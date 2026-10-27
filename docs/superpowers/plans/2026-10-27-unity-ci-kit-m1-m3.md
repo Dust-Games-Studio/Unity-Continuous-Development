@@ -469,11 +469,12 @@ git commit -m "feat: add config schema, validation and precedence"
 - Consumes: `EXIT` from `core/src/exit-codes.ts`, `Logger` from `core/src/logger.ts`, `Redactor` from `core/src/redact.ts`.
 - Produces:
   - `core/src/exec.ts` → `export interface SpawnResult { code: number; stdout: string; stderr: string }`, `export interface SpawnOptions { file: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; logger: Logger; redactor: Redactor; timeoutMs?: number }`, `export function spawnProcess(opts: SpawnOptions): Promise<SpawnResult>` — the **only** place a child process is started. Always `spawn(file, args, { shell: false })`.
-  - `core/src/unity/exec.ts` → `export interface UnityResult { code: number; stdout: string; stderr: string; json: unknown | null }`, `export interface RunUnityOptions { binary: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; logger: Logger; redactor: Redactor; timeoutMs?: number }`, `export function runUnity(opts: RunUnityOptions): Promise<UnityResult>` — builds the Unity child environment (GC13) and calls `spawnProcess`.
+  - `core/src/unity/exec.ts` → `export interface UnityEnvelope { success?: boolean; data?: unknown; errors?: { code?: string; message?: string }[]; warnings?: string[] }`, `export interface UnityResult { code: number; stdout: string; stderr: string; json: UnityEnvelope | null }`, `export interface RunUnityOptions { binary: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; logger: Logger; redactor: Redactor; timeoutMs?: number }`, `export function runUnity(opts: RunUnityOptions): Promise<UnityResult>` — builds the Unity child environment (GC13), calls `spawnProcess`, and parses the child's **raw** stdout into the typed envelope. `json` is a **typed envelope**, not `unknown`, so the later consumers do not each cast it by hand. The JSON is parsed from the raw stdout; only the exposed `stdout`/`stderr` strings are redacted, so a secret inside a JSON string can never corrupt the parse.
   - `core/src/unity/cli.ts` → typed wrappers, all of which call `runUnity` and all of which pass `--format json`:
     `export function unityVersion(opts): Promise<UnityResult>` — `unity version --format json`, which reports the CLI version, release channel, commit, platform, architecture and runtime. **`unity --version` is not trustworthy** (it reported `1.0.0-beta.13` while `unity version` and `unity doctor` reported `1.0.0-beta.14`), so the identity always comes from the `version` command.
     `export function unityDoctorCi(opts): Promise<UnityResult>` — `['doctor', '--ci', '--format', 'json']`.
-    `export function unityInstall(opts, options: UnityInstallOptions): Promise<UnityResult>` — an **options object**, not a positional list, because the install needs more than four fields. `UnityInstallOptions = { version: string; modules?: string[]; childModules?: boolean; acceptEula?: boolean; yes?: boolean; changeset?: string; architecture?: string }`. `--cm` and `--no-cm` are mutually exclusive; the long spelling `--module` is used (verified: `unity install 6000.6.6f1 -m Android --dry-run --format json` parses, so `--format json` after a variadic module list is accepted).
+    `export function unityInstall(opts, install: UnityInstallOptions): Promise<UnityResult>` — an **options object**, not a positional list, because the install needs more than four fields. `UnityInstallOptions = { version: string; modules?: string[]; childModules?: boolean; acceptEula?: boolean; yes?: boolean; changeset?: string; architecture?: string }`. `--cm` and `--no-cm` are mutually exclusive; the long spelling `--module` is used (verified: `unity install 6000.6.6f1 -m Android --dry-run --format json` parses, so `--format json` after a variadic module list is accepted).
+    `export function unityModulesList(opts, version: string): Promise<UnityResult>` — `['install', version, '--list-modules', '--format', 'json']`. **This is the authoritative source for "is module X installed for editor V".** Its rows carry the lowercase module **id** (`android`, `ios`, `webgl`, `linux-il2cpp`, `linux-mono`, `linux-server`, `mac-mono`, `universal-windows-platform`, …), the display `name`, `status`, `aliases`, and an `isInstalled` **boolean**.
     `export function unityTermsAccept(opts, version: string): Promise<UnityResult>`
     `export function unityLicenseActivate(opts, args: string[]): Promise<UnityResult>`
     `export function unityLicenseReturn(opts): Promise<UnityResult>` — `['license', 'return', '--yes', '--format', 'json']`.
@@ -483,9 +484,8 @@ git commit -m "feat: add config schema, validation and precedence"
     `export function unityCacheKey(opts, projectPath: string, target?: string): Promise<UnityResult>`
     `export function unityCacheInfo(opts): Promise<UnityResult>`
     `export function unityProjectsVerify(opts, projectPath: string): Promise<UnityResult>` — `['projects', 'verify', projectPath, '--strict', '--format', 'json']`. Both the positional project path and `--strict` are confirmed by `unity projects verify --help` (`Usage: unity projects verify [options] [project]`, `--strict  Treat warnings as errors`).
-    `export function unityEditorsInstalled(opts): Promise<UnityResult>` — `['editors', '--installed', '--format', 'json']`. Its rows carry a `modules` string that may be **empty** for a valid Editor, and the module **ids are lowercase** (`android`, `ios`, `webgl`, `linux-il2cpp`, `linux-mono`, `linux-server`, `mac-mono`, `universal-windows-platform`, …) per `unity install --list-modules`.
+    `export function unityEditorsInstalled(opts): Promise<UnityResult>` — `['editors', '--installed', '--format', 'json']`. Its rows carry a `modules` string that may be **empty** for a valid Editor. **That string holds display names, not module ids** (observed: `"Linux"`, `"Android, Android SDK & NDK Tools, Linux, OpenJDK, Web"`), so it is a *different namespace* from the ids `config.unity.editor.modules` uses. Do **not** compare against it — use `unityModulesList` and match on `id` + `isInstalled`.
     Each wrapper takes `{ binary, cwd, env, logger, redactor }` plus its own arguments. **The project path is always passed positionally** to the `unity` verb, and `cwd` is the directory the child runs in (the project root) — a caller must not rely on `cwd` alone to select the project.
-  - `core/src/unity/exec.ts` → `export interface UnityEnvelope { success?: boolean; data?: unknown; errors?: { code?: string; message?: string }[]; warnings?: string[] }` and `export interface UnityResult { code: number; stdout: string; stderr: string; json: UnityEnvelope | null }`. `json` is a **typed envelope**, not `unknown`, so the twelve later consumers do not each cast it by hand. The JSON is parsed from the child's **raw** stdout; only the exposed `stdout`/`stderr` strings are redacted, so a secret inside a JSON string can never corrupt the parse.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -538,6 +538,7 @@ git commit -m "feat: add the Unity CLI process runner"
 - Create: `core/src/commands/doctor.ts`, `core/src/commands/setup.ts`, `core/src/lifecycle/setup.ts`
 - Create: `core/src/packages/deps.ts`, `core/src/packages/git.ts`
 - Create: `core/test/fixtures/manifest-git-deps.json` (a `Packages/manifest.json` with a registry dependency, an `https://….git` dependency, an `ssh://` dependency and a `git@host:owner/repo.git` dependency)
+- Modify: `core/src/unity/cli.ts` (add the `unityModulesList` wrapper)
 - Test: `core/test/doctor.test.ts`, `core/test/setup.test.ts`, `core/test/packages.test.ts`
 
 **Interfaces:**
@@ -586,7 +587,7 @@ it('returns an empty list for a project with no manifest', () => { /* */ });
 it('installs the editor when it is not installed', () => { /* unity install invoked */ });
 it('accepts the Editor Software Terms after installing', () => { /* unity terms accept <v> --yes invoked after install */ });
 it('does not reinstall an editor that is already installed', () => { /* no install call */ });
-it('passes the module list and --cm to unity install', () => { /* args contain -m and --cm */ });
+it('passes the module list and --cm to unity install', () => { /* args contain --module and --cm */ });
 it('fails with exit 64 when the editor version is not from-project and is not a valid version', () => { /* invalid version */ });
 it('fails when doctor --ci reports a blocking failure', () => { /* non-zero */ });
 it('does not pass --accept-eula unless the config opts in', () => { /* acceptEula false → no flag */ });
@@ -608,7 +609,7 @@ Expected: FAIL — module not found.
 
 `setup.ts` (lifecycle) resolves the editor version: when `config.unity.editor.version === 'from-project'`, read `ProjectSettings/ProjectVersion.txt` from the project root and parse `m_EditorVersion:`; when the file is missing, fail with exit **64** naming the path. It then calls `unity editors --installed --format json`:
 - if the version is **absent** → it does **not** silently install. It fails with exit **64** and the exact command to run (`unity install <version> --module <modules…> --yes --accept-eula`). `--allow-install` is **never** sent: whether the install it triggers accepts the EULA cannot be verified, so a missing Editor must never turn into a multi-GB download plus an unrecorded licence acceptance in the middle of a build.
-- if the version is **present** → it verifies the **modules**: a row with `"modules": ""` is a valid installed Editor that lost its platform modules, so the module the build target needs (e.g. `Android`, `WebGL`, `Linux`) must be present, or the run fails with exit **64** naming the missing module.
+- if the version is **present** → it verifies the **modules**: a row with `"modules": ""` is a valid installed Editor that lost its platform modules, so the module the **invoked command** needs must be present, or the run fails with exit **64** naming the missing module. The requirement belongs to the command, not to the project: a **test** run needs the test modules, a **build** needs the target's modules, and a command with no module requirement checks only the Editor version. The check reads `unity install <version> --list-modules --format json` and matches the lowercase module **id** with `isInstalled` — the `modules` string on an `editors --installed` row holds **display names** (`"Linux"`, `"Android, …"`), a different namespace, and must not be compared against the ids in `config.unity.editor.modules`.
 - if `config.unity.editor.acceptEula` is true → it runs `unity install <version> --module <modules…> [--cm] --yes --accept-eula`; otherwise it never passes `--accept-eula` (accepting Unity's and every module's licence agreements is a **declared** input, not a silent default).
 - then, when `config.unity.editor.terms` is true, it runs `unity terms accept <version> --yes`.
 - finally it runs `unity doctor --ci --format json` and fails when any check has `blocking: true` and `status` is not `pass` or `info`.
@@ -637,10 +638,10 @@ Both commands are pure — they do not activate or return a license.
 Run: `pnpm -C core test`
 Expected: PASS — all tests green.
 
-- [ ] **Step Step 5: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add core/src/commands/doctor.ts core/src/commands/setup.ts core/src/lifecycle/setup.ts core/test/doctor.test.ts core/test/setup.test.ts
+git add core/src/commands/doctor.ts core/src/commands/setup.ts core/src/lifecycle/setup.ts core/src/packages core/src/unity/cli.ts core/test/doctor.test.ts core/test/setup.test.ts core/test/packages.test.ts
 git commit -m "feat: add doctor and setup commands"
 ```
 
@@ -1310,7 +1311,7 @@ grep -rnE "GITHUB_|GITLAB_|JENKINS_|CIRCLECI_|BUILDKITE_|AZURE_" core/src --incl
 ```
 and must print nothing. The spawn lint script is:
 ```
-grep -rnE "\b(spawn|spawnSync|exec|execFile|execSync)\(" core/src --include=*.ts | grep -v "core/src/unity/exec.ts"
+grep -rnE "\b(spawn|spawnSync|exec|execFile|execSync)\(" core/src --include=*.ts | grep -v "core/src/exec.ts"
 ```
 and must print nothing.
 
