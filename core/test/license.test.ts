@@ -124,23 +124,60 @@ describe('activateLicense', () => {
     expect(calls).toHaveLength(1);
     const call = calls[0]!;
     expect(call.args).toEqual(['license', 'activate', '--format', 'json']);
-    // The CLI reads UNITY_LICENSE_SERIAL itself, so neither the value nor the
-    // option that would carry it may appear on the child's command line.
+    // Neither the value, the option that would carry it, nor the variable name
+    // may appear on the child's command line.
     expect(call.args).not.toContain(SERIAL);
     expect(call.args.join(' ')).not.toContain(SERIAL);
     expect(call.args).not.toContain('--serial');
+    expect(call.args.join(' ')).not.toContain('UNITY_LICENSE_SERIAL');
     // The value must still reach the child, under the configured name.
     expect(call.env.UNITY_LICENSE_SERIAL).toBe(SERIAL);
   });
 
-  it('passes the serial under the configured env var name', async () => {
-    const ctx = makeContext('serial', { MY_UNITY_SERIAL: SERIAL });
-    ctx.config.license.serialEnv = 'MY_UNITY_SERIAL';
+  it('exports the serial as UNITY_LICENSE_SERIAL even when the source name differs', async () => {
+    const ctx = makeContext('serial', { MY_CI_LICENSE: SERIAL });
+    ctx.config.license.serialEnv = 'MY_CI_LICENSE';
 
     await activateLicense(ctx);
 
-    expect(calls[0]!.args).not.toContain('--serial');
-    expect(calls[0]!.env.MY_UNITY_SERIAL).toBe(SERIAL);
+    const call = calls[0]!;
+    expect(call.args).not.toContain('--serial');
+    expect(call.args.join(' ')).not.toContain('UNITY_LICENSE_SERIAL');
+    // Unity's CLI reads this exact name: a custom source variable must not
+    // starve it.
+    expect(call.env.UNITY_LICENSE_SERIAL).toBe(SERIAL);
+    // The configured name stays meaningful in the child environment too.
+    expect(call.env.MY_CI_LICENSE).toBe(SERIAL);
+  });
+
+  it('trims a padded serial before registering and exporting it', async () => {
+    const padded = `  ${SERIAL}\n`;
+    const ctx = makeContext('serial', { UNITY_LICENSE_SERIAL: padded });
+    mocks.runUnity.mockImplementation(async (options: UnityCall): Promise<FakeResult> => {
+      record(options);
+      // Unity echoes the bare serial back, without the padding.
+      return {
+        code: 3,
+        stdout: `serial ${SERIAL} rejected\n`,
+        stderr: `activation refused for ${SERIAL}\n`,
+        json: {
+          success: false,
+          errors: [{ code: 'LICENSE_INVALID', message: `serial ${SERIAL} rejected` }],
+        },
+      };
+    });
+
+    const code = await licenseActivateCommand(ctx);
+
+    expect(code).toBe(64);
+    // The child gets the trimmed value, and the redactor is armed with the
+    // trimmed form Unity will actually echo.
+    expect(calls[0]!.env.UNITY_LICENSE_SERIAL).toBe(SERIAL);
+    expect(ctx.redactor.secrets).toContain(SERIAL);
+    expect(ctx.redactor.secrets).not.toContain(padded);
+    const output = lines.join('');
+    expect(output).not.toContain(SERIAL);
+    expect(output).toContain('***');
   });
 
   it('activates floating with --floating', async () => {
@@ -289,11 +326,17 @@ describe('returnLicense', () => {
   it('returns the license with --yes', async () => {
     const result = await returnLicense(makeContext('none'));
 
-    expect(result).toEqual({ returned: true, code: 0 });
+    expect(result).toEqual({ returned: true, code: 0, seatLeaked: false });
     expect(calls).toHaveLength(1);
     expect(calls[0]!.args).toEqual(['license', 'return', '--yes', '--format', 'json']);
     // GC9: the teardown is bounded.
     expect(calls[0]!.timeoutMs).toBe(60_000);
+  });
+
+  it('reports seatLeaked: false for a returnable serial licence', async () => {
+    const result = await returnLicense(makeContext('serial'));
+
+    expect(result).toMatchObject({ returned: true, seatLeaked: false });
   });
 
   it('swallows a return failure without changing the caller exit code', async () => {
@@ -305,7 +348,11 @@ describe('returnLicense', () => {
 
     // It reports the failure instead of throwing, so the run lifecycle can log
     // it and keep its own primary exit code (GC9).
-    await expect(returnLicense(ctx)).resolves.toMatchObject({ returned: false, code: 7 });
+    await expect(returnLicense(ctx)).resolves.toMatchObject({
+      returned: false,
+      code: 7,
+      seatLeaked: false,
+    });
     expect(lines.join('')).toMatch(/could not return the Unity license/i);
   });
 
@@ -314,17 +361,77 @@ describe('returnLicense', () => {
 
     const result = await returnLicense(makeContext('none'));
 
-    expect(result).toMatchObject({ returned: false, code: 6 });
+    expect(result).toMatchObject({ returned: false, code: 6, seatLeaked: false });
     expect(lines.join('')).toContain('spawn exploded');
   });
 
-  it('warns that an offline --file licence cannot be returned', async () => {
+  it('reports the leaked seat when an offline --file licence cannot be returned', async () => {
     const result = await returnLicense(makeContext('offline-file'));
 
-    expect(result).toEqual({ returned: true, code: 0 });
+    // `unity license return` exits 0 but leaves the licence in place: the CLI
+    // released nothing and the runner still holds a seat.
+    expect(result).toMatchObject({ returned: true, code: 0, seatLeaked: true });
+  });
+
+  it('warns that an offline --file licence cannot be returned', async () => {
+    await returnLicense(makeContext('offline-file'));
+
     const output = lines.join('');
     expect(output).toMatch(/cannot be returned|leaks a seat/i);
     expect(output).toContain('reclaim');
+  });
+
+  it('still reports the leaked seat when the offline return call fails', async () => {
+    mocks.runUnity.mockRejectedValue(new Error('boom'));
+
+    const result = await returnLicense(makeContext('offline-file'));
+
+    expect(result).toMatchObject({ returned: false, code: 6, seatLeaked: true });
+  });
+
+  it('resolves when the CLI rejects with a non-Error value and a secret is registered', async () => {
+    // The old code read `.message` off the rejection value and passed
+    // `undefined` to the redactor, which throws exactly when a secret exists.
+    const ctx = makeContext('serial', { UNITY_LICENSE_SERIAL: SERIAL });
+    ctx.redactor.register(SERIAL);
+    mocks.runUnity.mockRejectedValue('boom, not an Error');
+
+    const result = await returnLicense(ctx);
+
+    expect(result).toMatchObject({ returned: false, code: 6, seatLeaked: false });
+    expect(result.error).toContain('boom, not an Error');
+  });
+
+  it('resolves even when the logger throws', async () => {
+    const ctx = makeContext('offline-file');
+    const boom = (): never => {
+      throw new Error('the log sink is closed');
+    };
+    ctx.logger = { info: boom, warn: boom, error: boom, debug: boom };
+
+    const result = await returnLicense(ctx);
+
+    expect(result).toMatchObject({ returned: true, code: 0, seatLeaked: true });
+  });
+
+  it('resolves even when the redactor throws', async () => {
+    const ctx = makeContext('serial');
+    ctx.redactor = {
+      register: () => {},
+      redact: () => {
+        throw new Error('redactor exploded');
+      },
+      secrets: [],
+    };
+    mocks.runUnity.mockImplementation(async (options: UnityCall) => {
+      record(options);
+      return failed(7, 'the licensing service is unreachable');
+    });
+
+    const result = await returnLicense(ctx);
+
+    expect(result).toMatchObject({ returned: false, code: 7, seatLeaked: false });
+    expect(result.error).toContain('<redaction failed>');
   });
 
   it('exits 6 when the return call failed: the standalone command must be honest', async () => {

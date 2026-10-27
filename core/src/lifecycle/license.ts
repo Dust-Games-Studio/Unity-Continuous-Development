@@ -30,6 +30,14 @@ export interface LicenseActivation {
  * `returned: false` into exit 6, because a user who explicitly asked for a seat
  * to be returned must not be told it succeeded when it did not.
  *
+ * `returned` and `seatLeaked` answer different questions. `returned` is "did the
+ * CLI release a seat?"; `seatLeaked` is "is a seat still held after this call?".
+ * For an offline `--file` licence both can be true: `unity license return`
+ * exits 0 and leaves the licence in place, so the CLI reports success while the
+ * runner still holds a seat that must be reclaimed by hand (R17). It is set on
+ * every result — `false` for every other mode — so `summary.json` can surface
+ * the leak without distinguishing "not applicable" from "not recorded".
+ *
  * `code` is Unity's exit code, or `EXIT.COMMAND_FAILED` when the call could not
  * run at all (a spawn failure, a thrown exception).
  */
@@ -37,6 +45,8 @@ export interface LicenseReturnResult {
   returned: boolean;
   code: number;
   error?: string;
+  /** `license.mode: offline-file`: the CLI leaves the licence in place. */
+  seatLeaked?: boolean;
 }
 
 /**
@@ -66,11 +76,63 @@ export const LICENSE_RETURN_TIMEOUT_MS = 60_000;
  * environment. `ctx.env` is the process environment in the real CLI, but a
  * caller (or a test) may pass a narrower set; the child inherits
  * `process.env` either way, so both sources are honoured.
+ *
+ * The value is trimmed. A CI secret written by `echo … >> $GITHUB_ENV` (or
+ * pasted from a file) commonly carries a trailing newline: passing it on would
+ * make `unity license activate` reject the serial, and registering the padded
+ * form would leave the redactor unable to match the bare serial that Unity
+ * echoes back.
  */
 function secretValue(ctx: CoreContext, name: string): string | null {
   const value = ctx.env[name] ?? process.env[name];
-  if (typeof value !== 'string' || value.trim() === '') return null;
-  return value;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed === '' ? null : trimmed;
+}
+
+/** A description of an arbitrary rejection value; never throws. */
+function describeThrown(error: unknown): string {
+  if (error instanceof Error) {
+    try {
+      return error.message;
+    } catch {
+      return 'unknown error';
+    }
+  }
+  try {
+    return String(error);
+  } catch {
+    return 'unknown error';
+  }
+}
+
+/**
+ * Redacts through the context, falling back to a fixed marker rather than
+ * throwing. Printing the unredacted value would be worse than losing detail.
+ */
+function safeRedact(ctx: CoreContext, value: string): string {
+  try {
+    return ctx.redactor.redact(value);
+  } catch {
+    return '<redaction failed>';
+  }
+}
+
+/**
+ * Logs without letting a broken sink (a closed stdout, a throwing custom
+ * logger) break the licence lifecycle. A teardown that throws while reporting
+ * a failure is worse than one that reports nothing (GC9).
+ */
+function safeLog(
+  ctx: CoreContext,
+  level: 'info' | 'warn' | 'error',
+  message: string,
+): void {
+  try {
+    ctx.logger[level](message);
+  } catch {
+    // Deliberately swallowed: see the doc comment.
+  }
 }
 
 /** The base options for one licence child, with an explicit env override. */
@@ -186,8 +248,10 @@ async function activateFromFile(
  * is needed. Secrets travel through the environment only (GC5):
  *
  * - `serial`: `unity license activate` is called with **no** `--serial` flag.
- *   Unity's CLI reads the value from `config.license.serialEnv` itself, by
- *   design, so the serial never appears in any child's `argv`.
+ *   The core reads the value from `config.license.serialEnv`, then exports it to
+ *   the child under **`UNITY_LICENSE_SERIAL`** (the name Unity's CLI actually
+ *   reads) and under the configured name as well. The serial never appears in
+ *   any child's `argv`.
  * - `floating`: `--floating`; the endpoint comes from the machine's
  *   `licensingServiceBaseUrl`, not from an environment variable (there is no
  *   `UNITY_LICENSING_SERVER`).
@@ -226,10 +290,17 @@ export async function activateLicense(ctx: CoreContext): Promise<LicenseActivati
       }
 
       ctx.logger.info(
-        `activating a Unity license with the serial from ${name} (the CLI reads it from the environment; it is never placed on the command line).`,
+        `activating a Unity license with the serial from ${name} (the core exports it to the CLI as UNITY_LICENSE_SERIAL; it is never placed on the command line).`,
       );
       const result = await unityLicenseActivate(
-        licenseBaseOptions(ctx, { [name]: serial }),
+        licenseBaseOptions(ctx, {
+          // Unity's CLI reads this exact name, whatever the config calls the
+          // source variable.
+          UNITY_LICENSE_SERIAL: serial,
+          // Keep the configured name meaningful in the child environment too,
+          // for diagnostics and for a child that prefers it.
+          [name]: serial,
+        }),
         [],
       );
       if (!activationSucceeded(result)) activationFailure(ctx, mode, result);
@@ -296,21 +367,31 @@ export async function activateLicense(ctx: CoreContext): Promise<LicenseActivati
  * Returns the licence seat.
  *
  * This is the teardown entrypoint used by the run lifecycle and by signals. It
- * **never throws**: every failure is reported in the result and logged at error
- * level, so the run lifecycle can log the failure loudly without changing its
- * primary exit code (GC9). The call is bounded to 60 s.
+ * **never throws** — the whole body, including logging and the offline warning,
+ * is inside one guard, and the failure path is itself guarded. Every outcome is
+ * reported in the result and logged at error level, so the run lifecycle can
+ * log a failure loudly without changing its primary exit code (GC9). The call
+ * is bounded to 60 s.
  *
  * It runs regardless of mode, too: `return` is a safe no-op when nothing is
  * held, and a run must not guess whether a previous step took a seat.
  */
 export async function returnLicense(ctx: CoreContext): Promise<LicenseReturnResult> {
-  if (ctx.config.license.mode === 'offline-file') {
-    ctx.logger.warn(
-      'license.mode is "offline-file": `unity license return` leaves an offline license in place, so this runner leaks a seat that must be reclaimed by hand.',
-    );
-  }
+  let seatLeaked = false;
 
   try {
+    // An offline `--file` licence is left in place by `unity license return`,
+    // so the seat is held whichever way the CLI call goes. Compute it once and
+    // put it on every result (R17).
+    seatLeaked = ctx.config.license.mode === 'offline-file';
+    if (seatLeaked) {
+      safeLog(
+        ctx,
+        'warn',
+        'license.mode is "offline-file": `unity license return` leaves an offline license in place, so this runner leaks a seat that must be reclaimed by hand.',
+      );
+    }
+
     const result = await unityLicenseReturn(
       licenseBaseOptions(ctx, {}, LICENSE_RETURN_TIMEOUT_MS),
     );
@@ -318,27 +399,29 @@ export async function returnLicense(ctx: CoreContext): Promise<LicenseReturnResu
     if (isUnsupportedCommand(result)) {
       const error =
         'this Unity CLI does not support `license return`; the license seat may still be held.';
-      ctx.logger.error(error);
-      return { returned: false, code: result.code, error };
+      safeLog(ctx, 'error', error);
+      return { returned: false, code: result.code, error, seatLeaked };
     }
     if (result.code !== 0) {
       const error =
         `could not return the Unity license: \`unity license return --yes\` failed (exit ${result.code})` +
-        `${ctx.redactor.redact(failureDetail(result))}. The seat may still be held.`;
-      ctx.logger.error(error);
-      return { returned: false, code: result.code, error };
+        `${safeRedact(ctx, failureDetail(result))}. The seat may still be held.`;
+      safeLog(ctx, 'error', error);
+      return { returned: false, code: result.code, error, seatLeaked };
     }
 
-    ctx.logger.info('Unity license returned (seat released).');
-    return { returned: true, code: 0 };
+    safeLog(ctx, 'info', 'Unity license returned (seat released).');
+    return { returned: true, code: 0, seatLeaked };
   } catch (error) {
-    // Belt and braces: a throw here would mask the run's real result. There is
-    // no Unity exit code for "the call never ran", so the result carries the
-    // same synthetic code the spawn layer uses for a command that could not run.
+    // Belt and braces: a throw here would mask the run's real result. The
+    // caught value may be anything (a string, null), and the logger/redactor
+    // may themselves be broken, so nothing below assumes otherwise.
     const message =
-      `could not return the Unity license: ${ctx.redactor.redact((error as Error).message)}. ` +
+      `could not return the Unity license: ${safeRedact(ctx, describeThrown(error))}. ` +
       'The seat may still be held.';
-    ctx.logger.error(message);
-    return { returned: false, code: EXIT.COMMAND_FAILED, error: message };
+    safeLog(ctx, 'error', message);
+    // There is no Unity exit code for "the call never ran": use the same
+    // synthetic code the spawn layer uses for a command that could not run.
+    return { returned: false, code: EXIT.COMMAND_FAILED, error: message, seatLeaked };
   }
 }
