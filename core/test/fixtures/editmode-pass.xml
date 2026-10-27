@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<test-run id="2" testcasecount="3" result="Passed" total="3" passed="2" failed="0" inconclusive="0" skipped="1" asserts="2" duration="0.123">
+  <test-suite type="TestSuite" id="1000" name="EditMode" fullname="EditMode" runstate="Runnable" testcasecount="3" result="Passed" total="3" passed="2" failed="0" inconclusive="0" skipped="1" duration="0.123">
+    <test-suite type="TestFixture" id="1001" name="MathTests" fullname="Game.Tests.MathTests" classname="Game.Tests.MathTests" runstate="Runnable" testcasecount="3" result="Passed" total="3" passed="2" failed="0" inconclusive="0" skipped="1" duration="0.123">
+      <test-case id="1002" name="AddsNumbers" fullname="Game.Tests.MathTests.AddsNumbers" classname="Game.Tests.MathTests" methodname="AddsNumbers" runstate="Runnable" result="Passed" duration="0.001" asserts="1" />
+      <test-case id="1003" name="SubtractsNumbers" fullname="Game.Tests.MathTests.SubtractsNumbers" classname="Game.Tests.MathTests" methodname="SubtractsNumbers" runstate="Runnable" result="Passed" duration="0.002" asserts="1" />
+      <test-case id="1004" name="PendingFeature" fullname="Game.Tests.MathTests.PendingFeature" classname="Game.Tests.MathTests" methodname="PendingFeature" runstate="Ignored" result="Skipped" duration="0.000" asserts="0">
+        <reason>
+          <message>Not implemented yet.</message>
+        </reason>
+      </test-case>
+    </test-suite>
+  </test-suite>
+</test-run>

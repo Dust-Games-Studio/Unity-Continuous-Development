@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<test-run id="2" testcasecount="2" result="Failed" total="2" passed="1" failed="1" inconclusive="0" skipped="0" asserts="2" duration="0.010">
+  <test-suite type="TestSuite" id="2000" name="EditMode" fullname="EditMode" runstate="Runnable" testcasecount="2" result="Failed" total="2" passed="1" failed="1" inconclusive="0" skipped="0" duration="0.010">
+    <test-suite type="TestFixture" id="2001" name="BrokenTests" fullname="Game.Tests.BrokenTests" classname="Game.Tests.BrokenTests" runstate="Runnable" testcasecount="2" result="Failed" total="2" passed="1" failed="1" inconclusive="0" skipped="0" duration="0.010">
+      <test-case id="2002" name="Passes" fullname="Game.Tests.BrokenTests.Passes" classname="Game.Tests.BrokenTests" methodname="Passes" runstate="Runnable" result="Passed" duration="0.001" asserts="1" />
+      <test-case id="2003" name="Fails&lt;badly&gt;" fullname="Game.Tests.BrokenTests.Fails" classname="Game.Tests.BrokenTests" methodname="Fails" runstate="Runnable" result="Failed" duration="0.002" asserts="1">
+        <failure>
+          <message>Expected 2 but was 3&#13;&#10;Ampersand &amp; and &lt;angle&gt;&#xA;last</message>
+          <stack-trace>at Game.Tests.BrokenTests.Fails () [0x00000] in /repo/Assets/Tests/BrokenTests.cs:42</stack-trace>
+        </failure>
+      </test-case>
+    </test-suite>
+  </test-suite>
+</test-run>
