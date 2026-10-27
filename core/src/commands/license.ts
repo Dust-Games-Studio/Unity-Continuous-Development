@@ -18,7 +18,11 @@ export async function licenseActivateCommand(ctx: CoreContext): Promise<number> 
     return EXIT.SUCCESS;
   } catch (error) {
     if (error instanceof LicenseError) {
-      ctx.logger.error(error.message);
+      try {
+        ctx.logger.error(error.message);
+      } catch {
+        // A broken logger must not turn a controlled 64 into a rejection.
+      }
       return error.exitCode;
     }
     throw error;
@@ -29,14 +33,20 @@ export async function licenseActivateCommand(ctx: CoreContext): Promise<number> 
  * `unityci license return`: the teardown command adapters call from an
  * `always()` step.
  *
- * A failed return exits **6**. This is deliberately different from the run
- * lifecycle's teardown: that teardown has a primary exit code to preserve and
- * only logs the failure (GC9), while this command has no primary exit code —
- * the user explicitly asked for a seat to be returned, and exit 0 on a failed
- * return is exactly how a leaked Unity seat goes unnoticed on a runner.
- * `returnLicense` has already logged the reason at error level.
+ * A failed return — or a return that leaves a seat held (`seatLeaked`) — exits
+ * **6**. This is deliberately different from the run lifecycle's teardown: that
+ * teardown has a primary exit code to preserve and only logs the result (GC9),
+ * while this command has no primary exit code — the user explicitly asked for a
+ * seat to be returned, and exit 0 on a failed or leaked return is exactly how a
+ * Unity seat goes unnoticed on a runner. `returnLicense` has already logged the
+ * reason at error/warn level.
+ *
+ * An adapter's `always()` step must therefore tolerate this non-zero exit when
+ * it runs the command after the job's real result is already known; the
+ * adapter conformance rule covers that, not this command.
  */
 export async function licenseReturnCommand(ctx: CoreContext): Promise<number> {
   const result = await returnLicense(ctx);
-  return result.returned ? EXIT.SUCCESS : EXIT.COMMAND_FAILED;
+  const freed = result.returned && result.seatLeaked !== true;
+  return freed ? EXIT.SUCCESS : EXIT.COMMAND_FAILED;
 }

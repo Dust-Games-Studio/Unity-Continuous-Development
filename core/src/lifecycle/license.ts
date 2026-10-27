@@ -90,6 +90,37 @@ function secretValue(ctx: CoreContext, name: string): string | null {
   return trimmed === '' ? null : trimmed;
 }
 
+/**
+ * The secret exactly as the environment holds it, for redaction only.
+ *
+ * A base64 value written by a CI secret file can be line-wrapped: trimming
+ * removes the surrounding newlines but not the internal ones, so a reformatted
+ * echo of the blob contains the raw form while a bare echo contains the trimmed
+ * one. Both must be registered (GC6).
+ */
+function rawSecretValue(ctx: CoreContext, name: string): string | null {
+  const value = ctx.env[name] ?? process.env[name];
+  return typeof value === 'string' ? value : null;
+}
+
+/**
+ * Registers a secret with the redactor, turning a broken redactor into a
+ * controlled configuration failure instead of an escaping exception (R17). If
+ * the secret cannot be masked, proceeding would risk printing it, so the
+ * activation stops at 64.
+ */
+function registerSecret(ctx: CoreContext, value: string | null): void {
+  if (value === null) return;
+  try {
+    ctx.redactor.register(value);
+  } catch {
+    throw new LicenseError(
+      'could not register a license secret with the redactor; refusing to continue rather than risk printing it.',
+      EXIT.CONFIG_ERROR,
+    );
+  }
+}
+
 /** A description of an arbitrary rejection value; never throws. */
 function describeThrown(error: unknown): string {
   if (error instanceof Error) {
@@ -191,13 +222,13 @@ function activationFailure(
     throw new LicenseError(
       '`unity license activate --floating` failed (exit 4): no floating license server is configured on this machine. ' +
         'Set the CLI\'s `licensingServiceBaseUrl` to your server; there is no UNITY_LICENSING_SERVER environment variable.' +
-        ctx.redactor.redact(failureDetail(result)),
+        safeRedact(ctx, failureDetail(result)),
       EXIT.CONFIG_ERROR,
     );
   }
   throw new LicenseError(
     `\`unity license activate\` failed for license.mode "${mode}" (exit ${result.code})` +
-      ctx.redactor.redact(failureDetail(result)),
+      safeRedact(ctx, failureDetail(result)),
     EXIT.CONFIG_ERROR,
   );
 }
@@ -229,14 +260,20 @@ async function activateFromFile(
     // An operational fact, not a footnote: `unity license return` leaves an
     // offline licence in place, so this runner's seat must be reclaimed by
     // hand (R17).
-    ctx.logger.warn(
+    safeLog(
+      ctx,
+      'warn',
       'an offline `--file` license cannot be returned by `unity license return`; this runner leaks a seat that must be reclaimed by hand.',
     );
 
     const result = await unityLicenseActivate(licenseBaseOptions(ctx), ['--file', path]);
     if (!activationSucceeded(result)) activationFailure(ctx, 'offline-file', result);
 
-    ctx.logger.info('Unity license activated from the offline license file (mode "offline-file").');
+    safeLog(
+      ctx,
+      'info',
+      'Unity license activated from the offline license file (mode "offline-file").',
+    );
     return { activated: true, mode: 'offline-file' };
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -271,7 +308,9 @@ export async function activateLicense(ctx: CoreContext): Promise<LicenseActivati
 
   switch (mode) {
     case 'none':
-      ctx.logger.info(
+      safeLog(
+        ctx,
+        'info',
         'license.mode is "none": no activation is performed; an active license is a precondition of the run.',
       );
       return { activated: false, mode };
@@ -280,7 +319,7 @@ export async function activateLicense(ctx: CoreContext): Promise<LicenseActivati
       const name = ctx.config.license.serialEnv;
       const serial = secretValue(ctx, name);
       // Register before anything is logged, whatever the outcome (GC6).
-      ctx.redactor.register(serial);
+      registerSecret(ctx, serial);
       if (serial === null) {
         throw new LicenseError(
           `license.mode is "serial" but the environment variable ${name} is empty or unset. ` +
@@ -289,7 +328,9 @@ export async function activateLicense(ctx: CoreContext): Promise<LicenseActivati
         );
       }
 
-      ctx.logger.info(
+      safeLog(
+        ctx,
+        'info',
         `activating a Unity license with the serial from ${name} (the core exports it to the CLI as UNITY_LICENSE_SERIAL; it is never placed on the command line).`,
       );
       const result = await unityLicenseActivate(
@@ -305,26 +346,32 @@ export async function activateLicense(ctx: CoreContext): Promise<LicenseActivati
       );
       if (!activationSucceeded(result)) activationFailure(ctx, mode, result);
 
-      ctx.logger.info('Unity license activated (mode "serial").');
+      safeLog(ctx, 'info', 'Unity license activated (mode "serial").');
       return { activated: true, mode };
     }
 
     case 'floating': {
-      ctx.logger.info(
+      safeLog(
+        ctx,
+        'info',
         "activating a Unity license with the floating server configured on this machine (`licensingServiceBaseUrl`).",
       );
       const result = await unityLicenseActivate(licenseBaseOptions(ctx), ['--floating']);
       if (!activationSucceeded(result)) activationFailure(ctx, mode, result);
 
-      ctx.logger.info('Unity license activated (mode "floating").');
+      safeLog(ctx, 'info', 'Unity license activated (mode "floating").');
       return { activated: true, mode };
     }
 
     case 'offline-file': {
       const name = ctx.config.license.fileEnv;
+      const raw = rawSecretValue(ctx, name);
       const encoded = secretValue(ctx, name);
-      // Register before anything is logged, whatever the outcome (GC6).
-      ctx.redactor.register(encoded);
+      // Register before anything is logged, whatever the outcome (GC6). Both
+      // forms: the raw one matches a line-wrapped echo, the trimmed one a bare
+      // echo.
+      registerSecret(ctx, raw);
+      registerSecret(ctx, encoded);
       if (encoded === null) {
         throw new LicenseError(
           `license.mode is "offline-file" but the environment variable ${name} is empty or unset. ` +
@@ -337,7 +384,9 @@ export async function activateLicense(ctx: CoreContext): Promise<LicenseActivati
     }
 
     case 'personal':
-      ctx.logger.warn(
+      safeLog(
+        ctx,
+        'warn',
         'license.mode is "personal": this route is local-only. Unity\'s licensing backend rejects service-account tokens for activation, so `--personal` cannot work in CI.',
       );
       {
@@ -348,7 +397,7 @@ export async function activateLicense(ctx: CoreContext): Promise<LicenseActivati
         if (!activationSucceeded(result)) activationFailure(ctx, mode, result);
       }
 
-      ctx.logger.info('Unity license activated (mode "personal").');
+      safeLog(ctx, 'info', 'Unity license activated (mode "personal").');
       return { activated: true, mode };
 
     default: {

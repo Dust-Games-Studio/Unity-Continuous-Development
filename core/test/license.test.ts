@@ -203,6 +203,43 @@ describe('activateLicense', () => {
     expect(output).toContain('no licensing server is configured');
   });
 
+  it('fails with 64 instead of rejecting when the redactor throws during activation', async () => {
+    const ctx = makeContext('serial', { UNITY_LICENSE_SERIAL: SERIAL });
+    ctx.redactor = {
+      register: () => {},
+      redact: () => {
+        throw new Error('redactor exploded');
+      },
+      secrets: [],
+    };
+    mocks.runUnity.mockImplementation(async (options: UnityCall) => {
+      record(options);
+      return failed(3, `activation refused for ${SERIAL}`);
+    });
+
+    const code = await licenseActivateCommand(ctx);
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toContain('<redaction failed>');
+  });
+
+  it('fails with 64 instead of rejecting when the redactor cannot register the secret', async () => {
+    const ctx = makeContext('serial', { UNITY_LICENSE_SERIAL: SERIAL });
+    ctx.redactor = {
+      register: () => {
+        throw new Error('cannot register');
+      },
+      redact: (text: string) => text,
+      secrets: [],
+    };
+
+    const code = await licenseActivateCommand(ctx);
+
+    expect(code).toBe(64);
+    expect(mocks.runUnity).not.toHaveBeenCalled();
+    expect(lines.join('')).toMatch(/could not register a license secret/i);
+  });
+
   it('decodes an offline license file to a temp path and passes --file', async () => {
     const content = '<?xml version="1.0"?><root>offline licence</root>\n';
     const encoded = Buffer.from(content, 'utf8').toString('base64');
@@ -250,6 +287,40 @@ describe('activateLicense', () => {
     expect(error).toBeInstanceOf(LicenseError);
     expect(tempPath).not.toBe('');
     expect(existsSync(tempPath)).toBe(false);
+  });
+
+  it('masks a line-wrapped base64 licence echoed back with its internal breaks', async () => {
+    // A base64 blob written by a CI secret file: valid internal line breaks,
+    // which `trim()` cannot remove.
+    const bare = Buffer.from('<?xml version="1.0"?><root>wrapped</root>\n', 'utf8').toString(
+      'base64',
+    );
+    const wrapped = `${bare.slice(0, 10)}\n${bare.slice(10)}\n`;
+    const ctx = makeContext('offline-file', { UNITY_LICENSE_FILE_BASE64: wrapped });
+    mocks.runUnity.mockImplementation(async (options: UnityCall): Promise<FakeResult> => {
+      record(options);
+      return {
+        code: 3,
+        stdout: `license file rejected:\n${wrapped}`,
+        stderr: `license file rejected:\n${wrapped}`,
+        json: {
+          success: false,
+          errors: [{ code: 'LICENSE_INVALID', message: `license file rejected:\n${wrapped}` }],
+        },
+      };
+    });
+
+    const code = await licenseActivateCommand(ctx);
+
+    expect(code).toBe(64);
+    // Both forms are registered: the raw one matches the line-wrapped echo,
+    // the trimmed one matches a bare echo.
+    expect(ctx.redactor.secrets).toContain(wrapped);
+    expect(ctx.redactor.secrets).toContain(wrapped.trim());
+    const output = lines.join('');
+    expect(output).not.toContain(bare);
+    expect(output).not.toContain(wrapped);
+    expect(output).toContain('***');
   });
 
   it('activates personal with --personal --accept-eula', async () => {
@@ -387,6 +458,33 @@ describe('returnLicense', () => {
     const result = await returnLicense(makeContext('offline-file'));
 
     expect(result).toMatchObject({ returned: false, code: 6, seatLeaked: true });
+  });
+
+  it('reports seatLeaked on the unsupported-command branch', async () => {
+    mocks.runUnity.mockImplementation(async (options: UnityCall) => {
+      record(options);
+      return {
+        code: 2,
+        stdout: '',
+        stderr: "error: unknown command 'license'",
+        json: {
+          success: false,
+          errors: [{ code: 'UNKNOWN_COMMAND', message: "unknown command 'license'" }],
+        },
+      };
+    });
+
+    const result = await returnLicense(makeContext('serial'));
+
+    expect(result).toMatchObject({ returned: false, code: 2, seatLeaked: false });
+    expect(lines.join('')).toContain('does not support `license return`');
+  });
+
+  it('exits 6 when an offline --file licence leaves the seat held', async () => {
+    const code = await licenseReturnCommand(makeContext('offline-file'));
+
+    expect(code).toBe(6);
+    expect(lines.join('')).toMatch(/reclaim/);
   });
 
   it('resolves when the CLI rejects with a non-Error value and a secret is registered', async () => {
