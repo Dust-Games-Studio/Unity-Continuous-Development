@@ -663,7 +663,7 @@ git commit -m "feat: add doctor and setup commands"
 **Interfaces:**
 - Consumes: `runUnity` wrappers; `Config`; `CoreContext`.
 - Produces:
-  - `core/src/lifecycle/license.ts` → `export interface LicenseActivation { activated: boolean; mode: string }`, `export interface LicenseReturnResult { returned: boolean; code: number; error?: string }`, `export async function activateLicense(ctx: CoreContext): Promise<LicenseActivation>` and `export async function returnLicense(ctx: CoreContext): Promise<LicenseReturnResult>`. `returnLicense` **never throws** — it catches everything and reports the outcome in its result. That is what lets the teardown log the failure loudly without changing the primary exit code (GC9), while the **standalone** `unityci license return` command can still report the failure honestly.
+  - `core/src/lifecycle/license.ts` → `export interface LicenseActivation { activated: boolean; mode: string }`, `export interface LicenseReturnResult { returned: boolean; code: number; error?: string; seatLeaked?: boolean }`, `export async function activateLicense(ctx: CoreContext): Promise<LicenseActivation>` and `export async function returnLicense(ctx: CoreContext): Promise<LicenseReturnResult>`. `returnLicense` **never throws** — it catches everything and reports the outcome in its result. That is what lets the teardown log the failure loudly without changing the primary exit code (GC9), while the **standalone** `unityci license return` command can still report the failure honestly. `seatLeaked` is set when the licence was an **offline `--file`** licence: `unity license return` leaves such a licence in place, so the CLI reports success while the seat is still held and must be reclaimed by hand. That fact is the **only** signal the caller gets, so it must be machine-readable rather than a log line nobody greps for.
   - `core/src/commands/license.ts` → `export async function licenseActivateCommand(ctx: CoreContext): Promise<number>` and `export async function licenseReturnCommand(ctx: CoreContext): Promise<number>`. The standalone `license return` command exits **non-zero** (`EXIT.COMMAND_FAILED`, 6) when the return failed — a user who explicitly asked for a seat to be returned must not be told it succeeded when it did not. That is a different question from the teardown, which has a primary exit code to preserve.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1124,7 +1124,15 @@ git commit -m "feat: add the CLI entrypoint and the fake unity binary"
     5. Restore the project `Library` folder — compute `unity cache key --target <target>` into `$GITHUB_OUTPUT`, then `actions/cache` with `path: <project-path>/Library` and `key: unity-library-<key>`.
     6. Run — `unityci run <command> --project-path <project-path> --output-dir <output-dir> --annotations github`.
     7. Upload artifacts — `actions/upload-artifact` with `path: <output-dir>` and `if: always()`.
-    8. Return the licence — `unityci license return` with `if: always()`.
+    8. Return the licence — `unityci license return` with `if: always()`. **The teardown must not fail the job.** `unityci license return` exits **6** when the seat was not returned — a deliberate choice, because a user who explicitly asked for a seat back must not be told it succeeded when it did not (a leaked Unity seat is expensive and silent). But in an `if: always()` teardown step, a non-zero exit turns a green test run red, and the teardown is **not** the pass/fail signal — the core decides that (D4). So the step tolerates the failure and raises it as an annotation instead:
+       ```yaml
+       - name: Return the licence
+         if: always()
+         shell: bash
+         run: |
+           unityci license return || echo "::warning::unityci license return failed — the Unity seat may still be held on this runner"
+       ```
+       The job's own result is decided by the run step, never by the teardown.
     Every third-party action is pinned by **commit SHA**, not a tag. The implementer must look up the current SHA for `actions/checkout`, `actions/cache` and `actions/upload-artifact` and record the version each SHA corresponds to in a comment.
     The action never passes `--allow-install` (the core fails fast with the exact install command instead) and never puts a secret on a command line: the licence serial is read by `unity license activate` from `UNITY_LICENSE_SERIAL` in the environment, and the floating/offline alternatives are documented in the action's README.
 
@@ -1169,6 +1177,7 @@ git commit -m "feat: add the CLI entrypoint and the fake unity binary"
   - `testing/conformance/check-adapters.ts` → `export async function checkAdapter(dir: string): Promise<{ file: string; rule: string; ok: boolean; detail: string }[]>` with these rules, each adapter file checked:
     - `calls-unityci`: the file contains `unityci ` and does **not** contain a bare `unity ` invocation outside a comment.
     - `has-teardown`: the file contains a step with `if: always()` that runs `unityci license return`.
+    - `teardown-does-not-fail-the-job`: that teardown step tolerates a non-zero exit from `unityci license return` (an `||` fallback that emits a warning annotation), so a failed licence return cannot turn a green run red. The pass/fail decision belongs to the run step alone (D4).
     - `no-retry-logic`: the file contains no `retry`/`attempt`/`max-attempts` construct.
     - `no-exit-code-logic`: the file contains no comparison against a numeric Unity exit code.
     - `publishes-on-zero-and-eight`: the artifact/report upload step uses `if: always()` or an equivalent that does not gate on the run's success.
