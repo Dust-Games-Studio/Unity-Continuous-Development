@@ -1059,7 +1059,9 @@ git commit -m "feat: add the CLI entrypoint and the fake unity binary"
     Every third-party action is pinned by **commit SHA**, not a tag. The implementer must look up the current SHA for `actions/checkout`, `actions/cache` and `actions/upload-artifact` and record the version each SHA corresponds to in a comment.
     The action never passes `--allow-install` (the core fails fast with the exact install command instead) and never puts a secret on a command line: the licence serial is read by `unity license activate` from `UNITY_LICENSE_SERIAL` in the environment, and the floating/offline alternatives are documented in the action's README.
 
-  - **Private git packages.** A new input pair, `git-credentials` (`none` (default) | `token`) and `git-token`, plus an optional `git-token-repos` (comma-separated `owner/repo` list). When `git-credentials` is `token`, the action adds a step **before** the run step:
+  - **Private git packages.** A new input pair, `git-credentials` (`none` (default) | `token`) and `git-token`, plus `git-token-repos` — a comma-separated list of `owner/repo` entries, or the literal `all` for a host-wide rewrite. The **default is per-repository**: the input is required when `git-credentials` is `token`, and `all` is the explicit opt-in for a host-wide rewrite, because a host-wide rewrite grants the token read access to every repository in that host, not only the packages the project consumes. When `git-credentials` is `token` and `git-token-repos` is missing or empty, the action **fails with exit 64** naming the input — it never silently falls back to a host-wide rewrite.
+
+    The action adds a step **before** the run step:
 
     ```yaml
     - name: Configure git credentials for private packages
@@ -1074,14 +1076,14 @@ git commit -m "feat: add the CLI entrypoint and the fake unity binary"
         umask 077
         if [ -f "$HOME/.gitconfig" ]; then cp "$HOME/.gitconfig" "$RUNNER_TEMP/gitconfig.snapshot"; fi
         {
-          if [ -n "${UNITYCI_GIT_REPOS:-}" ]; then
+          if [ "${UNITYCI_GIT_REPOS}" = "all" ]; then
+            printf '[url "https://x-access-token:%s@github.com/"]\n' "$UNITYCI_GIT_TOKEN"
+            printf '\tinsteadOf = https://github.com/\n'
+          else
             for repo in ${UNITYCI_GIT_REPOS//,/ }; do
               printf '[url "https://x-access-token:%s@github.com/%s.git"]\n' "$UNITYCI_GIT_TOKEN" "$repo"
               printf '\tinsteadOf = https://github.com/%s.git\n' "$repo"
             done
-          else
-            printf '[url "https://x-access-token:%s@github.com/"]\n' "$UNITYCI_GIT_TOKEN"
-            printf '\tinsteadOf = https://github.com/\n'
           fi
         } >> "$HOME/.gitconfig"
     ```
