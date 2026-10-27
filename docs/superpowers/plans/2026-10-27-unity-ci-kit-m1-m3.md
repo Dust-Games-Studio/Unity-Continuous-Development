@@ -6,7 +6,7 @@
 
 **Architecture:** Three layers, dependencies pointing one way: **Core** (`@unityci/core`, TypeScript → npm bin `unityci`) spawns `unity` via argv arrays only and owns the pass/fail verdict; **Adapters** (GitHub composite action, generic docs) are thin provider-specific YAML that call `unityci` and display results; **Unity CLI** is the only thing that touches the Editor. Core never reads `GITHUB_*`/`GITLAB_*`/`JENKINS_*`.
 
-**Tech Stack:** TypeScript 5.9.3 (ESM, `module: nodenext`), Node 22+ runtime, pnpm workspace, vitest 5, `yaml` 2.9 for `unity-ci.yml`. No runtime dependencies beyond `yaml`.
+**Tech Stack:** TypeScript 5.9.3 (ESM, `module: nodenext`), Node **22.4+** runtime (`util.parseArgs`'s `allowNegative` needs 22.4), pnpm workspace, vitest 5, `yaml` 2.9 for `unity-ci.yml`. No runtime dependencies beyond `yaml`.
 
 **Spec:** `unity-ci-design.md` (repo root). The plan argues from it; conflicts resolve against it, except where the plan's Global Constraints record a ruling that supersedes it.
 
@@ -16,7 +16,7 @@
 
 These bind every task. Copy them verbatim into every dispatch.
 
-- **GC1 — Runtime.** TypeScript 5.9.3 (NOT 7.x), ESM only (`"type": "module"`), `module`/`moduleResolution` = `nodenext`, `target` = `es2023`, `strict: true`. Build with `tsc`. Package name `@unityci/core`, bin name `unityci`.
+- **GC1 — Runtime.** TypeScript 5.9.3 (NOT 7.x), ESM only (`"type": "module"`), `module`/`moduleResolution` = `nodenext`, `target` = `es2023`, `strict: true`. Build with `tsc`. Package name `@unityci/core`, bin name `unityci`. Runtime floor **Node 22.4** (`util.parseArgs`'s `allowNegative` landed in 22.4), declared as `"engines": { "node": ">=22.4" }`.
 - **GC2 — Package manager.** pnpm workspaces. Root `package.json` is `private: true`. Only workspace package is `core`. `pnpm install` at the root installs everything.
 - **GC3 — One spawn point.** `core/src/exec.ts` is the **only** module that may spawn any child process, and it always uses `spawn(file, argsArray, { shell: false })` — never a concatenated command string, never `shell: true`. `core/src/unity/exec.ts` is the only module that may spawn **`unity`**, and `core/src/packages/git.ts` the only one that may spawn **`git`**. Lint: `grep -rnE "\b(spawn|spawnSync|exec|execFile|execSync)\(" core/src --include=*.ts` must match only `core/src/exec.ts`; and the same grep for the literal `unity` must additionally match only `core/src/unity/exec.ts`.
 - **GC4 — Provider neutrality.** `core/src/**` must not match `GITHUB_|GITLAB_|JENKINS_|CIRCLECI_|BUILDKITE_|AZURE_` except inside `core/src/report/annotations.ts`, which may reference `GITHUB_STEP_SUMMARY` and `GITHUB_OUTPUT` only. A conformance check enforces this.
@@ -186,7 +186,7 @@ Expected: no output (exit 1 from grep is the pass condition).
 - Create: `package.json`, `pnpm-workspace.yaml`, `core/package.json`, `core/tsconfig.json`, `core/vitest.config.ts`
 - Modify: `.gitignore`
 - Create: `core/src/exit-codes.ts`, `core/src/logger.ts`, `core/src/redact.ts`, `core/src/args.ts`
-- Test: `core/test/redact.test.ts`, `core/test/args.test.ts`
+- Test: `core/test/redact.test.ts`, `core/test/logger.test.ts`, `core/test/args.test.ts`
 
 **Interfaces:**
 - Consumes: nothing (first task in the code).
@@ -228,6 +228,16 @@ describe('createRedactor', () => {
 });
 ```
 
+`core/test/logger.test.ts`:
+```ts
+it('writes one newline-terminated line per message', () => { /* sink capture */ });
+it('redacts a registered secret before writing the line', () => { /* the sink never sees the secret */ });
+it('redacts a secret registered after the logger was created', () => { /* GC6 ordering */ });
+it('suppresses debug messages at the default level', () => { /* nothing written */ });
+it('emits debug messages at the debug level', () => { /* written */ });
+it('suppresses messages below the configured level', () => { /* nothing written */ });
+```
+
 `core/test/args.test.ts`:
 ```ts
 import { describe, it, expect } from 'vitest';
@@ -241,7 +251,7 @@ describe('parseArgs', () => {
     expect(r.flags.ci).toBe(true);
   });
   it('collects a repeated flag into an array', () => {
-    const r = parseArgs(['run', 'test', '--mode', 'EditMode', '--mode', 'PlayMode']);
+    const r = parseArgs(['run', 'test', '--mode', 'EditMode', '--mode', 'PlayMode'], { mode: { type: 'string', multiple: true } });
     expect(r.flags.mode).toEqual(['EditMode', 'PlayMode']);
   });
   it('supports --flag=value form', () => {
@@ -249,6 +259,35 @@ describe('parseArgs', () => {
   });
   it('treats an unknown flag as a usage error', () => {
     expect(() => parseArgs(['run', '--nope'])).toThrow(/nope/);
+  });
+  it('treats an unknown flag with a value as a usage error', () => {
+    expect(() => parseArgs(['run', '--nope', 'value'])).toThrow(/nope/);
+  });
+  it('merges extraOptions with the global schema instead of replacing it', () => {
+    const r = parseArgs(['--output-dir', 'ci-out', '--mode', 'EditMode'], { mode: { type: 'string' } });
+    expect(r.flags['output-dir']).toBe('ci-out');
+    expect(r.flags.mode).toBe('EditMode');
+  });
+  it('does not consume the next token for a declared boolean option', () => {
+    const r = parseArgs(['run', '--verbose', 'test'], { verbose: { type: 'boolean' } });
+    expect(r.flags.verbose).toBe(true);
+    expect(r.command).toEqual(['run', 'test']);
+  });
+  it('omits a multiple option that was not supplied', () => {
+    const r = parseArgs(['run'], { mode: { type: 'string', multiple: true } });
+    expect('mode' in r.flags).toBe(false);
+  });
+  it('returns an array for a multiple option supplied once', () => {
+    const r = parseArgs(['run', '--mode', 'EditMode'], { mode: { type: 'string', multiple: true } });
+    expect(r.flags.mode).toEqual(['EditMode']);
+  });
+  it('collects tokens after -- as passthrough and does not parse them as options', () => {
+    const r = parseArgs(['run', 'test', '--', '-nographics']);
+    expect(r.command).toEqual(['run', 'test']);
+    expect(r.passthrough).toEqual(['-nographics']);
+  });
+  it('returns an empty passthrough when there is no --', () => {
+    expect(parseArgs(['run', 'test']).passthrough).toEqual([]);
   });
 });
 ```
@@ -264,7 +303,7 @@ Expected: FAIL — `Cannot find module '../src/redact.js'`.
 
 `logger.ts` writes one line per message to `sink` (default `process.stdout.write`), passing the line through `redactor.redact()` first. `debug` is a no-op unless `level === 'debug'`.
 
-`args.ts` uses `parseArgs` from `node:util` with `allowPositionals: true`, `strict: true`. Unknown options throw an `Error` naming the option. Global flags are declared; command-specific flags are passed through as an open set via a second `parseArgs` pass with `strict: false` so subcommands can add their own flags without the global parser rejecting them.
+`args.ts` uses `parseArgs` from `node:util` in a **single strict pass** with `allowPositionals: true`, `allowNegative: true` (so `--no-ci` negates `--ci`). The declared schema is the global flags — `--project-path/-p`, `--config`, `--output-dir`, `--annotations`, `--ci`/`--no-ci`, `--verbose`, `--quiet`, `--help/-h`, `--version/-v`, `--json` — merged with any `extraOptions` the caller supplies. **Unknown options are a usage error**; there is no open set, because a bare unknown flag cannot be told apart from a typo without a per-command registry. Tokens after a literal `--` are collected in `passthrough` and are never parsed as options. `allowNegative` requires **Node 22.4 or newer**, which is the runtime floor the package declares.
 
 Fix the root `.gitignore` at the same time. It carries a NuGet rule `**/[Pp]ackages/*` that would ignore a Unity project's `Packages/manifest.json` and `Packages/packages-lock.json` — and the lock file is exactly what `unity cache key` hashes, so an ignored lock file silently breaks the CI cache key. Append:
 
@@ -279,10 +318,12 @@ ci-output/
 .superpowers/
 ```
 
+`core/package.json` declares `"type": "module"`, `"bin": { "unityci": "./dist/cli.js" }`, the three dev dependencies at their exact pinned versions (`typescript@5.9.3`, `vitest@5.0.5`, `@types/node@26.6.5`), the scripts `build` (`tsc -p tsconfig.json`), `typecheck` (`tsc --noEmit`) and `test` (`vitest run`), and `"engines": { "node": ">=22.4" }`.
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `pnpm -C core test`
-Expected: PASS — 9 tests.
+Expected: PASS — every test green (redact, logger and args).
 
 - [ ] **Step 5: Commit**
 

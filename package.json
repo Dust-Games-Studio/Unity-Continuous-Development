@@ -4,5 +4,8 @@
   "private": true,
   "description": "Provider-neutral CI toolkit for Unity, built on Unity's own CLI",
   "license": "MIT",
-  "packageManager": "pnpm@12.15.0"
+  "packageManager": "pnpm@12.15.0",
+  "engines": {
+    "node": ">=22.4"
+  }
 }
