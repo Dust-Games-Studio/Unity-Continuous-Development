@@ -2,6 +2,14 @@ import { parseArgs as parseArgsUtil } from 'node:util';
 
 export interface ParseResult {
   command: string[];
+  /**
+   * Parsed flags, keyed by their long name.
+   *
+   * An option declared with `multiple: true` is always an **array** when it is
+   * present — a single occurrence is `['value']`, never `'value'` — and its key
+   * is **absent** (not `[]`) when the option was never supplied. Consumers must
+   * check for the key's presence rather than assume an empty array.
+   */
   flags: Record<string, string | boolean | string[]>;
   passthrough: string[];
 }

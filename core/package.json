@@ -4,6 +4,9 @@
   "description": "Provider-neutral core for unity-ci-kit",
   "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=22.4"
+  },
   "bin": {
     "unityci": "./dist/cli.js"
   },

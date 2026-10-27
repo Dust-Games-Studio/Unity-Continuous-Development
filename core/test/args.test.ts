@@ -36,6 +36,19 @@ describe('parseArgs', () => {
     expect(r.flags.filter).toBe('Smoke');
     expect(r.command).toEqual(['run', 'test']);
   });
+  it('merges extraOptions with the global schema instead of replacing it', () => {
+    const r = parseArgs(['--output-dir', 'ci-out', '--mode', 'EditMode'], { mode: { type: 'string' } });
+    expect(r.flags['output-dir']).toBe('ci-out');
+    expect(r.flags.mode).toBe('EditMode');
+  });
+  it('returns an array for a multiple option supplied once', () => {
+    const r = parseArgs(['run', '--mode', 'EditMode'], { mode: { type: 'string', multiple: true } });
+    expect(r.flags.mode).toEqual(['EditMode']);
+  });
+  it('omits a multiple option that was not supplied', () => {
+    const r = parseArgs(['run'], { mode: { type: 'string', multiple: true } });
+    expect('mode' in r.flags).toBe(false);
+  });
   it('separates tokens after -- into passthrough', () => {
     const r = parseArgs(['run', 'test', '--', '-nographics']);
     expect(r.command).toEqual(['run', 'test']);
