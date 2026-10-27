@@ -122,20 +122,27 @@ function parseValue(path: string, raw: string): Parsed {
  * `UNITYCI_CLI_VERSION` sets `unity.cli.version` without disturbing
  * `unity.cli.allowLatest` or `unity.cli.binary`.
  *
- * `unknown` is the warning channel: every `UNITYCI_*` variable that was not
- * applied — because its name is not in `ENV_KEYS`, or because its value could
- * not be parsed (a boolean that is not `true`/`false`, a non-numeric exit
- * code) — is listed there. Unknown names are a warning by design; so are bad
- * values, because a typo in one CI variable must not fail a whole job. Values
- * under `UNITYCI_SECRET_*` are read by the lifecycle code directly and are
- * deliberately never part of the configuration, so they are not "unknown".
+ * The result separates the two warning conditions, because they mean different
+ * things to the user:
+ * - `unknown` lists every `UNITYCI_*` variable whose name is not in
+ *   `ENV_KEYS` (and is not `UNITYCI_SECRET_*`) — a typo or a variable from
+ *   another tool; the value is ignored.
+ * - `warnings` lists every variable that **is** known but whose value could not
+ *   be parsed (a non-boolean where a boolean is expected, a non-integer where a
+ *   number is expected); the value is ignored and the lower layer stands.
+ *
+ * Neither is a failure: an environment typo must not fail a whole CI job.
+ * Values under `UNITYCI_SECRET_*` are read by the lifecycle code directly and
+ * are deliberately never part of the configuration, so they are not "unknown".
  */
 export function readEnvConfig(env: NodeJS.ProcessEnv): {
   patch: DeepPartial<Config>;
   unknown: string[];
+  warnings: string[];
 } {
   const patch: Record<string, unknown> = {};
   const unknown: string[] = [];
+  const warnings: string[] = [];
 
   for (const [name, raw] of Object.entries(env)) {
     if (!name.startsWith('UNITYCI_')) continue;
@@ -148,12 +155,13 @@ export function readEnvConfig(env: NodeJS.ProcessEnv): {
     if (raw === undefined) continue;
     const parsed = parseValue(path, raw);
     if (!parsed.ok) {
-      unknown.push(name);
+      warnings.push(name);
       continue;
     }
     setAt(patch, path, parsed.value);
   }
 
   unknown.sort();
-  return { patch: patch as DeepPartial<Config>, unknown };
+  warnings.sort();
+  return { patch: patch as DeepPartial<Config>, unknown, warnings };
 }

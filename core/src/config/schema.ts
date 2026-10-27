@@ -85,7 +85,7 @@ export const DEFAULT_CONFIG: Config = {
     target: 'StandaloneWindows64',
     profile: null,
     executeMethod: null,
-    outputPath: 'ci-output/build',
+    outputPath: 'ci-output/build/game',
     versioningStrategy: 'none',
     buildVersion: null,
     androidVersionCode: null,

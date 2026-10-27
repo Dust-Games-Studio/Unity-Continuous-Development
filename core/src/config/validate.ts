@@ -94,11 +94,10 @@ function checkNullableVersion(path: string, value: unknown, issues: ConfigIssue[
 }
 
 /**
- * Validates a merged configuration and returns every problem. It never throws
- * and never exits: the CLI entrypoint turns a non-empty list into exit 64.
- *
- * One rule is a *repair* rather than an issue: opt-in retry of exit code 6 is
- * capped at two attempts (one retry), so a compile error cannot loop.
+ * Validates a merged configuration and returns every problem. It never throws,
+ * never exits and **never mutates** the config it is given: the CLI entrypoint
+ * turns a non-empty list into exit 64, and `loadConfig` applies the one repair
+ * (the exit-code-6 retry cap) after validation.
  *
  * `projectRoot` is where `output.*` paths must resolve; it defaults to the
  * process working directory so the documented one-argument call still works.
@@ -149,11 +148,6 @@ export function validateConfig(config: Config, projectRoot: string = process.cwd
         });
       }
     }
-    // Exit code 6 may be retried at most once: a terminal "no verdict" failure
-    // gets one extra attempt, never a loop.
-    if (codes.includes(EXIT.COMMAND_FAILED) && config.retry.maxAttempts > 2) {
-      config.retry.maxAttempts = 2;
-    }
   }
 
   if (!Number.isInteger(config.retry.maxAttempts) || config.retry.maxAttempts < 1) {
@@ -193,43 +187,39 @@ export function validateConfig(config: Config, projectRoot: string = process.cwd
   }
 
   // --- paths --------------------------------------------------------------------
+  // `output.dir` and `build.outputPath` are directories-or-files by design:
+  // both only have to resolve inside the project root.
   insideProjectRoot('output.dir', config.output.dir, root, issues);
+  insideProjectRoot('build.outputPath', config.build.outputPath, root, issues);
   const testOutputDir = insideProjectRoot(
     'test.outputDir',
     config.test.outputDir,
     root,
     issues,
   );
-  const buildOutputPath = insideProjectRoot(
-    'build.outputPath',
-    config.build.outputPath,
-    root,
-    issues,
-  );
 
   if (testOutputDir !== null && Array.isArray(modes)) {
-    // The core writes one report file per mode: <test.outputDir>/<Mode>.xml.
+    // `unity test --output` takes a FILE. The core writes one NUnit report and
+    // one JUnit report per mode: <test.outputDir>/<Mode>.xml and
+    // <test.outputDir>/<Mode>.junit.xml.
     for (const mode of modes) {
       if (typeof mode !== 'string') continue;
-      const reportPath = join(testOutputDir, `${mode}.xml`);
-      const issue = reportPathIssue(
-        'test.outputDir',
-        reportPath,
-        `test.outputDir puts the ${mode} report at ${reportPath}, which is an existing directory; a report path must be a file — Unity accepts a directory silently and then writes no report at all`,
-      );
-      if (issue) issues.push(issue);
+      for (const suffix of ['.xml', '.junit.xml']) {
+        const reportPath = join(testOutputDir, `${mode}${suffix}`);
+        const issue = reportPathIssue(
+          'test.outputDir',
+          reportPath,
+          `test.outputDir puts the ${mode} report at ${reportPath}, which is an existing directory; a report path must be a file — Unity accepts a directory silently and then writes no report at all`,
+        );
+        if (issue) issues.push(issue);
+      }
     }
   }
 
-  if (buildOutputPath !== null) {
-    const issue = reportPathIssue(
-      'build.outputPath',
-      buildOutputPath,
-      `build.outputPath is an existing directory (${buildOutputPath}); a report path must be a file — Unity accepts a directory silently and then writes no report at all`,
-    );
-    if (issue) issues.push(issue);
-  }
+  // `build.outputPath` may be a file or a directory (`unity build --profile
+  // WebGL --output-path ./Build/WebGL` is documented as a directory), so the
+  // existing-directory rule deliberately does not apply to it. It only has to
+  // resolve inside the project root, checked above.
 
-  // `output.dir` is a directory by design; it only has to resolve inside the root.
   return issues;
 }

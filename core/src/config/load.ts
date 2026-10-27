@@ -1,6 +1,8 @@
 import { readFileSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parse } from 'yaml';
+import type { ParseResult } from '../args.js';
+import { EXIT } from '../exit-codes.js';
 import { readEnvConfig, type DeepPartial } from './env.js';
 import { DEFAULT_CONFIG, type Config, type ConfigIssue } from './schema.js';
 import { validateConfig } from './validate.js';
@@ -21,12 +23,14 @@ const LICENSE_SECRET_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 export interface LoadConfigOptions {
-  /** Where `unity-ci.yml` is looked up, and what relative paths resolve against. */
+  /** The already-resolved Unity project root; the config file is read from here. */
+  projectPath: string;
+  /** The invocation directory. Only used to resolve relative paths (e.g. `--config`). */
   cwd: string;
-  /** The already-parsed flags; `loadConfig` never re-parses argv. */
-  argv: Record<string, string | boolean | string[]>;
+  /** The already-parsed flags, exactly as the parser produces them. */
+  argv: ParseResult['flags'];
   env: NodeJS.ProcessEnv;
-  /** An explicit config file (the caller's resolved `--config`), if any. */
+  /** An explicit config file (the caller's `--config`), if any. */
   configFile?: string;
 }
 
@@ -34,6 +38,9 @@ export interface LoadConfigResult {
   config: Config;
   issues: ConfigIssue[];
   unknownEnvVars: string[];
+  warnings: string[];
+  /** The resolved project root, echoed back so callers never recompute it. */
+  projectPath: string;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -86,10 +93,9 @@ function mergeDeep<T>(base: T, patch: DeepPartial<T>): T {
   return output as T;
 }
 
-/** The project root paths must resolve inside: `--project-path`, else `cwd`. */
-function projectRoot(cwd: string, argv: LoadConfigOptions['argv']): string {
-  const flag = argv['project-path'];
-  return typeof flag === 'string' && flag !== '' ? resolve(cwd, flag) : cwd;
+/** Resolves the caller-supplied project root against the invocation directory. */
+function resolveProjectPath(cwd: string, projectPath: string): string {
+  return resolve(cwd, projectPath);
 }
 
 function isFile(path: string): boolean {
@@ -101,16 +107,19 @@ function isFile(path: string): boolean {
 }
 
 /**
- * `--config` wins, then `unity-ci.yml`, then `unity.ci.yml`. An explicitly
- * requested file that does not exist is an issue; an absent default is not.
+ * `--config` wins, then `<projectPath>/unity-ci.yml`, then
+ * `<projectPath>/unity.ci.yml`. An explicitly requested file that does not
+ * exist is an issue; an absent default is not.
  */
 function resolveConfigFile(
+  projectPath: string,
   cwd: string,
   options: LoadConfigOptions,
   issues: ConfigIssue[],
 ): string | null {
   const requested = options.configFile ?? options.argv['config'];
   if (typeof requested === 'string' && requested !== '') {
+    // An explicit path is relative to where the user typed it, not to the project.
     const path = resolve(cwd, requested);
     if (!isFile(path)) {
       issues.push({ path, message: `configuration file not found: ${path}` });
@@ -119,7 +128,7 @@ function resolveConfigFile(
     return path;
   }
   for (const name of CONFIG_FILENAMES) {
-    const path = resolve(cwd, name);
+    const path = resolve(projectPath, name);
     if (isFile(path)) return path;
   }
   return null;
@@ -194,7 +203,7 @@ function describe(error: unknown): string {
 }
 
 /** The only flags that map to configuration keys; the rest are command input. */
-function readFlagConfig(argv: LoadConfigOptions['argv']): DeepPartial<Config> {
+function readFlagConfig(argv: ParseResult['flags']): DeepPartial<Config> {
   const output: DeepPartial<Config['output']> = {};
   let touched = false;
 
@@ -220,20 +229,41 @@ function readFlagConfig(argv: LoadConfigOptions['argv']): DeepPartial<Config> {
 }
 
 /**
+ * Exit code 6 may be retried at most once (two attempts): re-running an
+ * identical broken configuration reproduces the failure, so a loop is never
+ * useful. The cap is applied **here**, after validation, because
+ * `validateConfig` is pure and must not modify the config it is given.
+ */
+function capCommandFailedRetries(config: Config): void {
+  if (
+    Array.isArray(config.retry.onExitCodes) &&
+    config.retry.onExitCodes.includes(EXIT.COMMAND_FAILED) &&
+    config.retry.maxAttempts > 2
+  ) {
+    config.retry.maxAttempts = 2;
+  }
+}
+
+/**
  * Builds the effective configuration. Precedence is by **layer**, not by key:
  * defaults, then the config file, then the `UNITYCI_*` environment patch, then
  * the CLI flags — each deep-merged over the previous one.
  *
+ * The config file is discovered at the **project root**, not at `cwd`: a run
+ * against `--project-path examples/minimal-project` must honour that project's
+ * own `unity-ci.yml`. `cwd` only resolves relative paths.
+ *
  * A file that cannot be parsed is an issue, never a crash, and the defaults
  * are still returned. Validation issues are appended but never thrown; the
- * caller decides that a non-empty list means exit 64.
+ * caller decides that a non-empty list means exit 64. The exit-code-6 retry cap
+ * is the only repair, and it is applied after validation.
  */
 export function loadConfig(options: LoadConfigOptions): LoadConfigResult {
   const cwd = resolve(options.cwd);
-  const root = projectRoot(cwd, options.argv);
+  const projectPath = resolveProjectPath(cwd, options.projectPath);
   const issues: ConfigIssue[] = [];
 
-  const configFile = resolveConfigFile(cwd, options, issues);
+  const configFile = resolveConfigFile(projectPath, cwd, options, issues);
   const fileLayer = configFile === null ? {} : readConfigFile(configFile, issues);
   const envLayer = readEnvConfig(options.env);
   const flagLayer = readFlagConfig(options.argv);
@@ -243,7 +273,14 @@ export function loadConfig(options: LoadConfigOptions): LoadConfigResult {
   config = mergeDeep(config, envLayer.patch);
   config = mergeDeep(config, flagLayer);
 
-  issues.push(...validateConfig(config, root));
+  issues.push(...validateConfig(config, projectPath));
+  capCommandFailedRetries(config);
 
-  return { config, issues, unknownEnvVars: envLayer.unknown };
+  return {
+    config,
+    issues,
+    unknownEnvVars: envLayer.unknown,
+    warnings: envLayer.warnings,
+    projectPath,
+  };
 }
