@@ -1,0 +1,23 @@
+{
+  "name": "@unityci/core",
+  "version": "0.0.0",
+  "description": "Provider-neutral core for unity-ci-kit",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "unityci": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.5",
+    "typescript": "5.9.3",
+    "vitest": "5.0.5"
+  }
+}

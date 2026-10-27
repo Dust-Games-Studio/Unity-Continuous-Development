@@ -112,3 +112,10 @@ cmake-build-*/
 out/
 ### superpowers scratch
 .superpowers/
+
+### Unity projects
+!**/[Pp]ackages/manifest.json
+!**/[Pp]ackages/packages-lock.json
+node_modules/
+ci-output/
+.superpowers/
