@@ -908,22 +908,30 @@ Expected: FAIL — module not found.
 
 `runTest`:
 1. `await setup(ctx)` — on failure, `finally` still runs `returnLicense`.
-2. `await activateLicense(ctx)` inside the same `try`.
-3. `finally { await returnLicense(ctx) }` (GC9).
-4. For each mode in `config.test.modes` (default `['EditMode']`), build argv:
-   `['test', projectPath, '--mode', mode, '--output', <test.outputDir>/<mode>.xml, '--report-format', 'nunit,junit', '--junit-output', <test.outputDir>/<mode>.junit.xml, '--format', 'json']` plus `--filter` when set, `--coverage --coverage-output <test.outputDir>/coverage` when `config.test.coverage`, `--shard <n>` when `config.test.shards` is set, `--retries <n>` when `config.test.retries > 0`, and the editor arguments `-- -nographics` when `config.test.nographics` is true **and** the mode is `EditMode` (PlayMode needs a graphics device for simulated input).
+2. `await doctorCommand(ctx)` — the preflight gate (R11), **once**, after `setup` and before the licence step. `setup` deliberately does not run `unity doctor --ci` (that is `doctor`'s job), so without this call the run path would never execute the preflight at all.
+3. `await activateLicense(ctx)` inside the same `try`.
+4. `finally { await returnLicense(ctx) }` (GC9).
+5. For each mode in `config.test.modes` (default `['EditMode']`), build argv:
+   `['test', projectPath, '--mode', mode, '--output', <test.outputDir>/<mode>.xml, '--report-format', 'nunit,junit', '--junit-output', <test.outputDir>/<mode>.junit.xml, '--format', 'json']` plus `--filter <pattern>` when set, `--coverage --coverage-output <test.outputDir>/coverage` when `config.test.coverage`, `--shard <N/M>` when `config.test.shards` is set, `--retries <n>` when `config.test.retries > 0`, and the editor arguments `-- -nographics` when `config.test.nographics` is true **and** the mode is `EditMode` (PlayMode needs a graphics device for simulated input).
+
+   **`--shard` takes `N/M`, not a plain number** — `unity test --help` says "Run only one slice of the suite, written as N/M, so parallel CI jobs can split it". `config.test.shards` is therefore a **string** (`'1/3'`), passed through verbatim; the core does not parse or derive it.
+
+   **`--retries` and the toolkit's retry are different things.** `unity test --retries <n>` re-runs individual *failing tests* inside one invocation and reports any that pass on a retry as **flaky** (Unity's own range is 0–10). The toolkit's `withRetry` re-runs the whole *invocation*. Both may be active at once and they compose: the inner one settles a flaky test, the outer one retries an infrastructure failure.
+
    Exactly **one** `--mode` per invocation: the CLI accepts a repeated `--mode` and silently lets the **last one win**, so a config bug would run PlayMode instead of EditMode with no diagnostic. The core owns mode selection and must never emit two.
    `--junit-output` is only valid together with `nunit,junit` — with `junit` alone the JUnit report *is* `--output`, and passing both is a usage error (exit 2). The core therefore always requests `nunit,junit` and passes both paths.
    `--allow-install` is **never** sent (see Task 5): a missing Editor fails fast with the exact install command instead.
-5. Each mode's run goes through `withRetry` with the configured policy.
-6. After the runs, **verify the artifacts before believing them**: each NUnit report path must exist and be non-empty. Then parse it with `parseNUnit` (Task 8).
+6. Each mode's run goes through `withRetry` with the configured policy.
+7. After the runs, **verify the artifacts before believing them**: each NUnit report path must exist and be non-empty. Then parse it with `parseNUnit` (Task 8).
    - A mode exited 0 but produced **no report file** (or an empty one) → the run is `infra_failed` and the overall exit code is **6** — never a false green (Review Focus #1). This is a real failure mode: `unity test --output <directory>` runs the tests, exits 8, and writes **no report at all**, with no error and no warning.
    - A report exists but cannot be parsed → the exit code is **65** (GC7).
    - A mode that exited 8 (tests ran and failed) **must** have produced a report; a missing report alongside exit 8 is still `infra_failed` (6), because "tests failed" without an artifact is not a result anyone can act on.
-7. Aggregate `tests` counts across modes; aggregate `reports`.
-8. Write `summary.json` per GC11 using `buildSummary` and `writeSummary`, including `cliVersion`, `cliChannel` and `cliCommit` resolved by `setup`.
+8. Aggregate `tests` counts across modes; aggregate `reports`.
+9. Write `summary.json` per GC11 using `buildSummary` and `writeSummary`, including `cliVersion`, `cliChannel` and `cliCommit` resolved by `setup`.
 
 `runCommand` dispatches to `runTest` or `runBuild`, writes `summary.json`, and returns the exit code: `0` when the underlying result is `passed`, `8` when `tests_failed`, otherwise the raw Unity exit code (6, 11, 12, 14 …). A config-validation failure returns **64** without running anything.
+
+**The teardown returns a seat only if the toolkit took one.** GC9 makes the teardown *unconditional* — the `finally` always runs it — but "unconditional" must not mean "return whatever licence this machine happens to have". Under `license.mode: none` a developer's own personal licence is active and must be left alone; a blanket `unity license return` would **return the developer's licence** as a side effect of running the toolkit locally. So the `finally` always calls `returnLicense`, and `returnLicense` is a **no-op** — with a debug log — when `activateLicense` reported that the toolkit activated nothing (`activated: false`). The same applies when `setup` or `doctor` failed before activation was ever attempted.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
