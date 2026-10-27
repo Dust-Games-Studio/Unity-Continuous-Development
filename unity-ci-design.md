@@ -77,8 +77,8 @@ It replaces the role that `game-ci/cli` plus the `unity-activate`, `unity-test-r
 | Command | Purpose |
 |---|---|
 | `unityci doctor` | The preflight gate (R11). Runs `unity doctor --ci --format json`, consumes its report (`data.verdict`, `data.checks[]` with `id`/`status`/`code`/`blocking`/`message`), and adds the core's own checks: capability matrix (R13), glibc on Linux, disk space, licence state (R17), and git-dependency reachability (R19). Safe to run as the first CI step and to upload as a diagnostic artifact. |
-| `unityci setup` | Resolves the Editor version (from `ProjectSettings/ProjectVersion.txt` when `unity.editor.version` is `from-project`) and reads `unity editors --installed --format json`. Three branches: **present** with the modules the build target needs → verify only, install nothing (a present Editor missing a required module is exit 64 naming the module, never a silent reinstall); **missing** and `unity.editor.acceptEula: true` → `unity install <ver> -m <mods…> [--cm] --yes --accept-eula`; **missing** and `acceptEula: false` → exit 64 with the exact command to run. The core never accepts the EULA silently on the user's behalf, because `--accept-eula` accepts Unity's and every module's license agreements, and it never sends `--allow-install` (S8). When `unity.editor.terms` is true it then runs `unity terms accept <ver> --yes` (R10). Idempotent. |
-| `unityci license status` / `activate` / `return` | Thin, explicit wrappers over `unity license`. `status` is the precondition check — exit 64 when nothing is active and `license.mode: none` (R17). `activate` performs the route selected by `license.mode` (S1); `return` is the one the teardown calls, because a teardown returns a seat rather than acquiring one. |
+| `unityci setup` | Resolves the Editor version (from `ProjectSettings/ProjectVersion.txt` when `unity.editor.version` is `from-project`) and reads `unity editors --installed --format json`. Three branches: **present** with the modules the **invoked command** needs → verify only, install nothing (a test run needs the test modules, a build needs the target's modules, and a command with no module requirement checks only the Editor version; a present Editor missing a required module is exit 64 naming the module, never a silent reinstall); **missing** and `unity.editor.acceptEula: true` → `unity install <ver> -m <mods…> [--cm] --yes --accept-eula`; **missing** and `acceptEula: false` → exit 64 with the exact command to run. The core never accepts the EULA silently on the user's behalf, because `--accept-eula` accepts Unity's and every module's license agreements, and it never sends `--allow-install` (S8). When `unity.editor.terms` is true it then runs `unity terms accept <ver> --yes` (R10). Idempotent. |
+| `unityci license status` / `activate` / `return` | Thin, explicit wrappers over `unity license`. `status` reports the license state and, in an activation mode, whether the current license matches what that mode expects; a not-yet-active license is reported there, not treated as an error, because the lifecycle activates it and re-checks afterwards. Under `license.mode: none` the same check is the precondition and exits 64 when nothing is active (R17). `activate` performs the route selected by `license.mode` (S1); `return` is the one the teardown calls, because a teardown returns a seat rather than acquiring one. |
 | `unityci run test` | Lifecycle: preflight → setup → packages preflight → license step → `unity test` → verify artifacts → report → **finally** license return. |
 | `unityci run build` | Same lifecycle around `unity build`. |
 | `unityci report` | Asserts every expected artifact exists and is non-empty (R18), converts NUnit XML to JUnit XML **only when Unity produced no JUnit file** (D8), and writes or refreshes `summary.json`. |
@@ -136,7 +136,7 @@ Rules:
 - `serial`, `floating` and `offline-file` — the three unattended activation routes. `serial` reads the serial from `license.serialEnv`, so it never reaches `argv`; `floating` needs a server already configured on the machine (check it with `unity license server status` first); `offline-file` base64-decodes `license.fileEnv` into a temporary `.ulf`, passes it with `--file`, and deletes it afterward.
 - `personal` — requires a signed-in user and is rejected outright for a service-account session, so it is **local-only**; it is never valid in CI.
 
-The mode selects the route used by the lifecycle's license step and by the explicit `unityci license activate` wrapper. `return` runs in `finally` regardless of mode.
+The mode selects the route used by the lifecycle's license step and by the explicit `unityci license activate` wrapper. In `none` mode the lifecycle only reads `status` and fails fast when no license is active; in the activation modes it activates first and then re-reads `status`. `return` runs in `finally` regardless of mode.
 
 ### 4.3 Process execution
 
@@ -199,7 +199,7 @@ doctor (preflight) → setup: verify or install (EULA-gated) + terms accept → 
 ```
 
 - `unity version --format json` is captured **first**, before any other Unity call, and recorded in `summary.json` (R16).
-- `unity terms accept <editorVersion> --yes` runs after the install and before the first batch-mode launch. Without it the Editor stops on the "Unity Editor Software Terms" dialog and the job fails or hangs instead of running tests (R10). `unity.editor.terms: false` opts out for machines where the terms are already accepted.
+- `unity terms accept <editorVersion> --yes` runs after the install and before the first batch-mode launch. Without it the Editor stops on the "Unity Editor Software Terms" dialog and the job fails or hangs instead of running tests (R10). This is the default (`unity.editor.terms: true`); `terms: false` is the explicit opt-out for a machine where the terms were already accepted outside the toolkit.
 - **The license is checked before any test or build runs (R17).** The core reads `unity license status --format json` → `data.active`. With the default `license.mode: none` it activates nothing: no active license means exit 64 naming the three unattended routes (`--serial` from a secret, `--floating` after `unity license server status`, `--file` from a base64 secret). With `serial`, `floating` or `offline-file` it activates through that route first (Section 4.2), re-checks, and treats a failure as a configuration error (64), never a retryable one. `personal` never runs unattended (S1).
 - **A report that was not written is not a pass, and an exit code without an artifact is not a verdict.** Every expected artifact is asserted to exist and be non-empty before anything is reported on it; "ran but produced nothing" is an infrastructure failure (exit 6), never a green or a red test run (R18).
 - `license return` failures are logged loudly but never mask the primary exit code.
@@ -248,11 +248,12 @@ ci-output/
 ```json
 {
   "editor":  { "paths": ["<download-cache-path>"], "key": "unity-downloads-<editorVersion>" },
-  "library": { "paths": ["<project>/Library"],     "key": "<unity cache key>" }
+  "library": { "paths": ["<project>/Library"],     "key": "<unity cache key>",
+               "staticKey": "unity-library-<editorVersion>-<target>" }
 }
 ```
 
-The Editor install directory is **never** a cache path: it is global, shared with the Hub and other projects, and restoring over it can corrupt every install on the machine (see below). Providers that must compute a key before the job's script runs, such as GitLab, use `library.staticKey` = `unity-library-<editorVersion>-<target>`.
+The Editor install directory is **never** a cache path: it is global, shared with the Hub and other projects, and restoring over it can corrupt every install on the machine (see below). `library.staticKey` exists for providers such as GitLab, which must compute a cache key **before** the job's script runs and therefore cannot shell out; it is derived only from the Editor version and the target.
 
 `cliVersion`, `cliChannel` and `cliCommit` come from `unity version --format json`, captured at the start of the run. `unity build`'s provenance manifest already records the CLI build; it is merged in when present (R16).
 
@@ -402,7 +403,7 @@ Rules enforced by lint or CI:
 
 ---
 
-## 9. Spike 0: resolve before building (about 1 to 2 days)
+## 9. Spike 0: questions and resolved answers
 
 Each item gets a short written answer committed to `docs/decisions/`. **All nine are answered** — the conclusions are recorded in the Spike 0 outcomes section below, and the evidence is in the decision records.
 
@@ -460,7 +461,7 @@ Yes — an already-installed Editor is reused with **no** install step at all: e
 
 ### S9 — Stability, versioning and pinning
 
-Unity's docs state plainly: "The Unity command-line interface (CLI) is experimental. The features and documentation might change in an upcoming release." Versions are `1.0.0-beta.N`, shipping roughly fortnightly (beta.1 on 2026-06-30 → beta.14 on 2026-10-21). There is **no stable channel yet** — the installer "gets the latest beta on its own" "until a stable release ships", and `unity self-update --check --channel stable` is documented as the check you run "when moving off a beta once GA ships". **GA is undated.** Breaking changes ship per-beta under "Breaking changes" headings (beta.7 reached the beta channel and was withdrawn the same day it shipped), so a hard minimum-version gate would rot within weeks. **Pinning is not trustable**: "The Unity Hub updates the Unity CLI automatically. You can't disable these updates in the Hub", and "If you installed the CLI as an MSIX package, including through winget, Windows keeps the CLI current in the background. Rollback isn't available for MSIX installs." Therefore pinning is an **install-method policy** (apt/dnf/brew with an explicit version, or a standalone binary outside the Hub's path), not a version string, and the toolkit ships a **capability matrix** rather than a minimum-version constant. A CLI newer than tested is a loud warning, not a failure (GC17, GC18).
+Unity's docs state plainly: "The Unity command-line interface (CLI) is experimental. The features and documentation might change in an upcoming release." Versions are `1.0.0-beta.N`, shipping roughly fortnightly (beta.1 on 2026-06-30 → beta.14 on 2026-10-21). There is **no stable channel yet** — the installer "gets the latest beta on its own" "until a stable release ships", and `unity self-update --check --channel stable` is documented as the check you run "when moving off a beta once GA ships". **GA is undated.** Breaking changes ship per-beta under "Breaking changes" headings (beta.7 reached the beta channel and was withdrawn the same day it shipped), so a hard minimum-version gate would rot within weeks. **Pinning is not trustable**: "The Unity Hub updates the Unity CLI automatically. You can't disable these updates in the Hub", and "If you installed the CLI as an MSIX package, including through winget, Windows keeps the CLI current in the background. Rollback isn't available for MSIX installs." Therefore pinning is an **install-method policy** (apt/dnf/brew with an explicit version, or a standalone binary outside the Hub's path), not a version string, and the toolkit ships a **capability matrix** rather than a minimum-version constant. A CLI newer than the tested range is a loud warning rather than a failure, and the core probes for the capabilities it needs instead of gating on a version number.
 
 ### What the outcomes change in this document
 
@@ -474,7 +475,7 @@ Unity's docs state plainly: "The Unity command-line interface (CLI) is experimen
 
 These are binding on every later task. R10–R19 are stated here once; the sections above explain how they land in the design.
 
-- **R10 — Accept the Editor Software Terms.** The lifecycle must run `unity terms accept <editorVersion> --yes` after installing the Editor and before the first batch-mode run, otherwise the Editor stops on the Software Terms dialog.
+- **R10 — Accept the Editor Software Terms.** The lifecycle must run `unity terms accept <editorVersion> --yes` after installing the Editor and before the first batch-mode run, otherwise the Editor stops on the Software Terms dialog. This is the default (`unity.editor.terms: true`); `terms: false` is the explicit opt-out for a machine where the terms were already accepted outside the toolkit.
 - **R11 — Doctor is the preflight gate.** `unity doctor --ci` is the preflight gate; its JSON report (`data.verdict`, `data.checks[]` with `id`/`status`/`code`/`blocking`/`message`) is what `unityci doctor` consumes.
 - **R12 — Do not reimplement `unity ci init`.** Unity ships `unity ci init --provider github|gitlab`, which generates a complete stock workflow (install, caches, runtime libraries, license, preflight, test, build, license return). `unity-ci-kit` does **not** reimplement that; it adds what the stock workflow lacks — provider-neutrality beyond GitHub/GitLab, local execution identical to CI, a `summary.json` contract, retries, and guaranteed license teardown under signals. The GitHub adapter reuses Unity's proven install/cache/library sequence and adds the missing guarantees.
 - **R13 — Capability matrix, not a version gate.** The core probes `unity version --format json` and the presence of the commands and flags it needs, and degrades with a clear message when one is missing. It must never fail a run solely because the CLI is newer than tested.
@@ -484,6 +485,8 @@ These are binding on every later task. R10–R19 are stated here once; the secti
 - **R17 — The licence is a precondition, not a step the toolkit owns.** `unity license status --format json` reports `data.active`; the core checks it and fails fast with exit 64 when no licence is active, instead of attempting an activation it cannot perform unattended. The three documented unattended routes are `--serial` (from a secret), `--floating` (with `unity license server status` checked first) and `--file` (a base64 secret decoded to a `.ulf`). The docs must state that an offline `--file` licence **cannot be returned** — those runners leak seats.
 - **R18 — Never trust a result you did not verify.** A report that was not written is not a pass, and an exit code without an artifact is not a verdict. The core asserts every artifact exists and is non-empty before it reports on it, and treats "ran but produced nothing" as an infrastructure failure (exit 6) rather than a green or a red test run.
 - **R19 — Private git packages are a first-class concern.** A project may depend on a package in a private git repository. The design must cover three things: (a) **detection** — the core reads the project's git dependencies, reports their hosts, and refuses to run if a URL embeds credentials, because Unity copies that URL verbatim into the committed `packages-lock.json`; (b) **preflight** — the core proves each dependency is fetchable with `git ls-remote`, using the same git configuration the Package Manager will use, so a missing credential fails in seconds instead of ten minutes into an Editor launch; (c) **credential supply** — the adapter's job, never the core's, because the credential is a provider secret. The supported mechanism is a **git URL rewrite** (the manifest keeps a credential-free URL; git applies the credential at fetch time), measured in `docs/decisions/upm-git-auth-probe.md`: Unity's Package Manager honours a rewrite in `~/.gitconfig`, in `$XDG_CONFIG_HOME/git/config`, and through the per-invocation `GIT_CONFIG_*` variables, and **ignores `GIT_CONFIG_GLOBAL`**.
+
+Two scoping notes on the list above. **R17** describes the default `license.mode: none`: the lifecycle reads `unity license status` and fails fast with exit 64 when nothing is active. When the mode selects an activation route (`serial`, `floating` or `offline-file`), the lifecycle activates through that route first and then applies the same status check; `personal` stays local-only (Section 4.2). **R10** is the default behaviour: `unity.editor.terms: true` runs `unity terms accept`, and `terms: false` exists only for a machine where the terms were already accepted outside the toolkit.
 
 ---
 
@@ -504,7 +507,7 @@ These are binding on every later task. R10–R19 are stated here once; the secti
 
 **Carry over**
 
-- Spawn via argv arrays. Secrets via env only.
+- Spawn via argv arrays. Secrets via the environment or git configuration only.
 - Version-string validation before it reaches paths or URLs.
 - Exit-code-driven flow and "publish results on 0 or 8" semantics (game-ci: 0 or 2).
 - Token threading and rate-limit awareness where GitHub API calls are needed (e.g. fetching releases). Pass tokens explicitly, since `GITHUB_TOKEN` is not auto-injected into a JS action's env. This only applies to the GitHub adapter.
