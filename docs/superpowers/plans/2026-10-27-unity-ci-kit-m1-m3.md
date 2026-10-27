@@ -312,11 +312,14 @@ Fix the root `.gitignore` at the same time. It carries a NuGet rule `**/[Pp]acka
 !**/[Pp]ackages/manifest.json
 !**/[Pp]ackages/packages-lock.json
 node_modules/
+!*/src/packages/**
 dist/
 *.tsbuildinfo
 ci-output/
 .superpowers/
 ```
+
+The `!*/src/packages/**` negation is **not** cosmetic. The pre-existing NuGet rule `**/[Pp]ackages/*` matches the toolkit's **own** source directory `core/src/packages/`, so without the negation any new file placed there is invisible to `git status` and to `git add .` — it would be silently lost. Verified: with the rule alone, `git check-ignore --no-index -v core/src/packages/<new>.ts` matches; with the negation, `git status` reports the file and `git add -n` stages it.
 
 `core/package.json` declares `"type": "module"`, `"bin": { "unityci": "./dist/cli.js" }`, the three dev dependencies at their exact pinned versions (`typescript@5.9.3`, `vitest@5.0.5`, `@types/node@26.6.5`), the scripts `build` (`tsc -p tsconfig.json`), `typecheck` (`tsc --noEmit`) and `test` (`vitest run`), and `"engines": { "node": ">=22.4" }`.
 
