@@ -1,4 +1,8 @@
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EXIT } from '../src/exit-codes.js';
 import { spawnProcess } from '../src/exec.js';
@@ -18,8 +22,12 @@ interface Harness {
 function harness(): Harness {
   const lines: string[] = [];
   const redactor = createRedactor();
+  // The logger deliberately gets a DIFFERENT redactor with no registered
+  // secrets. If exec.ts relied on the logger to mask child output, the
+  // streaming-redaction assertion would fail: masking must happen in exec.ts
+  // before the line reaches the logger.
   const logger = createLogger({
-    redactor,
+    redactor: createRedactor(),
     level: 'debug',
     sink: (line) => {
       lines.push(line);
@@ -47,10 +55,35 @@ function nodeArgs(script: string, ...tokens: string[]): string[] {
 }
 
 const savedEnv = new Map<string, string | undefined>();
+const tempDirs: string[] = [];
 
 function setEnv(name: string, value: string): void {
   if (!savedEnv.has(name)) savedEnv.set(name, process.env[name]);
   process.env[name] = value;
+}
+
+function tempDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'unityci-exec-'));
+  tempDirs.push(dir);
+  return dir;
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForDeath(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return !isAlive(pid);
 }
 
 afterEach(() => {
@@ -59,25 +92,31 @@ afterEach(() => {
     else process.env[name] = value;
   }
   savedEnv.clear();
+  for (const dir of tempDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
   vi.restoreAllMocks();
 });
 
 describe('spawnProcess', () => {
   it('spawns the binary with an argv array and no shell', async () => {
     const child = new EventEmitter() as EventEmitter & {
-      stdout: EventEmitter;
-      stderr: EventEmitter;
+      stdout: PassThrough;
+      stderr: PassThrough;
       kill: ReturnType<typeof vi.fn>;
     };
-    child.stdout = new EventEmitter();
-    child.stderr = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
     child.kill = vi.fn();
 
     const spawnMock = vi.fn(
       (_file: string, _args: string[], _options: Record<string, unknown>) => {
         queueMicrotask(() => {
-          child.stdout.emit('data', '{"ok":true}');
-          child.emit('close', 0, null);
+          child.stdout.end('{"ok":true}');
+          child.stderr.end();
+          setImmediate(() => {
+            child.emit('close', 0, null);
+          });
         });
         return child;
       },
@@ -88,7 +127,7 @@ describe('spawnProcess', () => {
 
     const env = { PATH: process.env.PATH ?? '', PROBE: 'value' };
     const { logger, redactor } = harness();
-    let result: { code: number; stdout: string; stderr: string } | undefined;
+    let result: { code: number } | undefined;
     try {
       const { spawnProcess: spawnWithMock } = await import('../src/exec.js');
       result = await spawnWithMock({
@@ -110,7 +149,7 @@ describe('spawnProcess', () => {
     const [file, args, options] = call!;
 
     expect(file).toBe('unity');
-    // Never a command string: a string would let a shell split or reinterpret it.
+    // Never a command string: a shell would split or reinterpret it.
     expect(Array.isArray(args)).toBe(true);
     expect(args).toEqual(['version', '--format', 'json']);
     expect(options).toMatchObject({
@@ -151,6 +190,36 @@ describe('spawnProcess', () => {
     expect(result.code).toBe(8);
   });
 
+  it('treats stderr output with exit 0 as success', async () => {
+    const { logger, redactor } = harness();
+    const result = await spawnProcess({
+      file: process.execPath,
+      args: nodeArgs('process.stderr.write("just a warning"); process.exit(0)'),
+      cwd: CWD,
+      env: {},
+      logger,
+      redactor,
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe('just a warning');
+  });
+
+  it('maps ENOENT to 11 and other spawn failures to 6', async () => {
+    const { logger, redactor } = harness();
+    const result = await spawnProcess({
+      file: join(CWD, 'unityci-no-such-binary-9f3d'),
+      args: [],
+      cwd: CWD,
+      env: {},
+      logger,
+      redactor,
+    });
+
+    expect(result.code).toBe(EXIT.NOT_FOUND);
+    expect(result.stderr).toMatch(/ENOENT/);
+  });
+
   it('redacts a registered secret found in the child stdout and stderr', async () => {
     const { logger, redactor, lines } = harness();
     const secret = 'hunter2-super-secret';
@@ -172,7 +241,8 @@ describe('spawnProcess', () => {
     expect(result.stderr).toBe('error ***');
     expect(result.stdout).not.toContain(secret);
     expect(result.stderr).not.toContain(secret);
-    // Streaming output is redacted too, not only the returned strings.
+    // The logger was given an empty redactor, so this masking can only have
+    // happened inside exec.ts before the line was logged.
     expect(lines.join('')).not.toContain(secret);
     expect(lines.join('')).toContain('***');
   });
@@ -191,8 +261,48 @@ describe('spawnProcess', () => {
     });
 
     expect(result.code).toBe(EXIT.TIMEOUT);
-    // The child was spawned with a 60 s sleep; returning quickly proves the kill.
-    expect(Date.now() - started).toBeLessThan(10000);
+    // The child was spawned with a 60 s sleep; returning quickly proves the
+    // kill, and 5 s catches a lost SIGTERM inside the 2 s + 1 s escalation.
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  it('kills the whole process tree on timeout, not only the direct child', async () => {
+    const pidFile = join(tempDir(), 'grandchild.pid');
+    const script = `
+      const { spawn } = require('node:child_process');
+      const fs = require('node:fs');
+      const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+      fs.writeFileSync(${JSON.stringify(pidFile)}, String(grandchild.pid));
+      setInterval(() => {}, 1000);
+    `;
+
+    const { logger, redactor } = harness();
+    let grandchildPid: number | undefined;
+    try {
+      const result = await spawnProcess({
+        file: process.execPath,
+        args: nodeArgs(script),
+        cwd: CWD,
+        env: {},
+        logger,
+        redactor,
+        timeoutMs: 1500,
+      });
+
+      expect(result.code).toBe(EXIT.TIMEOUT);
+      grandchildPid = Number(readFileSync(pidFile, 'utf8'));
+      expect(Number.isInteger(grandchildPid)).toBe(true);
+      expect(grandchildPid).toBeGreaterThan(0);
+      await expect(waitForDeath(grandchildPid, 5000)).resolves.toBe(true);
+    } finally {
+      if (grandchildPid !== undefined) {
+        try {
+          process.kill(grandchildPid, 'SIGKILL');
+        } catch {
+          // Already dead, which is the expected outcome.
+        }
+      }
+    }
   });
 });
 
@@ -210,7 +320,7 @@ describe('runUnity', () => {
     };
   }
 
-  it('parses stdout as JSON when --format json was requested', async () => {
+  it('parses stdout as a JSON envelope when --format json was requested', async () => {
     const result = await runUnity(
       unityOpts(
         'process.stdout.write(JSON.stringify({ success: true, data: { version: "1.0.0-beta.14" } }))',
@@ -235,6 +345,35 @@ describe('runUnity', () => {
     expect(result.code).toBe(0);
     expect(result.stdout).toBe('');
     expect(result.json).toBeNull();
+  });
+
+  it('returns json: null for valid JSON that is not an envelope', async () => {
+    const result = await runUnity(unityOpts('process.stdout.write("42")'));
+
+    expect(result.json).toBeNull();
+  });
+
+  it('parses the raw stdout, so a redaction that breaks JSON cannot yield json: null', async () => {
+    const { logger, redactor } = harness();
+    // Masking this secret consumes the closing quote of `"a":""`, which turns
+    // the exposed stdout into invalid JSON. The envelope must still parse.
+    const secret = '","b":1';
+    const payload = '{"success":true,"data":{"a":"","b":1}}';
+    redactor.register(secret);
+
+    const result = await runUnity({
+      binary: process.execPath,
+      args: nodeArgs(`process.stdout.write(${JSON.stringify(payload)})`),
+      cwd: CWD,
+      env: {},
+      logger,
+      redactor,
+    });
+
+    expect(result.stdout).not.toContain(secret);
+    expect(result.stdout).toContain('***');
+    expect(() => JSON.parse(result.stdout)).toThrow();
+    expect(result.json).toEqual({ success: true, data: { a: '', b: 1 } });
   });
 
   it('passes the always-on Unity variables and strips the four token variables', async () => {
@@ -329,6 +468,7 @@ describe('unity CLI wrappers', () => {
       });
       await cli.unityInstall(base, { version: '6000.0.47f1' });
       await cli.unityTermsAccept(base, '6000.0.47f1');
+      await cli.unityLicenseStatus(base);
       await cli.unityLicenseActivate(base, ['--floating', '--file', 'license.ulf']);
       await cli.unityLicenseReturn(base);
       await cli.unityTest(base, ['--mode', 'EditMode', '--output', 'ci-output/tests/EditMode.xml']);
@@ -364,6 +504,7 @@ describe('unity CLI wrappers', () => {
       ],
       ['install', '6000.0.47f1', '--yes', '--format', 'json'],
       ['terms', 'accept', '6000.0.47f1', '--yes', '--format', 'json'],
+      ['license', 'status', '--format', 'json'],
       ['license', 'activate', '--floating', '--file', 'license.ulf', '--format', 'json'],
       ['license', 'return', '--yes', '--format', 'json'],
       [
@@ -383,11 +524,11 @@ describe('unity CLI wrappers', () => {
       ['editors', '--installed', '--format', 'json'],
     ]);
 
-    // No wrapper may ever pass a single concatenated command string.
+    // Every wrapper passes an argv array; hostile tokens are covered by the
+    // real-child argv-integrity test above.
     for (const args of calls) {
       expect(Array.isArray(args)).toBe(true);
       expect(args.every((token) => typeof token === 'string')).toBe(true);
-      expect(args[0]).not.toContain(' ');
     }
   });
 

@@ -2,12 +2,30 @@ import { spawnProcess } from '../exec.js';
 import type { Logger } from '../logger.js';
 import type { Redactor } from '../redact.js';
 
+/**
+ * The envelope every `unity … --format json` command emits (see the samples in
+ * `docs/decisions/spike0-cli.md`). Later tasks read `data` and branch on the
+ * exit code, not on `errors[0].code`.
+ */
+export interface UnityEnvelope {
+  success?: boolean;
+  data?: unknown;
+  errors?: { code?: string; message?: string }[];
+  warnings?: string[];
+}
+
 export interface UnityResult {
   code: number;
   stdout: string;
   stderr: string;
-  /** `JSON.parse(stdout)`, or null when stdout is not valid JSON. */
-  json: unknown | null;
+  /**
+   * The parsed stdout envelope, or null when stdout is not a JSON object.
+   *
+   * It is parsed from the child's raw output, so a value Unity echoes back
+   * (for example a licence serial) is present here even though `stdout` is
+   * redacted; do not persist this field without redacting it first.
+   */
+  json: UnityEnvelope | null;
 }
 
 export interface RunUnityOptions {
@@ -58,10 +76,28 @@ function unityChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return childEnv;
 }
 
+/** A top-level JSON object is a Unity envelope; anything else is "no data". */
+function parseEnvelope(raw: string): UnityEnvelope | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      return parsed as UnityEnvelope;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Runs one `unity` invocation with the Unity-specific child environment and
- * parses its stdout as JSON. Unparsable stdout is not an error here — callers
- * decide what a missing JSON document means — so `json` is null instead.
+ * parses its stdout as a JSON envelope.
+ *
+ * Parsing reads the child's **raw** stdout: redaction can mask a substring that
+ * straddles JSON syntax, and a valid document must never turn into
+ * `json: null` because a secret was registered. Only the exposed `stdout` and
+ * `stderr` strings are redacted. Unparsable stdout is not an error here —
+ * callers decide what a missing envelope means — so `json` is null instead.
  */
 export async function runUnity(opts: RunUnityOptions): Promise<UnityResult> {
   const result = await spawnProcess({
@@ -74,12 +110,10 @@ export async function runUnity(opts: RunUnityOptions): Promise<UnityResult> {
     timeoutMs: opts.timeoutMs,
   });
 
-  let json: unknown | null = null;
-  try {
-    json = JSON.parse(result.stdout);
-  } catch {
-    json = null;
-  }
-
-  return { ...result, json };
+  return {
+    code: result.code,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    json: parseEnvelope(result.rawStdout),
+  };
 }

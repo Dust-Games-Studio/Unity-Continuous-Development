@@ -10,7 +10,13 @@ import { runUnity, type UnityResult } from './exec.js';
 export const TESTED_CLI_MIN = '1.0.0-beta.9';
 export const TESTED_CLI_MAX = '1.0.0-beta.14';
 
-/** Everything a wrapper needs to start one Unity invocation. */
+/**
+ * Everything a wrapper needs to start one Unity invocation.
+ *
+ * `cwd` is the directory the child process runs in. A project path is always
+ * passed positionally to the Unity verb (`unity cache key <project>`), never
+ * folded into `cwd` and never implied by it.
+ */
 export interface UnityBaseOptions {
   binary: string;
   cwd: string;
@@ -22,14 +28,19 @@ export interface UnityBaseOptions {
 
 export interface UnityInstallOptions {
   version: string;
-  /** Module IDs installed alongside the Editor, e.g. `android`. */
+  /**
+   * Module IDs installed alongside the Editor. They are the lowercase ids from
+   * `unity install --list-modules` (`android`, `ios`, `webgl`, `linux-il2cpp`,
+   * `linux-mono`, `linux-server`, `mac-mono`,
+   * `universal-windows-platform`, …).
+   */
   modules?: string[];
   /** `true` sends `--cm`, `false` sends `--no-cm`, unset sends neither. */
   childModules?: boolean;
   /** Required only for versions that are not in Unity's release list. */
-  changeset?: string | null;
+  changeset?: string;
   /** `x86_64` or `arm64`. */
-  architecture?: string | null;
+  architecture?: string;
   /** Accepts Unity's and every selected module's licence agreements. */
   acceptEula?: boolean;
   /** Defaults to true: the toolkit never wants an interactive install. */
@@ -88,6 +99,11 @@ export function unityTermsAccept(
   return run(opts, ['terms', 'accept', version, '--yes', '--format', 'json']);
 }
 
+/** `unity license status --format json`: `data.active` is the precondition. */
+export function unityLicenseStatus(opts: UnityBaseOptions): Promise<UnityResult> {
+  return run(opts, ['license', 'status', '--format', 'json']);
+}
+
 /** `unity license activate <args…> --format json`. Secrets stay in `env`. */
 export function unityLicenseActivate(
   opts: UnityBaseOptions,
@@ -101,17 +117,26 @@ export function unityLicenseReturn(opts: UnityBaseOptions): Promise<UnityResult>
   return run(opts, ['license', 'return', '--yes', '--format', 'json']);
 }
 
-/** `unity test <args…> --format json`. The caller owns mode selection. */
+/**
+ * `unity test <args…> --format json`. The caller owns mode selection; a project
+ * path, when given, is one of the positional `args`.
+ */
 export function unityTest(opts: UnityBaseOptions, args: string[]): Promise<UnityResult> {
   return run(opts, ['test', ...args, '--format', 'json']);
 }
 
-/** `unity build <args…> --format json`. */
+/**
+ * `unity build <args…> --format json`. A project path, when given, is one of the
+ * positional `args`.
+ */
 export function unityBuild(opts: UnityBaseOptions, args: string[]): Promise<UnityResult> {
   return run(opts, ['build', ...args, '--format', 'json']);
 }
 
-/** `unity cache key <project> [--target <target>] --format json`. */
+/**
+ * `unity cache key <projectPath> [--target <target>] --format json`. The
+ * project path is positional; `opts.cwd` only sets where the child runs.
+ */
 export function unityCacheKey(
   opts: UnityBaseOptions,
   projectPath: string,
@@ -128,7 +153,10 @@ export function unityCacheInfo(opts: UnityBaseOptions): Promise<UnityResult> {
   return run(opts, ['cache', 'info', '--format', 'json']);
 }
 
-/** `unity projects verify <project> --strict --format json`. */
+/**
+ * `unity projects verify <projectPath> --strict --format json`. The project
+ * path is positional; `opts.cwd` only sets where the child runs.
+ */
 export function unityProjectsVerify(
   opts: UnityBaseOptions,
   projectPath: string,
@@ -136,7 +164,15 @@ export function unityProjectsVerify(
   return run(opts, ['projects', 'verify', projectPath, '--strict', '--format', 'json']);
 }
 
-/** `unity editors --installed --format json`: which Editors are present. */
+/**
+ * `unity editors --installed --format json`: which Editors are present.
+ *
+ * Each row's `modules` is a comma-separated list of lowercase module ids from
+ * `unity install --list-modules` (`android`, `ios`, `webgl`, `linux-il2cpp`,
+ * `linux-mono`, `linux-server`, `mac-mono`,
+ * `universal-windows-platform`, …). A later step verifies the installed modules
+ * against the build target's needs; `""` is a valid Editor with no modules.
+ */
 export function unityEditorsInstalled(opts: UnityBaseOptions): Promise<UnityResult> {
   return run(opts, ['editors', '--installed', '--format', 'json']);
 }
