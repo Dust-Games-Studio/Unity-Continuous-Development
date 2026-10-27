@@ -22,6 +22,24 @@ export interface LicenseActivation {
 }
 
 /**
+ * The outcome of a teardown attempt.
+ *
+ * `returnLicense` never throws, so this result is how a caller tells a released
+ * seat from a held one. The **run lifecycle** logs it and ignores it for the
+ * exit code (GC9); the **standalone** `unityci license return` command turns
+ * `returned: false` into exit 6, because a user who explicitly asked for a seat
+ * to be returned must not be told it succeeded when it did not.
+ *
+ * `code` is Unity's exit code, or `EXIT.COMMAND_FAILED` when the call could not
+ * run at all (a spawn failure, a thrown exception).
+ */
+export interface LicenseReturnResult {
+  returned: boolean;
+  code: number;
+  error?: string;
+}
+
+/**
  * A configuration/precondition failure in the licence lifecycle. The command
  * layer prints the message and exits `exitCode` instead of letting the error
  * escape as an internal error (R17: a licence failure is 64, never retryable).
@@ -100,6 +118,18 @@ function activationFailure(
   if (isUnsupportedCommand(result)) {
     throw new LicenseError(
       'this Unity CLI does not support `license activate`; the toolkit cannot activate a license with this CLI.',
+      EXIT.CONFIG_ERROR,
+    );
+  }
+  // Unity's CLI exits 4 when `--floating` has no server to talk to. Name the
+  // cause and the one setting that fixes it: the endpoint lives in the
+  // machine's `licensingServiceBaseUrl`, and there is deliberately no
+  // UNITY_LICENSING_SERVER environment variable to point at.
+  if (mode === 'floating' && result.code === EXIT.NEEDS_CONFIG) {
+    throw new LicenseError(
+      '`unity license activate --floating` failed (exit 4): no floating license server is configured on this machine. ' +
+        'Set the CLI\'s `licensingServiceBaseUrl` to your server; there is no UNITY_LICENSING_SERVER environment variable.' +
+        ctx.redactor.redact(failureDetail(result)),
       EXIT.CONFIG_ERROR,
     );
   }
@@ -263,17 +293,17 @@ export async function activateLicense(ctx: CoreContext): Promise<LicenseActivati
 }
 
 /**
- * Returns the licence seat (GC9).
+ * Returns the licence seat.
  *
  * This is the teardown entrypoint used by the run lifecycle and by signals. It
- * **never throws**: every failure is logged at error level and swallowed, so
- * the primary exit code of the run is the only thing the caller sees. The call
- * is bounded to 60 s.
+ * **never throws**: every failure is reported in the result and logged at error
+ * level, so the run lifecycle can log the failure loudly without changing its
+ * primary exit code (GC9). The call is bounded to 60 s.
  *
  * It runs regardless of mode, too: `return` is a safe no-op when nothing is
  * held, and a run must not guess whether a previous step took a seat.
  */
-export async function returnLicense(ctx: CoreContext): Promise<void> {
+export async function returnLicense(ctx: CoreContext): Promise<LicenseReturnResult> {
   if (ctx.config.license.mode === 'offline-file') {
     ctx.logger.warn(
       'license.mode is "offline-file": `unity license return` leaves an offline license in place, so this runner leaks a seat that must be reclaimed by hand.',
@@ -286,24 +316,29 @@ export async function returnLicense(ctx: CoreContext): Promise<void> {
     );
 
     if (isUnsupportedCommand(result)) {
-      ctx.logger.error(
-        'this Unity CLI does not support `license return`; the license seat may still be held. The primary exit code is unchanged (GC9).',
-      );
-      return;
+      const error =
+        'this Unity CLI does not support `license return`; the license seat may still be held.';
+      ctx.logger.error(error);
+      return { returned: false, code: result.code, error };
     }
     if (result.code !== 0) {
-      ctx.logger.error(
+      const error =
         `could not return the Unity license: \`unity license return --yes\` failed (exit ${result.code})` +
-          `${ctx.redactor.redact(failureDetail(result))}. The seat may still be held; the primary exit code is unchanged (GC9).`,
-      );
-      return;
+        `${ctx.redactor.redact(failureDetail(result))}. The seat may still be held.`;
+      ctx.logger.error(error);
+      return { returned: false, code: result.code, error };
     }
 
     ctx.logger.info('Unity license returned (seat released).');
+    return { returned: true, code: 0 };
   } catch (error) {
-    // Belt and braces: a thrown error here would mask the run's real result.
-    ctx.logger.error(
-      `could not return the Unity license: ${(error as Error).message}. The seat may still be held; the primary exit code is unchanged (GC9).`,
-    );
+    // Belt and braces: a throw here would mask the run's real result. There is
+    // no Unity exit code for "the call never ran", so the result carries the
+    // same synthetic code the spawn layer uses for a command that could not run.
+    const message =
+      `could not return the Unity license: ${ctx.redactor.redact((error as Error).message)}. ` +
+      'The seat may still be held.';
+    ctx.logger.error(message);
+    return { returned: false, code: EXIT.COMMAND_FAILED, error: message };
   }
 }

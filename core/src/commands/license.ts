@@ -29,11 +29,14 @@ export async function licenseActivateCommand(ctx: CoreContext): Promise<number> 
  * `unityci license return`: the teardown command adapters call from an
  * `always()` step.
  *
- * It always exits 0. `returnLicense` logs a failed return loudly but never
- * throws, and a teardown must never mask the primary exit code (GC9) — an
- * adapter step that turned red here would fail a job whose tests passed.
+ * A failed return exits **6**. This is deliberately different from the run
+ * lifecycle's teardown: that teardown has a primary exit code to preserve and
+ * only logs the failure (GC9), while this command has no primary exit code —
+ * the user explicitly asked for a seat to be returned, and exit 0 on a failed
+ * return is exactly how a leaked Unity seat goes unnoticed on a runner.
+ * `returnLicense` has already logged the reason at error level.
  */
 export async function licenseReturnCommand(ctx: CoreContext): Promise<number> {
-  await returnLicense(ctx);
-  return EXIT.SUCCESS;
+  const result = await returnLicense(ctx);
+  return result.returned ? EXIT.SUCCESS : EXIT.COMMAND_FAILED;
 }

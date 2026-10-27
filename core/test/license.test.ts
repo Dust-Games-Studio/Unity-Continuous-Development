@@ -151,6 +151,21 @@ describe('activateLicense', () => {
     expect(calls[0]!.args).not.toContain('--serial');
   });
 
+  it('explains a missing floating server when the CLI exits 4', async () => {
+    mocks.runUnity.mockImplementation(async (options: UnityCall) => {
+      record(options);
+      return failed(4, 'no licensing server is configured');
+    });
+
+    const code = await licenseActivateCommand(makeContext('floating'));
+
+    expect(code).toBe(64);
+    const output = lines.join('');
+    expect(output).toMatch(/no floating license server is configured/i);
+    expect(output).toContain('licensingServiceBaseUrl');
+    expect(output).toContain('no licensing server is configured');
+  });
+
   it('decodes an offline license file to a temp path and passes --file', async () => {
     const content = '<?xml version="1.0"?><root>offline licence</root>\n';
     const encoded = Buffer.from(content, 'utf8').toString('base64');
@@ -272,8 +287,9 @@ describe('activateLicense', () => {
 
 describe('returnLicense', () => {
   it('returns the license with --yes', async () => {
-    await returnLicense(makeContext('none'));
+    const result = await returnLicense(makeContext('none'));
 
+    expect(result).toEqual({ returned: true, code: 0 });
     expect(calls).toHaveLength(1);
     expect(calls[0]!.args).toEqual(['license', 'return', '--yes', '--format', 'json']);
     // GC9: the teardown is bounded.
@@ -287,31 +303,51 @@ describe('returnLicense', () => {
     });
     const ctx = makeContext('serial');
 
-    await expect(returnLicense(ctx)).resolves.toBeUndefined();
+    // It reports the failure instead of throwing, so the run lifecycle can log
+    // it and keep its own primary exit code (GC9).
+    await expect(returnLicense(ctx)).resolves.toMatchObject({ returned: false, code: 7 });
     expect(lines.join('')).toMatch(/could not return the Unity license/i);
   });
 
   it('swallows a thrown return failure too', async () => {
     mocks.runUnity.mockRejectedValue(new Error('spawn exploded'));
 
-    await expect(returnLicense(makeContext('none'))).resolves.toBeUndefined();
+    const result = await returnLicense(makeContext('none'));
+
+    expect(result).toMatchObject({ returned: false, code: 6 });
     expect(lines.join('')).toContain('spawn exploded');
   });
 
   it('warns that an offline --file licence cannot be returned', async () => {
-    await returnLicense(makeContext('offline-file'));
+    const result = await returnLicense(makeContext('offline-file'));
 
+    expect(result).toEqual({ returned: true, code: 0 });
     const output = lines.join('');
     expect(output).toMatch(/cannot be returned|leaks a seat/i);
     expect(output).toContain('reclaim');
   });
 
-  it('exits 0 even when the return call failed: the primary code wins', async () => {
+  it('exits 6 when the return call failed: the standalone command must be honest', async () => {
     mocks.runUnity.mockRejectedValue(new Error('boom'));
 
     const code = await licenseReturnCommand(makeContext('none'));
 
-    expect(code).toBe(0);
+    expect(code).toBe(6);
+    expect(lines.join('')).toMatch(/could not return the Unity license/i);
+  });
+
+  it('exits 6 when unity exits non-zero, and 0 when it succeeds', async () => {
+    mocks.runUnity.mockImplementation(async (options: UnityCall) => {
+      record(options);
+      return failed(7, 'the licensing service is unreachable');
+    });
+    expect(await licenseReturnCommand(makeContext('none'))).toBe(6);
+
+    mocks.runUnity.mockImplementation(async (options: UnityCall) => {
+      record(options);
+      return ok({});
+    });
+    expect(await licenseReturnCommand(makeContext('none'))).toBe(0);
   });
 });
 

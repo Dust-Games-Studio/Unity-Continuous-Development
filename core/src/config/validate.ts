@@ -1,5 +1,6 @@
 import { statSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { STRIPPED_ENV_VARIABLES } from '../exec.js';
 import { EXIT } from '../exit-codes.js';
 import type { Config, ConfigIssue } from './schema.js';
 
@@ -27,6 +28,39 @@ const LICENSE_MODES: ReadonlySet<string> = new Set([
 const TEST_MODES: ReadonlySet<string> = new Set(['EditMode', 'PlayMode']);
 
 const ANNOTATIONS: ReadonlySet<string> = new Set(['none', 'github']);
+
+/**
+ * The variables `spawnProcess` removes from every child (GC23). A licence
+ * secret cannot be carried in one of these: it would be deleted before
+ * `unity license activate` could read it, and the failure would name no cause.
+ *
+ * Compared case-insensitively: Windows environment names are case-insensitive,
+ * and a case variant on POSIX is a nearly certain mistake rather than a
+ * deliberate second variable.
+ */
+const STRIPPED_NAMES: ReadonlySet<string> = new Set(
+  STRIPPED_ENV_VARIABLES.map((name) => name.toUpperCase()),
+);
+
+/** A configured env-var name must be usable and must survive the spawn strip. */
+function checkSecretEnvName(
+  path: string,
+  value: unknown,
+  issues: ConfigIssue[],
+): void {
+  if (typeof value !== 'string' || value.trim() === '') {
+    issues.push({ path, message: `${path} must be a non-empty environment variable name` });
+    return;
+  }
+  if (STRIPPED_NAMES.has(value.toUpperCase())) {
+    issues.push({
+      path,
+      message:
+        `${path} must not name ${value}: the toolkit strips that variable from every child process ` +
+        '(GC23), so the secret would never reach `unity license activate`. Choose a different variable name.',
+    });
+  }
+}
 
 /**
  * The `--output` flag is a **file** path. A directory is accepted silently and
@@ -190,6 +224,11 @@ export function validateConfig(config: Config, projectRoot: string = process.cwd
       message: `license.mode must be one of none, serial, floating, offline-file, personal; got ${JSON.stringify(config.license.mode)}`,
     });
   }
+  // The serial and the offline file travel through the environment; refusing a
+  // stripped name here turns a silent "activation cannot see the secret" into
+  // exit 64 naming the setting.
+  checkSecretEnvName('license.serialEnv', config.license.serialEnv, issues);
+  checkSecretEnvName('license.fileEnv', config.license.fileEnv, issues);
   if (!ANNOTATIONS.has(config.output.annotations)) {
     issues.push({
       path: 'output.annotations',

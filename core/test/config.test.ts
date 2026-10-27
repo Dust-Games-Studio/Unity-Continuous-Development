@@ -441,6 +441,56 @@ describe('config validation', () => {
     expect(issues.some((i) => i.path === 'license.mode')).toBe(true);
   });
 
+  it('rejects a serial env var the spawn layer strips', () => {
+    const tmp = workspace();
+    const configFile = write(
+      tmp,
+      'unity-ci.yml',
+      'license:\n  mode: serial\n  serialEnv: UNITY_SERVICE_ACCOUNT_SECRET\n',
+    );
+    const { issues } = loadIn(tmp, { configFile });
+    expect(
+      issues.some(
+        (i) => i.path === 'license.serialEnv' && /strips that variable/.test(i.message),
+      ),
+    ).toBe(true);
+    // The message must name the variable and the reason, or the user has no
+    // way to know why their serial is invisible to `unity license activate`.
+    expect(issues.some((i) => i.message.includes('UNITY_SERVICE_ACCOUNT_SECRET'))).toBe(true);
+  });
+
+  it('rejects a licence file env var the spawn layer strips, case-insensitively', () => {
+    const tmp = workspace();
+    for (const name of ['UNITY_GITHUB_TOKEN', 'unity_gitlab_token']) {
+      write(tmp, 'unity-ci.yml', `license:\n  mode: offline-file\n  fileEnv: ${name}\n`);
+      const { issues } = loadIn(tmp, { configFile: join(tmp, 'unity-ci.yml') });
+      expect(issues.some((i) => i.path === 'license.fileEnv'), name).toBe(true);
+    }
+  });
+
+  it('rejects an empty licence env var name', () => {
+    const tmp = workspace();
+    const configFile = write(
+      tmp,
+      'unity-ci.yml',
+      'license:\n  mode: serial\n  serialEnv: ""\n',
+    );
+    const { issues } = loadIn(tmp, { configFile });
+    expect(issues.some((i) => i.path === 'license.serialEnv')).toBe(true);
+  });
+
+  it('accepts a custom licence env var name that is not stripped', () => {
+    const tmp = workspace();
+    const configFile = write(
+      tmp,
+      'unity-ci.yml',
+      'license:\n  mode: serial\n  serialEnv: MY_LICENSE_SERIAL\n',
+    );
+    const { config, issues } = loadIn(tmp, { configFile });
+    expect(config.license.serialEnv).toBe('MY_LICENSE_SERIAL');
+    expect(issues).toEqual([]);
+  });
+
   it('rejects a non-integer maxAttempts', () => {
     const tmp = workspace();
     const configFile = write(tmp, 'unity-ci.yml', 'retry:\n  maxAttempts: 0\n');
