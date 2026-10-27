@@ -347,7 +347,7 @@ git commit -m "chore: scaffold pnpm workspace and core primitives"
 - Produces:
   - `core/src/config/schema.ts` → `export interface Config` (exact shape below), `export const DEFAULT_CONFIG: Config`, `export type ConfigIssue = { path: string; message: string }`.
   - `core/src/config/validate.ts` → `export function validateConfig(config: Config): ConfigIssue[]`.
-  - `core/src/config/env.ts` → `export const ENV_KEYS: Record<string, string>` mapping each `UNITYCI_*` env var to its config path, and `export function readEnvConfig(env: NodeJS.ProcessEnv): { patch: Partial<Config>; unknown: string[] }`.
+  - `core/src/config/env.ts` → `export const ENV_KEYS: Record<string, string>` mapping each `UNITYCI_*` env var to its config path, `export type DeepPartial<T> = { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K] }`, and `export function readEnvConfig(env: NodeJS.ProcessEnv): { patch: DeepPartial<Config>; unknown: string[] }`. The patch is **deep**: `Partial<Config>` cannot express a nested path such as `unity.cli.version`.
   - `core/src/config/load.ts` → `export function loadConfig(opts: { cwd: string; argv: Record<string, string | boolean | string[]>; env: NodeJS.ProcessEnv; configFile?: string }): { config: Config; issues: ConfigIssue[]; unknownEnvVars: string[] }`.
   - `core/src/context.ts` → `export interface CoreContext { config: Config; cwd: string; projectPath: string; env: NodeJS.ProcessEnv; logger: Logger; redactor: Redactor; binary: string; startedAt: number; cliVersion: string | null }`.
 
