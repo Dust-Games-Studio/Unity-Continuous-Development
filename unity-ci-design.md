@@ -15,7 +15,7 @@ It replaces the role that `game-ci/cli` plus the `unity-activate`, `unity-test-r
 
 - Same commands run identically on a developer machine and in CI.
 - GitHub Actions is a supported *adapter*, not a requirement. Adding another provider (GitLab, Jenkins, Buildkite, etc.) means adding one directory and changing no core code.
-- Correct, explicit handling of exit codes, license lifecycle (activate, then always return), retries, and test-result reporting.
+- Correct, explicit handling of exit codes, the license **precondition** (checked before anything runs, never assumed) and teardown (return the seat whenever a returnable license is held), retries, and test-result reporting. An offline `--file` license cannot be returned, so that route leaks a seat that must be reclaimed by hand.
 - Secure by default: secrets never in argv or logs, no shell-string construction, validated inputs.
 - Testable without a Unity license (via a fake `unity` binary).
 
@@ -41,8 +41,8 @@ It replaces the role that `game-ci/cli` plus the `unity-activate`, `unity-test-r
 | D6 | The GitHub adapter is a **composite action**, not a JS action. | No bundled `dist/` to commit and no Node-runtime upgrade treadmill. It just installs the binary and calls it. |
 | D7 | Caching is **described** by the core (`cache-info`) and **performed** by adapters. | Cache APIs are provider-specific. Cache *keys and paths* are not. |
 | D8 | The core asks `unity test` for **both** formats (`--report-format nunit,junit` with `--output` and `--junit-output`) and converts NUnit→JUnit itself **only as a fallback**, when no JUnit file was produced. | Unity's converter already sits in the CLI path, and re-converting can only lose `test-case` ids. Unity emits **NUnit 3** (root `<test-run>`), so any fallback converter targets that schema, not NUnit 2. GitLab and Jenkins still consume JUnit (Section 5.3). |
-| D9 | The Unity CLI version is **recorded, not enforced**: the configured version is the *tested* version and is written into every artefact. A running CLI older than the tested floor fails; a newer one warns. `latest` still requires an explicit opt-in. | The CLI self-updates through the Hub and through winget/MSIX and cannot be reliably pinned (S9). A hard version gate would rot within weeks; recording the exact build is what makes a failure reproducible (R13, R16). |
-| D10 | Editor version defaults to the project's own `ProjectVersion.txt` (`--allow-install`). | The project, not the runner, is the source of truth. |
+| D9 | The Unity CLI version is **recorded, not enforced**: the configured version is the *tested* version and is written into every artifact. The tested range is **1.0.0-beta.9 through 1.0.0-beta.14**, held as `TESTED_CLI_MIN` / `TESTED_CLI_MAX` constants in `core/src/unity/cli.ts`: a CLI below the floor fails with exit 64, a CLI above the ceiling warns and continues. `latest` still requires an explicit opt-in. | The CLI self-updates through the Hub and through winget/MSIX and cannot be reliably pinned (S9). A hard version gate would rot within weeks; recording the exact build is what makes a failure reproducible (R13, R16). |
+| D10 | Editor version defaults to the project's own `ProjectVersion.txt`. The core resolves it by reading `ProjectSettings/ProjectVersion.txt` and installs explicitly when needed; it **never** uses `--allow-install`, whose implicit install carries no EULA flag (S8). | The project, not the runner, is the source of truth. A missing Editor is an explicit `unity install` gated by `acceptEula`, or a fail-fast error naming the command. |
 
 ---
 
@@ -77,9 +77,9 @@ It replaces the role that `game-ci/cli` plus the `unity-activate`, `unity-test-r
 | Command | Purpose |
 |---|---|
 | `unityci doctor` | The preflight gate (R11). Runs `unity doctor --ci --format json`, consumes its report (`data.verdict`, `data.checks[]` with `id`/`status`/`code`/`blocking`/`message`), and adds the core's own checks: capability matrix (R13), glibc on Linux, disk space, licence state (R17), and git-dependency reachability (R19). Safe to run as the first CI step and to upload as a diagnostic artifact. |
-| `unityci setup` | Ensures the Editor the project needs is present, then accepts the Editor Software Terms. Installs with `unity install <ver> -m <mods> --cm --accept-eula --yes` **only** when `unity editors --installed --format json` lacks that version or its modules, then runs `unity terms accept <ver> --yes` (R10). Never sends `--allow-install` (S8). Idempotent. |
-| `unityci license status` / `activate` / `return` | Thin, explicit wrappers over `unity license`. `status` is the precondition check — exit 64 when nothing is active (R17); `activate` and `return` are exposed so adapters can add a backup `always()` teardown. `activate` supports only the three unattended routes from S1. |
-| `unityci run test` | Lifecycle: preflight → setup → packages preflight → license check → `unity test` → verify artifacts → report → **finally** license return. |
+| `unityci setup` | Resolves the Editor version (from `ProjectSettings/ProjectVersion.txt` when `unity.editor.version` is `from-project`) and reads `unity editors --installed --format json`. Three branches: **present** with the modules the build target needs → verify only, install nothing (a present Editor missing a required module is exit 64 naming the module, never a silent reinstall); **missing** and `unity.editor.acceptEula: true` → `unity install <ver> -m <mods…> [--cm] --yes --accept-eula`; **missing** and `acceptEula: false` → exit 64 with the exact command to run. The core never accepts the EULA silently on the user's behalf, because `--accept-eula` accepts Unity's and every module's license agreements, and it never sends `--allow-install` (S8). When `unity.editor.terms` is true it then runs `unity terms accept <ver> --yes` (R10). Idempotent. |
+| `unityci license status` / `activate` / `return` | Thin, explicit wrappers over `unity license`. `status` is the precondition check — exit 64 when nothing is active and `license.mode: none` (R17). `activate` performs the route selected by `license.mode` (S1); `return` is the one the teardown calls, because a teardown returns a seat rather than acquiring one. |
+| `unityci run test` | Lifecycle: preflight → setup → packages preflight → license step → `unity test` → verify artifacts → report → **finally** license return. |
 | `unityci run build` | Same lifecycle around `unity build`. |
 | `unityci report` | Asserts every expected artifact exists and is non-empty (R18), converts NUnit XML to JUnit XML **only when Unity produced no JUnit file** (D8), and writes or refreshes `summary.json`. |
 | `unityci cache-info --json` | Prints cache descriptors (Section 4.6): paths from `unity cache info`, the `Library/` key from `unity cache key`. Never touches a cache service. |
@@ -99,18 +99,22 @@ unity:
     changeset: null              # needed only for versions not in Unity's release list
     modules: [android]
     childModules: true
-    acceptEula: false            # declared input: accepts Unity's and every module's licence terms (S8)
+    terms: true                  # run `unity terms accept <ver> --yes` after install (R10)
+    acceptEula: false            # declared input: accepts Unity's and every module's license agreements (S8)
 license:
-  mode: floating                 # floating | serial | file  (the three unattended routes, R17)
+  mode: none                     # none | serial | floating | offline-file | personal
+  serialEnv: UNITY_LICENSE_SERIAL
+  fileEnv: UNITY_LICENSE_FILE_BASE64
+packages:
+  preflight: true                # git-dependency detection + `git ls-remote` (R19)
 test:
   modes: [EditMode, PlayMode]
   outputDir: ci-output/tests
-  nographics: true               # default; forced off for PlayMode, where simulated input needs a device (R14)
+  nographics: true               # default; forced off for PlayMode (R14)
 build:
   target: Android
   executeMethod: Builder.PerformBuild
   outputPath: ci-output/build/app.aab
-  nographics: true               # batch builds: on unless the target needs a device (R14)
 retry:
   onExitCodes: [7, 9, 12, 14]    # see 4.4
   maxAttempts: 2
@@ -121,9 +125,18 @@ output:
 
 Rules:
 
-- **Secrets are env-only.** Unity service-account credentials (`UNITY_SERVICE_ACCOUNT_ID`, `UNITY_SERVICE_ACCOUNT_SECRET`), licence material (`--serial` value, a base64 `.ulf`), Android keystore material and the credentials for private git packages are never accepted as flags or config keys; they travel through the environment or through git configuration. Reject them if found in `unity-ci.yml`. (Service accounts authenticate Unity *services*; they cannot activate an Editor licence — S1.)
+- **Secrets are environment-only or git-configuration-only.** Unity service-account credentials (`UNITY_SERVICE_ACCOUNT_ID`, `UNITY_SERVICE_ACCOUNT_SECRET`), license material (the serial named by `license.serialEnv`, the base64 `.ulf` named by `license.fileEnv`) and the credentials for private git packages are never accepted as flags or config keys: they travel through the environment or through git configuration, never through a flag, a config file or a command line (R19). Reject them if found in `unity-ci.yml`. (Service accounts authenticate Unity *services*; they cannot activate an Editor license — S1.)
+- **Android signing is out of scope for v0.1.** `unity build` takes keystore material only on argv (`--android-keystore-base64`, `--android-keystore-password`, `--android-key-alias`, `--android-key-alias-password`), and Unity's own help warns that those arguments "may appear in shell history and CI logs". There is no environment or file route in this CLI build, so the core exposes no keystore flags and passes none; a signed Android artifact must be produced outside the toolkit. `--android-export-type`, `--android-version-code` and `--android-target-sdk-version` stay in scope because they are not secrets.
 - Own env vars use the `UNITYCI_` prefix (`UNITYCI_TEST_MODES=EditMode`). **Unknown `UNITYCI_*` vars produce a warning, not a failure.** (game-ci's strict-mode behavior turned typos into hard failures. That's defensible, but unfriendly for a tool consumed from many CI systems.)
 - Validate every value that reaches a path, URL or argv. Reuse the idea from game-ci's `validateCliVersion`: an allow-list regex such as `^[A-Za-z0-9][A-Za-z0-9._+-]*$`, plus path-traversal checks on `outputDir`.
+
+`license.mode` selects what the toolkit does about licensing, not whether a license is required:
+
+- `none` (the default) — the toolkit **does not activate anything**. An active license is a precondition: `unity license status --format json` must report `data.active: true`, or the run fails fast with exit 64 (R17).
+- `serial`, `floating` and `offline-file` — the three unattended activation routes. `serial` reads the serial from `license.serialEnv`, so it never reaches `argv`; `floating` needs a server already configured on the machine (check it with `unity license server status` first); `offline-file` base64-decodes `license.fileEnv` into a temporary `.ulf`, passes it with `--file`, and deletes it afterward.
+- `personal` — requires a signed-in user and is rejected outright for a service-account session, so it is **local-only**; it is never valid in CI.
+
+The mode selects the route used by the lifecycle's license step and by the explicit `unityci license activate` wrapper. `return` runs in `finally` regardless of mode.
 
 ### 4.3 Process execution
 
@@ -132,7 +145,7 @@ Rules:
 - Prefer `--format json` / `ndjson` for Unity CLI calls whose output the core parses. Never parse human-formatted output or progress bars.
 - Set `UNITY_NON_INTERACTIVE=1`, `UNITY_NO_UPDATE_CHECK=1`, `UNITY_NO_BANNER=1` for all child processes in CI. Consider `UNITY_NO_CRASH_REPORT` and `UNITY_NO_CONSENT_PROMPT` behind config.
 - Capture `unity version --format json` (version, channel, commit) **before any other Unity call** and carry it into `summary.json` (R16). A failure must be traceable to an exact CLI build.
-- Forward `-nographics` to the Editor for EditMode runs and batch builds (R14). It is on by default, configurable, and forced **off** for PlayMode, where simulated input needs a graphics device.
+- Forward `-nographics` to the Editor for EditMode runs and batch builds (R14), using each command's own mechanism: `unity test` forwards editor arguments after a literal `--` (so the core appends `-- -nographics`), and `unity build` takes them through `--args` (it already passes `-nographics` in its batch defaults). Unity documents both; neither has been exercised on this build, so the task that wires it **probes the mechanism first** instead of assuming it. Forced **off** for PlayMode, where simulated input needs a graphics device.
 - Treat `--output` as a **file** path, never a directory: a directory is accepted silently, the tests still run, and no report is written at all (S2).
 - Never pass `--mode` more than once per `unity test`. A repeated `--mode` is not a usage error — the last one silently wins — so the core owns mode selection and spawns one Editor per mode (S2).
 - `--args` on `unity build` is shell-split by Unity itself, so it is passed as **one** argv element and never built by string concatenation. Prefer the typed flags wherever they exist.
@@ -166,6 +179,7 @@ The list above is the CLI's own machine-readable table (`unity commands --json` 
 Retry policy:
 
 - Default: retry **`[7, 9, 12, 14]`**, up to `maxAttempts`, with backoff.
+- **This default differs deliberately from `docs/decisions/spike0-cli.md`, whose Implications section recommends `{7, 9, 10, 12, 14, 130, 143}`.** `10` (`READY_TIMEOUT`) applies only to `unity open --until-ready`, and `130`/`143` are interrupts — a signalled CI job must fail, never loop — so both are excluded even though Unity's own table marks them retryable. Exit 8 is never retried; exit 6 is opt-in and capped at one extra attempt. The resolved S4 answer supersedes the earlier recommendation.
 - **Never retry 8** (tests ran and failed), nor `2`, `3`, `4`, `11`, `13`.
 - Exclude `10` (only reachable through `unity open --until-ready`) and `130`/`143` (a signalled job must fail, not loop).
 - **6 is terminal by default.** It is opt-in per pipeline (`retry.onExitCodes: [6, 7, 9, 12, 14]`) and then capped at **one** extra attempt, because re-running an identical broken configuration reproduces the failure.
@@ -177,16 +191,16 @@ Adapter semantics for results: on **0 or 8**, results exist, so publish them —
 ### 4.5 The `run` lifecycle (guarantees)
 
 ```
-doctor (preflight) → setup: install + terms accept → packages preflight (git ls-remote)
-   → license check (precondition) → unity <test|build> (with retries) → verify artifacts → report
+doctor (preflight) → setup: verify or install (EULA-gated) + terms accept → packages preflight (git ls-remote)
+   → license step (mode-dependent check or activate) → unity <test|build> (with retries) → verify artifacts → report
                                         │
                                         └── finally: license return   (always)
                                             also on SIGINT/SIGTERM, with a bounded timeout
 ```
 
 - `unity version --format json` is captured **first**, before any other Unity call, and recorded in `summary.json` (R16).
-- `unity terms accept <editorVersion> --yes` runs after the install and before the first batch-mode launch. Without it the Editor stops on the "Unity Editor Software Terms" dialog and the job hangs until the timeout (R10).
-- The licence is a **precondition, not a step the toolkit owns**. The core reads `unity license status --format json` → `data.active`; when nothing is active it fails fast with exit 64 and names the three supported unattended routes (`--serial` from a secret, `--floating` after `unity license server status`, `--file` from a base64 secret), instead of attempting an activation it cannot perform (R17).
+- `unity terms accept <editorVersion> --yes` runs after the install and before the first batch-mode launch. Without it the Editor stops on the "Unity Editor Software Terms" dialog and the job fails or hangs instead of running tests (R10). `unity.editor.terms: false` opts out for machines where the terms are already accepted.
+- **The license is checked before any test or build runs (R17).** The core reads `unity license status --format json` → `data.active`. With the default `license.mode: none` it activates nothing: no active license means exit 64 naming the three unattended routes (`--serial` from a secret, `--floating` after `unity license server status`, `--file` from a base64 secret). With `serial`, `floating` or `offline-file` it activates through that route first (Section 4.2), re-checks, and treats a failure as a configuration error (64), never a retryable one. `personal` never runs unattended (S1).
 - **A report that was not written is not a pass, and an exit code without an artifact is not a verdict.** Every expected artifact is asserted to exist and be non-empty before anything is reported on it; "ran but produced nothing" is an infrastructure failure (exit 6), never a green or a red test run (R18).
 - `license return` failures are logged loudly but never mask the primary exit code.
 - If the core process is killed hard (SIGKILL, runner teardown), only an adapter-level `always()` step can recover. Every adapter **must** include one (`unityci license return`, a safe no-op if nothing is held).
@@ -233,10 +247,12 @@ ci-output/
 
 ```json
 {
-  "editor":  { "paths": ["<install-path>/<version>"], "key": "unity-editor-<os>-<arch>-<version>-<modules-hash>" },
-  "library": { "paths": ["<project>/Library"],        "key": "<output of `unity cache key`>" }
+  "editor":  { "paths": ["<download-cache-path>"], "key": "unity-downloads-<editorVersion>" },
+  "library": { "paths": ["<project>/Library"],     "key": "<unity cache key>" }
 }
 ```
+
+The Editor install directory is **never** a cache path: it is global, shared with the Hub and other projects, and restoring over it can corrupt every install on the machine (see below). Providers that must compute a key before the job's script runs, such as GitLab, use `library.staticKey` = `unity-library-<editorVersion>-<target>`.
 
 `cliVersion`, `cliChannel` and `cliCommit` come from `unity version --format json`, captured at the start of the run. `unity build`'s provenance manifest already records the CLI build; it is merged in when present (R16).
 
@@ -304,10 +320,10 @@ unityci license return   # in the provider's always-run teardown
 
 ### Security
 
-- Secrets: env only, redacted everywhere (register values at startup, also from config files, before any logging of option bags. game-ci had to fix ordering bugs here).
+- Secrets: environment or git configuration only, redacted everywhere (register values at startup, also from config files, before any logging of option bags. game-ci had to fix ordering bugs here). Never through a flag, a config file or a command line — see R19 for the git-configuration route.
 - Install path for the Unity CLI: Unity's recommended `curl -fsSL https://unity.com/install.sh | bash` is acceptable for convenience, but the docs also offer Homebrew, winget and apt/dnf packages. Always verify the result with `unity version --format json` against the **tested** version and record what was found (D9).
 - **Pinning is an install-method policy, not a version string.** "The Unity Hub updates the Unity CLI automatically. You can't disable these updates in the Hub", and an MSIX/winget install "keeps the CLI current in the background" with no rollback. `unity self-update --target <version>` pins a script install, but the reliable route is apt/dnf/brew with an explicit version, or a standalone binary kept outside the Hub's path. `unity config update-check off` silences only the CLI's own notice; it does not stop the Hub (S9).
-- Never pass secrets on argv (process listings and command logging leak them).
+- Never pass secrets on argv (process listings and command logging leak them). This is also why Android signing is out of scope for v0.1 (Section 4.2): this CLI build offers keystore input only on argv.
 
 ### Platform support
 
@@ -332,8 +348,8 @@ Credentials travel through the environment or through git configuration, never t
 
 ### Reproducibility
 
-- The configured Unity CLI version is the **tested** version. It is recorded in every artefact (`unity version --format json` → version, channel, commit; R16) rather than enforced as a pin: a CLI older than the tested floor fails, a newer one warns (D9, R13). The Editor version comes from the project. Record both in `summary.json`.
-- A weekly scheduled CI job runs against Unity CLI `latest` to catch upstream breakage early and open an issue (see Section 10).
+- The configured Unity CLI version is the **tested** version. It is recorded in every artifact (`unity version --format json` → version, channel, commit; R16) rather than enforced as a pin: the tested range is **1.0.0-beta.9 through 1.0.0-beta.14** (constants in `core/src/unity/cli.ts`), so a CLI below beta.9 fails and one above beta.14 warns (D9, R13). The Editor version comes from the project. Record both in `summary.json`.
+- A weekly scheduled CI job runs against Unity CLI `latest` to catch upstream breakage early and open an issue (see Section 8).
 
 ---
 
@@ -399,7 +415,7 @@ Each item gets a short written answer committed to `docs/decisions/`. **All nine
 | S5 | What does the Linux Editor need on a bare runner (libraries, virtual display)? | Docs and `doctor` checks. |
 | S6 | Can a restored, cached Editor install be reused without reinstall? Does `unity install-path` plus caching work as expected? | Whether CI is fast enough to be practical. |
 | S7 | Does `unity build` / `unity test` require `com.unity.pipeline`? | Non-goal assumption in Section 1. |
-| S8 | Is `--allow-install` EULA-safe in CI, or does it need `--accept-eula`? | Unattended installs. |
+| S8 | Is the CLI's install-if-needed shortcut EULA-safe in CI, or does it need `--accept-eula`? | Unattended installs. |
 | S9 | What is the Unity CLI's stability and versioning policy (the docs describe a beta channel)? | Compatibility range and pinning policy. |
 
 ---
@@ -415,6 +431,8 @@ Every question in Section 9 was answered against a live `unity` install (a 1.0.0
 ### S2 — The flag surface of `unity test` and `unity build`
 
 `unity test` flags to expose: `--mode` (exactly **one** per invocation — a repeated `--mode` is *not* a usage error; the CLI silently lets the **last one win**, so the core must own mode selection), `--filter`, `--output`, `--report-format nunit,junit`, `--junit-output`, `--shard N/M`, `--shard-inventory`, `--retries`, `--rerun-failed`, `--affected`, `--affected-compare`, `--since`, `--coverage`, `--coverage-output`, `--coverage-options`, `--editor-version`, `--allow-install`, `--timeout`. **`--output` is a FILE path**: a directory is accepted silently, the tests still run, and **no report is written at all** — no error, no warning. `unity build` flags to expose: `--target`, `--profile`, `--create-profile`, `--execute-method`, `--output-path`, `--log-file`, `--args`, `--versioning-strategy`, `--build-version`, `--android-export-type`, `--android-version-code`, `--android-target-sdk-version`, `--android-symbol-type`, `--allow-dirty-build`, `--provenance-path`, `--timeout`. `unity build` works with **no** `--execute-method`: on Unity 6 it auto-discovers a Build Profile, and with a desktop `--target` it drives the legacy player flags. `unity build --list-targets --format json` is machine-readable and its rows carry a `zeroCode` boolean (`StandaloneWindows64`/`StandaloneLinux64`/`StandaloneOSX` are zero-code; `Android`, `WebGL`, `iOS` and the rest are not).
+
+Note: `--allow-install` is in that list because the CLI accepts it, not because the core uses it — the core **never sends it** (S8).
 
 ### S3 — `--format github` with `--output`, and the NUnit version
 
@@ -436,7 +454,7 @@ Yes — an already-installed Editor is reused with **no** install step at all: e
 
 **CONFIRMED** for `unity test`, which Unity's own CLI reference describes as running the tests "directly via the editor command line — no pipeline package or server is involved". `unity build` is **INFERRED** to be the same: the package requirement is stated on every command that drives a *running* Editor (`command`, `status`, `run --command`, `recompile`, `mcp`, `logs --console`) and is absent from `build` and `test`; Unity's own generated CI workflow installs the package never and still runs `unity doctor --ci`, `unity test` and `unity build`. `unity projects create` now adds the package to every new project; `--bare` leaves it out. The toolkit must **never** add a package to a user's project to run CI.
 
-### S8 — Is `--allow-install` EULA-safe?
+### S8 — Is the install-if-needed shortcut EULA-safe?
 
 `--allow-install` itself has **no EULA surface and no EULA flag** — it is a three-word convenience on `build`/`test`/`run` meaning "install the project's editor version if it is not already installed", and it cannot carry `--accept-eula`. The separate `unity install` command has `--accept-eula` ("Accept all module license agreements automatically") and `-y, --yes`, and Unity's own generated CI workflow uses both together: `unity install 6000.0.47f1 --yes --accept-eula`. The safe pattern is therefore an **explicit** install step with `--yes --accept-eula`, with `--allow-install` used only as a recovery path — and since whether the install `--allow-install` triggers accepts the EULA cannot be verified, the core **never** sends it and instead fails fast with the exact install command. EULA acceptance is a **declared** config input (`unity.editor.acceptEula`), not a silent default, because it means accepting Unity's and every module's licence agreements on the user's behalf. A separate step is still required for the Editor Software Terms: `unity terms accept <version> --yes`, and the first Editor launch otherwise stops on the "Unity Editor Software Terms" dialog.
 
@@ -460,7 +478,7 @@ These are binding on every later task. R10–R19 are stated here once; the secti
 - **R11 — Doctor is the preflight gate.** `unity doctor --ci` is the preflight gate; its JSON report (`data.verdict`, `data.checks[]` with `id`/`status`/`code`/`blocking`/`message`) is what `unityci doctor` consumes.
 - **R12 — Do not reimplement `unity ci init`.** Unity ships `unity ci init --provider github|gitlab`, which generates a complete stock workflow (install, caches, runtime libraries, license, preflight, test, build, license return). `unity-ci-kit` does **not** reimplement that; it adds what the stock workflow lacks — provider-neutrality beyond GitHub/GitLab, local execution identical to CI, a `summary.json` contract, retries, and guaranteed license teardown under signals. The GitHub adapter reuses Unity's proven install/cache/library sequence and adds the missing guarantees.
 - **R13 — Capability matrix, not a version gate.** The core probes `unity version --format json` and the presence of the commands and flags it needs, and degrades with a clear message when one is missing. It must never fail a run solely because the CLI is newer than tested.
-- **R14 — `-nographics` by default.** EditMode test runs and batch builds pass `-- -nographics` so a machine without a GPU works. It is a config knob and is **off** for PlayMode, where simulated input needs a graphics device.
+- **R14 — `-nographics` by default.** EditMode test runs and batch builds pass `-nographics` so a machine without a GPU works. The mechanism is per command: `unity test` forwards editor arguments after a literal `--` (so the core passes `-- -nographics`), while `unity build` takes extra editor arguments through its own `--args` flag (and already passes `-nographics` in its batch defaults). The forwarding is documented but unprobed on this build, so a later task must **probe the mechanism** before relying on it rather than assuming it. It is a config knob (`test.nographics`) and is **off** for PlayMode, where simulated input needs a graphics device.
 - **R15 — State the support caveat.** The README and `docs/local-development.md` must say plainly that Unity's own support statement covers "workstations or laptop form factors running without emulation, container or compatibility layer", that a bare CI runner works but sits outside that statement, and that RHEL 9 supports the CLI but not the Editor.
 - **R16 — Record the CLI identity.** `unity version --format json` (version, channel, commit) is captured at the start of every run and stored in `summary.json`, so a failure can be traced to an exact CLI build. `unity build`'s provenance manifest already records it and is merged in.
 - **R17 — The licence is a precondition, not a step the toolkit owns.** `unity license status --format json` reports `data.active`; the core checks it and fails fast with exit 64 when no licence is active, instead of attempting an activation it cannot perform unattended. The three documented unattended routes are `--serial` (from a secret), `--floating` (with `unity license server status` checked first) and `--file` (a base64 secret decoded to a `.ulf`). The docs must state that an offline `--file` licence **cannot be returned** — those runners leak seats.
@@ -516,7 +534,7 @@ These are binding on every later task. R10–R19 are stated here once; the secti
 ## 13. Sources
 
 - Unity docs: Use the Unity CLI; Unity CLI reference (commands, exit codes, env vars, output formats).
-- Unity blog: "CICD Made Easier with Unity CLI" (`--allow-install`, `unity license activate --floating` / `return`, example `test` and `build` commands).
+- Unity blog: "CICD Made Easier with Unity CLI" (the install-if-needed shortcut the toolkit deliberately does not use — see S8 — plus `unity license activate --floating` / `return` and example `test` and `build` commands).
 - XGameDev: "Unity CLI Explained" (third-party field report. Notes the CLI is labeled experimental and the `com.unity.pipeline` package is optional).
 - `game-ci/unity-activate`, `unity-test-runner` and `game-ci/cli` source as supplied by the requester (patterns carried over or deliberately dropped, per Section 11).
 - Spike 0 evidence: `docs/decisions/spike0-cli.md` (empirical CLI probes), `docs/decisions/spike0-research.md` (documentation review, with quotations and confidence labels) and `docs/decisions/upm-git-auth-probe.md` (how the Package Manager authenticates to a private git repository).
