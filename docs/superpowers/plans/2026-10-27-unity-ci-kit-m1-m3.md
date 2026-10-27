@@ -18,7 +18,7 @@ These bind every task. Copy them verbatim into every dispatch.
 
 - **GC1 — Runtime.** TypeScript 5.9.3 (NOT 7.x), ESM only (`"type": "module"`), `module`/`moduleResolution` = `nodenext`, `target` = `es2023`, `strict: true`. Build with `tsc`. Package name `@unityci/core`, bin name `unityci`.
 - **GC2 — Package manager.** pnpm workspaces. Root `package.json` is `private: true`. Only workspace package is `core`. `pnpm install` at the root installs everything.
-- **GC3 — The only spawn point.** Only `core/src/unity/exec.ts` may spawn `unity`. Always `spawn(file, argsArray, { shell: false })` — never a concatenated command string, never `shell: true`. Lint rule: `grep -rn "spawn\|exec(" core/src --include=*.ts` must match only `core/src/unity/exec.ts` and `core/test/`.
+- **GC3 — One spawn point.** `core/src/exec.ts` is the **only** module that may spawn any child process, and it always uses `spawn(file, argsArray, { shell: false })` — never a concatenated command string, never `shell: true`. `core/src/unity/exec.ts` is the only module that may spawn **`unity`**, and `core/src/packages/git.ts` the only one that may spawn **`git`**. Lint: `grep -rnE "\b(spawn|spawnSync|exec|execFile|execSync)\(" core/src --include=*.ts` must match only `core/src/exec.ts`; and the same grep for the literal `unity` must additionally match only `core/src/unity/exec.ts`.
 - **GC4 — Provider neutrality.** `core/src/**` must not match `GITHUB_|GITLAB_|JENKINS_|CIRCLECI_|BUILDKITE_|AZURE_` except inside `core/src/report/annotations.ts`, which may reference `GITHUB_STEP_SUMMARY` and `GITHUB_OUTPUT` only. A conformance check enforces this.
 - **GC5 — Secrets are env-only.** `UNITY_SERVICE_ACCOUNT_ID`, `UNITY_SERVICE_ACCOUNT_SECRET`, `UNITY_LICENSE_SERIAL`, `UNITY_LICENSE_FILE_BASE64` and anything under `UNITYCI_SECRET_*` are read from the environment only. Never accepted as CLI flags, never written to `unity-ci.yml` (the loader must **reject** such keys with exit 64), never placed in `argv` of a child process. Redact registered secret values from every byte the core logs or writes.
 - **GC6 — Redaction before logging.** Register all secret values into the redactor **before** the first log line is emitted. A redactor replaces each registered non-empty secret with `***`.
@@ -51,6 +51,10 @@ These bind every task. Copy them verbatim into every dispatch.
 - **GC18 — Capability probing, not version gating.** Beta releases add, rename and remove commands between fortnightly drops, so the core probes for what it needs (`unity version --format json`, plus the presence of the commands and flags it uses) and reports a clear "this CLI does not support X" error instead of crashing. A run is never failed solely because the CLI is newer than tested.
 - **GC19 — Adapters never decide pass/fail.** An adapter may only install the binary, set env/flags, call `unityci`, read `summary.json` and files under `ci-output/`, and wire provider-native features (cache, artifacts, report display, job summary, secrets, an always-run teardown). It must not implement retries, exit-code interpretation, Unity output parsing, or version resolution.
 - **GC20 — Commit discipline.** One commit per task, conventional-commit message (`feat:`, `test:`, `docs:`, `chore:`, `fix:`). Every commit must leave `pnpm -C core test` green.
+- **GC21 — Credential material never enters a committed file.** `Packages/manifest.json` and `Packages/packages-lock.json` are committed, and Unity records a git dependency's URL in the lock file **exactly as written in the manifest**. A token embedded in the URL therefore lands in the repository. The supported mechanism rewrites git's **URL resolution**, never the manifest, so both files keep the plain URL.
+- **GC22 — The core never handles credentials; the adapter does.** The core must not read `GITHUB_TOKEN`, `GH_TOKEN`, `UNITY_GITHUB_TOKEN`, `UNITY_SERVICE_ACCOUNT_ID` or `UNITY_SERVICE_ACCOUNT_SECRET`, and must not write git config. Adapters own secrets injection (GC19). What the core *does* own is **detection**: it reads the project's git dependencies, reports the hosts, and preflights that they are fetchable — all provider-neutral, from the manifest and lock file alone.
+- **GC23 — Credentials travel by git configuration, not by Unity's token variables.** Unity's CLI strips `UNITY_SERVICE_ACCOUNT_ID`, `UNITY_SERVICE_ACCOUNT_SECRET`, `UNITY_GITHUB_TOKEN` and `UNITY_GITLAB_TOKEN` from every process it starts, so those variables do **not** reach the Editor's Package Manager or its git. Credentials must reach git through **git configuration**. Measured, end-to-end through `unity build` (`docs/decisions/upm-git-auth-probe.md`): Unity's Package Manager honours a URL rewrite delivered by the real `~/.gitconfig`, by `$XDG_CONFIG_HOME/git/config`, or by the per-invocation `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` variables — and it **ignores `GIT_CONFIG_GLOBAL`**, which is the most convenient-looking option and the one that fails.
+- **GC24 — Masked and scrubbed.** An adapter that injects a credential masks its value in the log (`::add-mask::`) **before** the first use, never puts it in a command line (write the config with a shell **builtin**, not `git config --global url.…`, whose argument would carry the token), and removes what it wrote in the always-run teardown. A credential must never appear in a command line, in a log line, in `summary.json`, in `Packages/manifest.json`, in `Packages/packages-lock.json`, or in an artefact.
 
 ---
 
@@ -66,6 +70,8 @@ Inputs and failure modes the spec implies that no task's tests obviously cover. 
 6. **`unity doctor --ci` reporting a blocking failure** (e.g. `EDITOR_NOT_ENTITLED`). `unityci doctor` must exit non-zero and `unityci run test` must refuse to start. → pinned in Task 5.
 7. **A retryable exit 14 on the second attempt succeeding.** `summary.json` must report `attempts: 2` and the overall status `passed`, with the failed attempt's log preserved — and a timed-out suite must never be reported as red tests. → pinned in Task 9.
 8. **A config that puts `8`, `130` or `143` in `retry.onExitCodes`.** The loader must reject it with exit 64 rather than silently retrying a failing test suite or looping on a signalled job. → pinned in Task 3.
+9. **A project whose `Packages/manifest.json` points at a private git package, with no credentials configured.** The run must fail in seconds with the repo URL and the remedy — not after a ten-minute Editor launch with a confusing resolution error. → pinned in Task 5.
+10. **A git dependency whose URL carries embedded credentials.** The core must detect it and **refuse to run**, because Unity copies that URL verbatim into the committed `packages-lock.json`. → pinned in Task 5.
 
 ---
 
@@ -87,8 +93,10 @@ Inputs and failure modes the spec implies that no task's tests obviously cover. 
 │  │  ├─ exit-codes.ts
 │  │  ├─ logger.ts
 │  │  ├─ redact.ts
+│  │  ├─ exec.ts                    # the ONLY place a child process is spawned
 │  │  ├─ context.ts                # CoreContext
 │  │  ├─ config/{schema,validate,env,load}.ts
+│  │  ├─ packages/{deps,git}.ts    # private git package detection + fetch preflight
 │  │  ├─ unity/{exec,cli}.ts       # exec.ts is the ONLY spawn point
 │  │  ├─ lifecycle/{setup,license,retry,signals,test,build}.ts
 │  │  ├─ report/{nunit,junit,summary,annotations}.ts
@@ -103,8 +111,8 @@ Inputs and failure modes the spec implies that no task's tests obviously cover. 
 │  ├─ github/{action.yml,README.md}
 │  └─ generic/README.md
 ├─ examples/minimal-project/       # real Unity project: 1 EditMode test + 1 build method
-├─ docs/{decisions,local-development.md,generic-ci.md,compatibility.md}
-├─ .github/workflows/{ci.yml,example.yml}
+├─ docs/{decisions,local-development.md,generic-ci.md,compatibility.md,private-packages.md}
+├─ .github/workflows/{ci.yml,example.yml,nightly.yml}
 └─ README.md
 ```
 
@@ -156,6 +164,7 @@ Add a `## Spike 0 outcomes` section to the spec recording the table above, and a
 - **New requirement R16 — record the CLI identity.** `unity version --format json` (version, channel, commit) is captured at the start of every run and stored in `summary.json`, so a failure can be traced to an exact CLI build. `unity build`'s provenance manifest already records it and is merged in.
 - **New requirement R17 — the licence is a precondition, not a step the toolkit owns.** `unity license status --format json` reports `data.active`; the core checks it and fails fast with exit 64 when no licence is active, instead of attempting an activation it cannot perform unattended. The three documented unattended routes are `--serial` (from a secret), `--floating` (with `unity license server status` checked first) and `--file` (a base64 secret decoded to a `.ulf`). The docs must state that an offline `--file` licence **cannot be returned** — those runners leak seats.
 - **New requirement R18 — never trust a result you did not verify.** A report that was not written is not a pass, and an exit code without an artifact is not a verdict. The core asserts every artifact exists and is non-empty before it reports on it, and treats "ran but produced nothing" as an infrastructure failure (exit 6) rather than a green or a red test run.
+- **New requirement R19 — private git packages are a first-class concern.** A project may depend on a package in a private git repository. The design must cover three things: (a) **detection** — the core reads the project's git dependencies, reports their hosts, and refuses to run if a URL embeds credentials, because Unity copies that URL verbatim into the committed `packages-lock.json`; (b) **preflight** — the core proves each dependency is fetchable with `git ls-remote`, using the same git configuration the Package Manager will use, so a missing credential fails in seconds instead of ten minutes into an Editor launch; (c) **credential supply** — the adapter's job, never the core's, because the credential is a provider secret. The supported mechanism is a **git URL rewrite** (the manifest keeps a credential-free URL; git applies the credential at fetch time), measured in `docs/decisions/upm-git-auth-probe.md`: Unity's Package Manager honours a rewrite in `~/.gitconfig`, in `$XDG_CONFIG_HOME/git/config`, and through the per-invocation `GIT_CONFIG_*` variables, and **ignores `GIT_CONFIG_GLOBAL`**.
 
 - [ ] **Step 3: Commit the spec revision**
 
@@ -306,6 +315,7 @@ export interface Config {
     editor: { version: string; changeset: string | null; modules: string[]; childModules: boolean; terms: boolean; acceptEula: boolean };
   };
   license: { mode: 'none' | 'serial' | 'floating' | 'offline-file' | 'personal'; serialEnv: string; fileEnv: string };
+  packages: { preflight: boolean };
   test: { modes: string[]; outputDir: string; filter: string | null; coverage: boolean; shards: string | null; retries: number; nographics: boolean };
   build: { target: string; profile: string | null; executeMethod: string | null; outputPath: string; versioningStrategy: 'none' | 'semantic' | 'tag' | 'custom'; buildVersion: string | null; androidVersionCode: number | null; allowDirtyBuild: boolean };
   retry: { onExitCodes: number[]; maxAttempts: number; backoffMs: number };
@@ -356,6 +366,7 @@ Expected: FAIL — module not found.
 unity: { cli: { version: '1.0.0-beta.14', allowLatest: false, binary: 'unity' },
          editor: { version: 'from-project', changeset: null, modules: [], childModules: true, terms: true, acceptEula: false } },
 license: { mode: 'none', serialEnv: 'UNITY_LICENSE_SERIAL', fileEnv: 'UNITY_LICENSE_FILE_BASE64' },
+packages: { preflight: true },
 test: { modes: ['EditMode'], outputDir: 'ci-output/tests', filter: null, coverage: false, shards: null, retries: 0, nographics: true },
 build: { target: 'StandaloneWindows64', profile: null, executeMethod: null, outputPath: 'ci-output/build',
          versioningStrategy: 'none', buildVersion: null, androidVersionCode: null, allowDirtyBuild: false },
@@ -374,7 +385,7 @@ output: { dir: 'ci-output', annotations: 'none', ci: true }
 - `build.target` and `build.profile` must match the version-string regex.
 - `retry.maxAttempts` must be an integer ≥ 1.
 
-`env.ts` — `ENV_KEYS` maps: `UNITYCI_CLI_VERSION` → `unity.cli.version`, `UNITYCI_CLI_ALLOW_LATEST` → `unity.cli.allowLatest`, `UNITYCI_UNITY_BINARY` → `unity.cli.binary`, `UNITYCI_EDITOR_VERSION` → `unity.editor.version`, `UNITYCI_EDITOR_MODULES` → `unity.editor.modules` (comma-separated), `UNITYCI_EDITOR_CHANGESET` → `unity.editor.changeset`, `UNITYCI_EDITOR_ACCEPT_EULA` → `unity.editor.acceptEula`, `UNITYCI_EDITOR_TERMS` → `unity.editor.terms`, `UNITYCI_LICENSE_MODE` → `license.mode`, `UNITYCI_TEST_MODES` → `test.modes` (comma-separated), `UNITYCI_TEST_FILTER` → `test.filter`, `UNITYCI_TEST_COVERAGE` → `test.coverage`, `UNITYCI_TEST_NOGRAPHICS` → `test.nographics`, `UNITYCI_TEST_SHARDS` → `test.shards`, `UNITYCI_BUILD_TARGET` → `build.target`, `UNITYCI_BUILD_PROFILE` → `build.profile`, `UNITYCI_BUILD_METHOD` → `build.executeMethod`, `UNITYCI_RETRY_EXIT_CODES` → `retry.onExitCodes` (comma-separated), `UNITYCI_RETRY_MAX_ATTEMPTS` → `retry.maxAttempts`, `UNITYCI_OUTPUT_DIR` → `output.dir`, `UNITYCI_ANNOTATIONS` → `output.annotations`, `UNITYCI_CI` → `output.ci`.
+`env.ts` — `ENV_KEYS` maps: `UNITYCI_CLI_VERSION` → `unity.cli.version`, `UNITYCI_CLI_ALLOW_LATEST` → `unity.cli.allowLatest`, `UNITYCI_UNITY_BINARY` → `unity.cli.binary`, `UNITYCI_EDITOR_VERSION` → `unity.editor.version`, `UNITYCI_EDITOR_MODULES` → `unity.editor.modules` (comma-separated), `UNITYCI_EDITOR_CHANGESET` → `unity.editor.changeset`, `UNITYCI_EDITOR_ACCEPT_EULA` → `unity.editor.acceptEula`, `UNITYCI_EDITOR_TERMS` → `unity.editor.terms`, `UNITYCI_LICENSE_MODE` → `license.mode`, `UNITYCI_TEST_MODES` → `test.modes` (comma-separated), `UNITYCI_TEST_FILTER` → `test.filter`, `UNITYCI_TEST_COVERAGE` → `test.coverage`, `UNITYCI_TEST_NOGRAPHICS` → `test.nographics`, `UNITYCI_TEST_SHARDS` → `test.shards`, `UNITYCI_BUILD_TARGET` → `build.target`, `UNITYCI_BUILD_PROFILE` → `build.profile`, `UNITYCI_BUILD_METHOD` → `build.executeMethod`, `UNITYCI_RETRY_EXIT_CODES` → `retry.onExitCodes` (comma-separated), `UNITYCI_RETRY_MAX_ATTEMPTS` → `retry.maxAttempts`, `UNITYCI_OUTPUT_DIR` → `output.dir`, `UNITYCI_ANNOTATIONS` → `output.annotations`, `UNITYCI_CI` → `output.ci`, `UNITYCI_PACKAGES_PREFLIGHT` → `packages.preflight`.
 `readEnvConfig` returns `{ patch, unknown }` where `unknown` lists every `UNITYCI_*` var not in `ENV_KEYS` **and** not matching `UNITYCI_SECRET_*`. Booleans parse `true`/`false` case-insensitively; anything else is a warning, not a failure.
 
 `load.ts` — loads `unity-ci.yml` (or `unity.ci.yml`, or the path given by `--config`) with the `yaml` package, merges `DEFAULT_CONFIG` < file < env < flags, then runs `validateConfig`. A file that cannot be parsed yields a `ConfigIssue` (not a throw). A file containing any of `serial`, `fileBase64`, `serviceAccountId`, `serviceAccountSecret` anywhere under `license:` yields a `ConfigIssue` saying secrets are env-only.
@@ -396,13 +407,14 @@ git commit -m "feat: add config schema, validation and precedence"
 ## Task 4: The Unity process runner
 
 **Files:**
-- Create: `core/src/unity/exec.ts`, `core/src/unity/cli.ts`
+- Create: `core/src/exec.ts` (the generic argv-only spawner), `core/src/unity/exec.ts` (the Unity child-environment wrapper), `core/src/unity/cli.ts`
 - Test: `core/test/unity-exec.test.ts`
 
 **Interfaces:**
 - Consumes: `EXIT` from `core/src/exit-codes.ts`, `Logger` from `core/src/logger.ts`, `Redactor` from `core/src/redact.ts`.
 - Produces:
-  - `core/src/unity/exec.ts` → `export interface UnityResult { code: number; stdout: string; stderr: string; json: unknown | null }`, `export interface RunUnityOptions { binary: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; logger: Logger; redactor: Redactor; timeoutMs?: number }`, `export function runUnity(opts: RunUnityOptions): Promise<UnityResult>`.
+  - `core/src/exec.ts` → `export interface SpawnResult { code: number; stdout: string; stderr: string }`, `export interface SpawnOptions { file: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; logger: Logger; redactor: Redactor; timeoutMs?: number }`, `export function spawnProcess(opts: SpawnOptions): Promise<SpawnResult>` — the **only** place a child process is started. Always `spawn(file, args, { shell: false })`.
+  - `core/src/unity/exec.ts` → `export interface UnityResult { code: number; stdout: string; stderr: string; json: unknown | null }`, `export interface RunUnityOptions { binary: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv; logger: Logger; redactor: Redactor; timeoutMs?: number }`, `export function runUnity(opts: RunUnityOptions): Promise<UnityResult>` — builds the Unity child environment (GC13) and calls `spawnProcess`.
   - `core/src/unity/cli.ts` → typed wrappers, all of which call `runUnity` and all of which pass `--format json`:
     `export function unityVersion(opts): Promise<UnityResult>` — `unity version --format json`, which reports the CLI version, release channel, commit, platform, architecture and runtime.
     `export function unityDoctorCi(opts): Promise<UnityResult>`
@@ -437,13 +449,13 @@ it('kills the child and returns 14 when the timeout elapses', () => { /* code ==
 Run: `pnpm -C core test core/test/unity-exec.test.ts`
 Expected: FAIL — module not found.
 
-- [ ] **Step 3: Implement `exec.ts` and `cli.ts`**
+- [ ] **Step 3: Implement `exec.ts`, `unity/exec.ts` and `unity/cli.ts`**
 
-`exec.ts` uses `node:child_process.spawn(binary, args, { cwd, env, shell: false, stdio: ['ignore', 'pipe', 'pipe'] })`. It accumulates stdout and stderr, redacts both before returning, and logs each line as it arrives (redacted). It resolves `{ code, stdout, stderr, json }` where `json` is `JSON.parse(stdout)` in a `try`/`catch` that yields `null`. On timeout it kills the child and resolves with code `EXIT.TIMEOUT` (14).
+`core/src/exec.ts` uses `node:child_process.spawn(file, args, { cwd, env, shell: false, stdio: ['ignore', 'pipe', 'pipe'] })`. It accumulates stdout and stderr, redacts both before returning, and logs each line as it arrives (redacted). It resolves `{ code, stdout, stderr }`. On timeout it kills the child and resolves with code `EXIT.TIMEOUT` (14).
 
-The child environment is built as `{ ...process.env, ...opts.env }` **minus** `UNITY_SERVICE_ACCOUNT_SECRET`, `UNITY_SERVICE_ACCOUNT_ID`, `UNITY_GITHUB_TOKEN`, `UNITY_GITLAB_TOKEN`, then **plus** `UNITY_NON_INTERACTIVE=1`, `UNITY_NO_UPDATE_CHECK=1`, `UNITY_NO_BANNER=1`, `UNITY_NO_AGENT_HINTS=1`. (Unity's own CLI strips these from child processes too.) `UNITY_LICENSE_SERIAL` **is** passed through — the CLI reads it from the environment by design and never puts it in `argv`.
+`core/src/unity/exec.ts` builds the child environment as `{ ...process.env, ...opts.env }` **minus** `UNITY_SERVICE_ACCOUNT_SECRET`, `UNITY_SERVICE_ACCOUNT_ID`, `UNITY_GITHUB_TOKEN`, `UNITY_GITLAB_TOKEN`, then **plus** `UNITY_NON_INTERACTIVE=1`, `UNITY_NO_UPDATE_CHECK=1`, `UNITY_NO_BANNER=1`, `UNITY_NO_AGENT_HINTS=1`, `UNITY_NO_CLI_INVOKED_TELEMETRY=1`. (Unity's own CLI strips the four token variables from child processes too — GC23.) `UNITY_LICENSE_SERIAL` **is** passed through — the CLI reads it from the environment by design and never puts it in `argv`. It then calls `spawnProcess`, and parses stdout as JSON in a `try`/`catch` that yields `json: null`.
 
-`cli.ts` builds the argv array for each wrapper: `['<verb>', ...args, '--format', 'json']`. `unityDoctorCi` uses `['doctor', '--ci', '--format', 'json']`. `unityLicenseReturn` uses `['license', 'return', '--yes', '--format', 'json']`.
+`core/src/unity/cli.ts` builds the argv array for each wrapper: `['<verb>', ...args, '--format', 'json']`. `unityDoctorCi` uses `['doctor', '--ci', '--format', 'json']`. `unityLicenseReturn` uses `['license', 'return', '--yes', '--format', 'json']`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -463,14 +475,18 @@ git commit -m "feat: add the Unity CLI process runner"
 
 **Files:**
 - Create: `core/src/commands/doctor.ts`, `core/src/commands/setup.ts`, `core/src/lifecycle/setup.ts`
-- Test: `core/test/doctor.test.ts`, `core/test/setup.test.ts`
+- Create: `core/src/packages/deps.ts`, `core/src/packages/git.ts`
+- Create: `core/test/fixtures/manifest-git-deps.json` (a `Packages/manifest.json` with a registry dependency, an `https://….git` dependency, an `ssh://` dependency and a `git@host:owner/repo.git` dependency)
+- Test: `core/test/doctor.test.ts`, `core/test/setup.test.ts`, `core/test/packages.test.ts`
 
 **Interfaces:**
-- Consumes: `runUnity` and the wrappers from `core/src/unity/cli.ts`; `Config` from `core/src/config/schema.ts`; `CoreContext` from `core/src/context.ts`.
+- Consumes: `runUnity` and the wrappers from `core/src/unity/cli.ts`; `spawnProcess` from `core/src/exec.ts`; `Config` from `core/src/config/schema.ts`; `CoreContext` from `core/src/context.ts`.
 - Produces:
   - `core/src/commands/doctor.ts` → `export async function doctorCommand(ctx: CoreContext): Promise<number>`.
   - `core/src/lifecycle/setup.ts` → `export async function setup(ctx: CoreContext): Promise<SetupResult>` where `SetupResult = { editorVersion: string; cliVersion: string; cliChannel: string | null; cliCommit: string | null; installed: boolean; doctorVerdict: 'pass' | 'fail' | 'unknown' }`.
   - `core/src/commands/setup.ts` → `export async function setupCommand(ctx: CoreContext): Promise<number>`.
+  - `core/src/packages/deps.ts` → `export interface GitDependency { name: string; url: string; host: string; hasEmbeddedCredentials: boolean }`, `export function readGitDependencies(projectPath: string): GitDependency[]` — parses `Packages/manifest.json` (and `Packages/packages-lock.json` for the resolved set), and returns every dependency whose value is a git URL (`https://….git`, `git@host:owner/repo.git`, `ssh://…`, `git://…`). `host` is the hostname; `hasEmbeddedCredentials` is true when the URL carries a userinfo component (`https://user:token@host/…`).
+  - `core/src/packages/git.ts` → `export interface GitPreflightResult { dependency: GitDependency; reachable: boolean; detail: string }`, `export async function preflightGitDependencies(deps: GitDependency[], opts: { cwd: string; env: NodeJS.ProcessEnv; logger: Logger; redactor: Redactor; timeoutMs?: number }): Promise<GitPreflightResult[]>` — runs `git ls-remote --exit-code <url>` **once per unique repository URL** through `spawnProcess`, using the ambient git configuration exactly as the Package Manager will.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -484,6 +500,24 @@ it('runs unity projects verify and reports project integrity problems', () => { 
 it('warns but does not fail when the CLI is newer than the tested ceiling', () => { /* exit 0, warning emitted */ });
 it('fails with exit 64 when the CLI is older than the tested floor', () => { /* exit 64 */ });
 it('records the CLI version, channel and commit on the context', () => { /* ctx.cliVersion set */ });
+it('reports the git package dependencies and their hosts', () => { /* doctor output lists them */ });
+it('fails when a git package dependency is not fetchable', () => {
+  /* git ls-remote fails → exit non-zero naming the URL */ });
+it('passes when every git package dependency is fetchable', () => { /* ls-remote succeeds */ });
+it('refuses to run when a git dependency URL embeds credentials', () => {
+  /* https://user:token@host/x.git → exit 64 naming the package (it would be copied into packages-lock.json) */ });
+it('does not run git ls-remote more than once per unique repository URL', () => { /* two packages, one repo → one call */ });
+```
+
+`core/test/packages.test.ts`:
+```ts
+it('reads git dependencies from Packages/manifest.json', () => { /* fixture */ });
+it('reads a dependency written as git@github.com:owner/repo.git', () => { /* host github.com */ });
+it('reads a dependency written as ssh://git@host/owner/repo.git', () => { /* host */ });
+it('ignores registry dependencies', () => { /* com.unity.ugui → not a git dep */ });
+it('ignores a scoped registry dependency', () => { /* https://packages.unity.com/... → not a git dep */ });
+it('detects embedded credentials in a URL', () => { /* hasEmbeddedCredentials true */ });
+it('returns an empty list for a project with no manifest', () => { /* */ });
 ```
 
 `core/test/setup.test.ts`:
@@ -527,6 +561,13 @@ The comparison is a plain semver-ish comparison of the numeric `beta.N` suffix, 
 The license is checked with `unity license status --format json` (`data.active`, `data.licenses[]`, `data.floatingServer`). A run with `license.mode: 'none'` fails fast with exit 64 when `active` is `false`, naming the activation command to run.
 
 `doctor.ts` runs `unity doctor --ci --format json` and `unity projects verify --strict --format json`, writes the doctor report to `<output.dir>/logs/doctor.json`, prints a one-line-per-check human summary, and exits 0 when no blocking check failed and `unity projects verify` found no error. `unity projects verify` catches missing/orphaned `.meta` files, duplicate GUIDs, conflict markers and an invalid package manifest **without launching the Editor** — a cheap preflight that catches a broken checkout before a ten-minute build.
+
+**Private git packages.** `setup.ts` (and `doctor.ts`) also runs the package-dependency preflight, unless `config.packages.preflight` is `false`:
+1. `readGitDependencies(projectPath)` reads `Packages/manifest.json` and returns the git-hosted dependencies with their hosts.
+2. If any dependency URL **embeds credentials** (`https://user:token@host/…`), the core **refuses to run** with exit 64, naming the package and the URL — because Unity copies that URL verbatim into `packages-lock.json`, which is a committed file, so the token would land in the repository (GC21, Review Focus #10). The remedy is a credential-free URL plus a git-level rewrite.
+3. `preflightGitDependencies` runs `git ls-remote --exit-code <url>` once per **unique repository URL** (two packages can come from one repo), through `spawnProcess`, using the ambient git configuration — the same configuration the Package Manager will use. A failure is a **blocking** check: the run stops in seconds with the URL and the remedy, instead of failing ten minutes later inside the Editor with a resolution error that reads like a Unity bug (Review Focus #9). A success proves the credentials are in place.
+
+This preflight is the core's **detection** half. Supplying the credentials is the adapter's job (GC22): the core never reads a token variable and never writes git config.
 
 Both commands are pure — they do not activate or return a license.
 
@@ -1017,6 +1058,43 @@ git commit -m "feat: add the CLI entrypoint and the fake unity binary"
     8. Return the licence — `unityci license return` with `if: always()`.
     Every third-party action is pinned by **commit SHA**, not a tag. The implementer must look up the current SHA for `actions/checkout`, `actions/cache` and `actions/upload-artifact` and record the version each SHA corresponds to in a comment.
     The action never passes `--allow-install` (the core fails fast with the exact install command instead) and never puts a secret on a command line: the licence serial is read by `unity license activate` from `UNITY_LICENSE_SERIAL` in the environment, and the floating/offline alternatives are documented in the action's README.
+
+  - **Private git packages.** A new input pair, `git-credentials` (`none` (default) | `token`) and `git-token`, plus an optional `git-token-repos` (comma-separated `owner/repo` list). When `git-credentials` is `token`, the action adds a step **before** the run step:
+
+    ```yaml
+    - name: Configure git credentials for private packages
+      if: inputs.git-credentials == 'token'
+      shell: bash
+      env:
+        UNITYCI_GIT_TOKEN: ${{ inputs.git-token }}
+        UNITYCI_GIT_REPOS: ${{ inputs.git-token-repos }}
+      run: |
+        set -euo pipefail
+        echo "::add-mask::$UNITYCI_GIT_TOKEN"
+        umask 077
+        if [ -f "$HOME/.gitconfig" ]; then cp "$HOME/.gitconfig" "$RUNNER_TEMP/gitconfig.snapshot"; fi
+        {
+          if [ -n "${UNITYCI_GIT_REPOS:-}" ]; then
+            for repo in ${UNITYCI_GIT_REPOS//,/ }; do
+              printf '[url "https://x-access-token:%s@github.com/%s.git"]\n' "$UNITYCI_GIT_TOKEN" "$repo"
+              printf '\tinsteadOf = https://github.com/%s.git\n' "$repo"
+            done
+          else
+            printf '[url "https://x-access-token:%s@github.com/"]\n' "$UNITYCI_GIT_TOKEN"
+            printf '\tinsteadOf = https://github.com/\n'
+          fi
+        } >> "$HOME/.gitconfig"
+    ```
+
+    and a matching teardown step, `if: always()`, that restores the snapshot or removes `~/.gitconfig` when there was none.
+
+    Four rules this step must obey, each with a reason:
+    - **`::add-mask::` before the first use** — the value must never reach a log line (GC24).
+    - **A shell *builtin*, not `git config --global url.…`** — `git config` would put the token in its own argv, and argv is visible in the process list and in shell tracing. `printf` and `cp` are bash builtins on the Actions runner, so the token never enters a process's arguments. The step therefore declares `shell: bash` explicitly.
+    - **A credential-free URL in `Packages/manifest.json`** — the rewrite is applied by git at fetch time, so the manifest and the committed `packages-lock.json` keep the plain URL (GC21, measured in `docs/decisions/upm-git-auth-probe.md`).
+    - **`GIT_CONFIG_GLOBAL` must not be used** — Unity's Package Manager ignores it, and it fails at resolution with an error that looks like a Unity bug. The rewrite goes into `~/.gitconfig`, which is measured to work.
+
+    The action's README documents the no-file-on-disk alternative for a single-step job — the per-invocation `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_0` / `GIT_CONFIG_VALUE_0` variables, which the Package Manager also honours (measured) — and warns that `GIT_CONFIG_GLOBAL` does not work.
   - `testing/conformance/check-adapters.ts` → `export async function checkAdapter(dir: string): Promise<{ file: string; rule: string; ok: boolean; detail: string }[]>` with these rules, each adapter file checked:
     - `calls-unityci`: the file contains `unityci ` and does **not** contain a bare `unity ` invocation outside a comment.
     - `has-teardown`: the file contains a step with `if: always()` that runs `unityci license return`.
@@ -1024,6 +1102,9 @@ git commit -m "feat: add the CLI entrypoint and the fake unity binary"
     - `no-exit-code-logic`: the file contains no comparison against a numeric Unity exit code.
     - `publishes-on-zero-and-eight`: the artifact/report upload step uses `if: always()` or an equivalent that does not gate on the run's success.
     - `pinned-actions`: every `uses:` line is pinned to a 40-character commit SHA.
+    - `masks-credentials`: if the file mentions a token or a secret, it also contains an `add-mask` call for it, **before** the first use.
+    - `no-credential-on-command-line`: the file never passes a credential to `git config` (whose argument would land in the process list) — the rewrite is written with a shell builtin instead.
+    - `no-git-config-global-env`: the file never sets `GIT_CONFIG_GLOBAL`, which Unity's Package Manager ignores.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1036,6 +1117,9 @@ it('the GitHub adapter satisfies every conformance rule', () => {
 it('detects a retry loop added to an adapter', () => { /* a temp file with 'maxAttempts' fails no-retry-logic */ });
 it('detects a missing license-return teardown', () => { /* temp file without 'always()' fails */ });
 it('detects an unpinned action', () => { /* 'actions/cache@v4' fails pinned-actions */ });
+it('detects a credential passed to git config on a command line', () => { /* fails no-credential-on-command-line */ });
+it('detects GIT_CONFIG_GLOBAL', () => { /* fails no-git-config-global-env */ });
+it('detects a token used without being masked', () => { /* fails masks-credentials */ });
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1136,6 +1220,7 @@ git commit -m "feat: add the minimal example Unity project"
   - `docs/local-development.md` — running `unityci` on a developer machine: install the Unity CLI, `pnpm install`, `pnpm -C core build`, `unityci doctor`, `unityci run test`, the fake-unity workflow, and how to run the same thing on Linux (including the runtime-library list and `ulimit -n 4096`).
   - `docs/generic-ci.md` — the documented minimum for any CI system (doctor → run → always-run licence return), plus how to wire cache from `unityci cache-info --json`.
   - `docs/compatibility.md` — a matrix of tested Unity CLI and Editor versions, the **pinning policy** (the CLI self-updates and cannot be reliably pinned: the Hub updates it automatically and that cannot be disabled, and winget/MSIX installs self-update with no rollback — so pin by *install method* (apt/dnf/brew with an explicit version, or a standalone binary outside the Hub's path), never by a version string), and the capability matrix the core probes.
+  - `docs/private-packages.md` — consuming a package from a **private git repository**: why the manifest URL must stay credential-free (Unity copies it verbatim into the committed `packages-lock.json`), the git URL-rewrite mechanism, the three delivery mechanisms that are measured to work (`~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`, per-invocation `GIT_CONFIG_*`) and the one that does **not** (`GIT_CONFIG_GLOBAL`), the least-privilege per-repository rewrite, the local-developer equivalents (Git Credential Manager, `gh auth setup-git`), the `git ls-remote` preflight, and a copy-paste recipe for GitHub Actions and for generic CI. It cites `docs/decisions/upm-git-auth-probe.md` for the measurements and marks SSH support as unverified.
   - `CONTRIBUTING.md` — the adapter contract (Section 5.1) and the "no core changes for a new provider" rule, with a how-to for writing a new adapter.
   - `SECURITY.md` — how to report a vulnerability, and the secrets-handling rules (env only, never argv, redaction before logging).
 
