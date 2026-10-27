@@ -347,8 +347,8 @@ git commit -m "chore: scaffold pnpm workspace and core primitives"
 - Produces:
   - `core/src/config/schema.ts` → `export interface Config` (exact shape below), `export const DEFAULT_CONFIG: Config`, `export type ConfigIssue = { path: string; message: string }`.
   - `core/src/config/validate.ts` → `export function validateConfig(config: Config): ConfigIssue[]`.
-  - `core/src/config/env.ts` → `export const ENV_KEYS: Record<string, string>` mapping each `UNITYCI_*` env var to its config path, `export type DeepPartial<T> = { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K] }`, and `export function readEnvConfig(env: NodeJS.ProcessEnv): { patch: DeepPartial<Config>; unknown: string[] }`. The patch is **deep**: `Partial<Config>` cannot express a nested path such as `unity.cli.version`.
-  - `core/src/config/load.ts` → `export function loadConfig(opts: { cwd: string; argv: Record<string, string | boolean | string[]>; env: NodeJS.ProcessEnv; configFile?: string }): { config: Config; issues: ConfigIssue[]; unknownEnvVars: string[] }`.
+  - `core/src/config/env.ts` → `export const ENV_KEYS: Record<string, string>` mapping each `UNITYCI_*` env var to its config path, `export type DeepPartial<T> = { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K] }`, and `export function readEnvConfig(env: NodeJS.ProcessEnv): { patch: DeepPartial<Config>; unknown: string[]; warnings: string[] }`. The patch is **deep**: `Partial<Config>` cannot express a nested path such as `unity.cli.version`. `unknown` holds env vars that are **not** in `ENV_KEYS`; `warnings` holds **malformed values for known vars** (a non-boolean where a boolean is expected). The two are different conditions and must not share one channel.
+  - `core/src/config/load.ts` → `export function loadConfig(opts: { projectPath: string; cwd: string; argv: ParseResult['flags']; env: NodeJS.ProcessEnv; configFile?: string }): { config: Config; issues: ConfigIssue[]; unknownEnvVars: string[]; warnings: string[]; projectPath: string }`. The `argv` type is the parser's own `ParseResult['flags']` — do not restate it, or the two drift apart. **`projectPath` is the already-resolved project root**, supplied by the caller (from `--project-path`, else the working directory). The config file is discovered **at the project root** (`<projectPath>/unity-ci.yml`), not at the working directory — otherwise `unityci run test --project-path examples/minimal-project` would silently ignore that project's own configuration.
   - `core/src/context.ts` → `export interface CoreContext { config: Config; cwd: string; projectPath: string; env: NodeJS.ProcessEnv; logger: Logger; redactor: Redactor; binary: string; startedAt: number; cliVersion: string | null }`.
 
 `Config` shape (the spec's surface plus the additions Spike 0 forces):
@@ -396,7 +396,17 @@ it('caps exit code 6 at one extra attempt when it is enabled', () => { /* maxAtt
 it('rejects a version string with a shell-unsafe character', () => { /* '6000.0.47f1; rm -rf /' */ });
 it('rejects an output dir that escapes the project root', () => { /* '../outside' */ });
 it('rejects a report path that is an existing directory', () => { /* unity test silently writes no report */ });
+it('accepts a build output path that is an existing directory', () => { /* unity build --output-path ./Build/WebGL is a directory */ });
 it('accepts a normal config', () => { /* issues is empty */ });
+
+// the validator is exercised directly, not only through the loader
+it('validateConfig returns issues and does not mutate the config it is given', () => { /* purity */ });
+it('validateConfig leaves retry.maxAttempts alone when exit code 6 is absent', () => { /* no cap */ });
+it('the loader applies the exit-code-6 cap, not the validator', () => { /* maxAttempts === 2 after load */ });
+
+// the project root, not the working directory, decides which config file is read
+it('discovers unity-ci.yml at the project root', () => { /* not at cwd */ });
+it('returns the resolved project path', () => { /* echoed back */ });
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -413,7 +423,7 @@ unity: { cli: { version: '1.0.0-beta.14', allowLatest: false, binary: 'unity' },
 license: { mode: 'none', serialEnv: 'UNITY_LICENSE_SERIAL', fileEnv: 'UNITY_LICENSE_FILE_BASE64' },
 packages: { preflight: true },
 test: { modes: ['EditMode'], outputDir: 'ci-output/tests', filter: null, coverage: false, shards: null, retries: 0, nographics: true },
-build: { target: 'StandaloneWindows64', profile: null, executeMethod: null, outputPath: 'ci-output/build',
+build: { target: 'StandaloneWindows64', profile: null, executeMethod: null, outputPath: 'ci-output/build/game',
          versioningStrategy: 'none', buildVersion: null, androidVersionCode: null, allowDirtyBuild: false },
 retry: { onExitCodes: [7, 9, 12, 14], maxAttempts: 2, backoffMs: 5000 },
 output: { dir: 'ci-output', annotations: 'none', ci: true }
@@ -422,18 +432,18 @@ output: { dir: 'ci-output', annotations: 'none', ci: true }
 `validate.ts` — returns issues (never throws):
 - version strings must match `^[A-Za-z0-9][A-Za-z0-9._+-]*$` — except the sentinel `from-project` and the literal `latest`.
 - `latest` without `allowLatest: true` → issue.
-- `retry.onExitCodes` containing `8`, `130` or `143` → issue ("this exit code is never retried"). `6` is allowed but, when present, `retry.maxAttempts` is capped at 2 (one extra attempt).
+- `retry.onExitCodes` containing `8`, `130` or `143` → issue ("this exit code is never retried"). `6` is allowed, but because re-running an identical broken configuration reproduces the failure, `6` caps `retry.maxAttempts` at 2 (one extra attempt). **The cap is applied by `loadConfig` after validation, not by `validateConfig` itself** — the validator is pure and returns issues; it does not mutate the config it is given.
 - `output.dir`, `test.outputDir`, `build.outputPath` must resolve inside the project root (reject `..` escapes and absolute paths outside the root).
-- A report path (`test.outputDir` files, `build.outputPath`) that is an **existing directory** → issue. `unity test --output <dir>` runs the tests and writes no report at all, silently.
+- A report path (`test.outputDir` files) that is an **existing directory** → issue. `unity test --output <dir>` runs the tests and writes no report at all, silently. The rule applies to **test report paths only**: `build.outputPath` may legitimately be a directory, because Unity's own CLI documents `unity build --profile WebGL --output-path ./Build/WebGL` — a directory — for directory-style targets. The core creates the output's **parent directory** before invoking `unity build`.
 - `test.modes` entries must be `EditMode` or `PlayMode`.
 - `license.mode` must be one of the five listed values.
 - `build.target` and `build.profile` must match the version-string regex.
 - `retry.maxAttempts` must be an integer ≥ 1.
 
 `env.ts` — `ENV_KEYS` maps: `UNITYCI_CLI_VERSION` → `unity.cli.version`, `UNITYCI_CLI_ALLOW_LATEST` → `unity.cli.allowLatest`, `UNITYCI_UNITY_BINARY` → `unity.cli.binary`, `UNITYCI_EDITOR_VERSION` → `unity.editor.version`, `UNITYCI_EDITOR_MODULES` → `unity.editor.modules` (comma-separated), `UNITYCI_EDITOR_CHANGESET` → `unity.editor.changeset`, `UNITYCI_EDITOR_ACCEPT_EULA` → `unity.editor.acceptEula`, `UNITYCI_EDITOR_TERMS` → `unity.editor.terms`, `UNITYCI_LICENSE_MODE` → `license.mode`, `UNITYCI_TEST_MODES` → `test.modes` (comma-separated), `UNITYCI_TEST_FILTER` → `test.filter`, `UNITYCI_TEST_COVERAGE` → `test.coverage`, `UNITYCI_TEST_NOGRAPHICS` → `test.nographics`, `UNITYCI_TEST_SHARDS` → `test.shards`, `UNITYCI_BUILD_TARGET` → `build.target`, `UNITYCI_BUILD_PROFILE` → `build.profile`, `UNITYCI_BUILD_METHOD` → `build.executeMethod`, `UNITYCI_RETRY_EXIT_CODES` → `retry.onExitCodes` (comma-separated), `UNITYCI_RETRY_MAX_ATTEMPTS` → `retry.maxAttempts`, `UNITYCI_OUTPUT_DIR` → `output.dir`, `UNITYCI_ANNOTATIONS` → `output.annotations`, `UNITYCI_CI` → `output.ci`, `UNITYCI_PACKAGES_PREFLIGHT` → `packages.preflight`.
-`readEnvConfig` returns `{ patch, unknown }` where `unknown` lists every `UNITYCI_*` var not in `ENV_KEYS` **and** not matching `UNITYCI_SECRET_*`. Booleans parse `true`/`false` case-insensitively; anything else is a warning, not a failure.
+`readEnvConfig` returns `{ patch, unknown, warnings }` where `unknown` lists every `UNITYCI_*` var not in `ENV_KEYS` **and** not matching `UNITYCI_SECRET_*`, and `warnings` lists env vars that **are** in `ENV_KEYS` but whose value could not be parsed (a non-boolean where a boolean is expected, a non-numeric where a number is expected). Booleans parse `true`/`false` case-insensitively; anything else is a warning, not a failure.
 
-`load.ts` — loads `unity-ci.yml` (or `unity.ci.yml`, or the path given by `--config`) with the `yaml` package, merges `DEFAULT_CONFIG` < file < env < flags, then runs `validateConfig`. A file that cannot be parsed yields a `ConfigIssue` (not a throw). A file containing any of `serial`, `fileBase64`, `serviceAccountId`, `serviceAccountSecret` anywhere under `license:` yields a `ConfigIssue` saying secrets travel through the environment or through git configuration only — never through a config file, a flag, or a command line (GC5, GC21).
+`load.ts` — loads `unity-ci.yml` (or `unity.ci.yml`, or the path given by `--config`) from the **project root** with the `yaml` package, then **deep-merges** the layers in order — `DEFAULT_CONFIG` < file < env < flags — so a layer that sets one nested key never erases its siblings. It then runs `validateConfig`, applies the `6`-retry cap to `retry.maxAttempts` (the validator itself is pure), and returns the config, the issues, the warnings and the resolved project path. A file that cannot be parsed yields a `ConfigIssue` (not a throw) and the loader still returns a usable config built from the defaults. A file containing any of `serial`, `fileBase64`, `serviceAccountId`, `serviceAccountSecret` anywhere under `license:` yields a `ConfigIssue` saying secrets travel through the environment or through git configuration only — never through a config file, a flag, or a command line (GC5, GC21).
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -846,7 +856,7 @@ Expected: FAIL — module not found.
 2. `await activateLicense(ctx)` inside the same `try`.
 3. `finally { await returnLicense(ctx) }` (GC9).
 4. For each mode in `config.test.modes` (default `['EditMode']`), build argv:
-   `['test', projectPath, '--mode', mode, '--output', <outputDir>/tests/<mode>.xml, '--report-format', 'nunit,junit', '--junit-output', <outputDir>/tests/<mode>.junit.xml, '--format', 'json']` plus `--filter` when set, `--coverage --coverage-output <outputDir>/coverage` when `config.test.coverage`, `--shard <n>` when `config.test.shards` is set, `--retries <n>` when `config.test.retries > 0`, and the editor arguments `-- -nographics` when `config.test.nographics` is true **and** the mode is `EditMode` (PlayMode needs a graphics device for simulated input).
+   `['test', projectPath, '--mode', mode, '--output', <test.outputDir>/<mode>.xml, '--report-format', 'nunit,junit', '--junit-output', <test.outputDir>/<mode>.junit.xml, '--format', 'json']` plus `--filter` when set, `--coverage --coverage-output <test.outputDir>/coverage` when `config.test.coverage`, `--shard <n>` when `config.test.shards` is set, `--retries <n>` when `config.test.retries > 0`, and the editor arguments `-- -nographics` when `config.test.nographics` is true **and** the mode is `EditMode` (PlayMode needs a graphics device for simulated input).
    Exactly **one** `--mode` per invocation: the CLI accepts a repeated `--mode` and silently lets the **last one win**, so a config bug would run PlayMode instead of EditMode with no diagnostic. The core owns mode selection and must never emit two.
    `--junit-output` is only valid together with `nunit,junit` — with `junit` alone the JUnit report *is* `--output`, and passing both is a usage error (exit 2). The core therefore always requests `nunit,junit` and passes both paths.
    `--allow-install` is **never** sent (see Task 5): a missing Editor fails fast with the exact install command instead.
