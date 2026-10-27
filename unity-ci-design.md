@@ -180,8 +180,8 @@ Retry policy:
 
 - Default: retry **`[7, 9, 12, 14]`**, up to `maxAttempts`, with backoff.
 - **This default differs deliberately from `docs/decisions/spike0-cli.md`, whose Implications section recommends `{7, 9, 10, 12, 14, 130, 143}`.** `10` (`READY_TIMEOUT`) applies only to `unity open --until-ready`, and `130`/`143` are interrupts — a signalled CI job must fail, never loop — so both are excluded even though Unity's own table marks them retryable. Exit 8 is never retried; exit 6 is opt-in and capped at one extra attempt. The resolved S4 answer supersedes the earlier recommendation.
-- **Never retry 8** (tests ran and failed), nor `2`, `3`, `4`, `11`, `13`.
-- Exclude `10` (only reachable through `unity open --until-ready`) and `130`/`143` (a signalled job must fail, not loop).
+- **Never retry 0** (success — retrying a green run doubles the work and can turn a flaky-but-green suite into a flaky-and-red one), nor `8` (tests ran and failed), nor `2`, `3`, `4`, `11`, `13`.
+- Exclude `10` (only reachable through `unity open --until-ready`) and `130`/`143` (a signalled job must fail, not loop). These four codes are rejected in a configuration, **and** the retry decision itself refuses them unconditionally, so a hand-built policy cannot retry a success, a test failure or a signalled job.
 - **6 is terminal by default.** It is opt-in per pipeline (`retry.onExitCodes: [6, 7, 9, 12, 14]`) and then capped at **one** extra attempt, because re-running an identical broken configuration reproduces the failure.
 - Classify **14** as infrastructure and retry it; a `TEST_TIMED_OUT` run produced no verdict and must not be summarised as failing tests.
 - Branch on the **exit code** first and `errors[0].code` second: a usage error shipped `COMMAND_FAILED` on exit 2, so the error code is not a stable classifier on its own (S3).

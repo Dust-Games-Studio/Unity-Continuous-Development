@@ -23,7 +23,7 @@ These bind every task. Copy them verbatim into every dispatch.
 - **GC5 — Secrets are env-only.** `UNITY_SERVICE_ACCOUNT_ID`, `UNITY_SERVICE_ACCOUNT_SECRET`, `UNITY_LICENSE_SERIAL`, `UNITY_LICENSE_FILE_BASE64` and anything under `UNITYCI_SECRET_*` are read from the environment only. Never accepted as CLI flags, never written to `unity-ci.yml` (the loader must **reject** such keys with exit 64), never placed in `argv` of a child process. Redact registered secret values from every byte the core logs or writes. A **git** credential (for a private UPM package) is a separate channel and is not a `UNITYCI_*` value: it travels through git configuration only — never through a flag, a config file, or a command line (GC21, GC23, GC24).
 - **GC6 — Redaction before logging.** Register all secret values into the redactor **before** the first log line is emitted. A redactor replaces each registered non-empty secret with `***`.
 - **GC7 — Exit codes.** The core passes Unity's exit codes through unchanged and adds only two in a reserved range: **64** = core configuration/validation error, **65** = core internal error (unparsable Unity output, unexpected exception). Unity's codes to handle explicitly: `0` success, `2` usage, `3` auth, `4` needs config, `6` command failed (the run produced **no** verdict), `7` service unreachable, `8` tests ran and some failed (**never retried**), `9` install locked, `11` not a Unity project / release missing, `12` Editor unreachable, `13` unknown Editor command, `14` timeout, `130` SIGINT, `143` SIGTERM. **Branch on the exit code first** — `errors[0].code` is *not* a reliable branch key (a `--junit-output` usage error shipped with `"code": "COMMAND_FAILED"` on exit 2).
-- **GC8 — Retry policy.** Unity's own machine-readable table (`unity commands --json` → `data.exitCodes[].retry`) marks `7`, `9`, `10`, `12`, `14`, `130` and `143` retryable and `6`, `8`, `11`, `13` terminal. The core's default is **`retry.onExitCodes: [7, 9, 12, 14]`**, `maxAttempts: 2`, backoff 5000 ms. It differs from Unity's table in two deliberate ways: **`10`** (`READY_TIMEOUT`) applies only to `unity open --until-ready` and is excluded, and **`130`/`143`** are interrupts — a signalled CI job must fail, never loop — so they are excluded even though Unity marks them retryable. **Exit 8 is never retried**, and a config listing `8`, `130` or `143` is rejected at validation time with exit 64. **Exit 6 is opt-in**: the reference docs are explicit that re-running an identical broken configuration reproduces the failure, so `6` may be added per pipeline but is capped at **one** extra attempt.
+- **GC8 — Retry policy.** Unity's own machine-readable table (`unity commands --json` → `data.exitCodes[].retry`) marks `7`, `9`, `10`, `12`, `14`, `130` and `143` retryable and `6`, `8`, `11`, `13` terminal. The core's default is **`retry.onExitCodes: [7, 9, 12, 14]`**, `maxAttempts: 2`, backoff 5000 ms. It differs from Unity's table in two deliberate ways: **`10`** (`READY_TIMEOUT`) applies only to `unity open --until-ready` and is excluded, and **`130`/`143`** are interrupts — a signalled CI job must fail, never loop — so they are excluded even though Unity marks them retryable. **Exit 8 is never retried**, and a config listing `8`, `130` or `143` is rejected at validation time with exit 64 — as is `0`, because it is **success** and retrying a green run doubles the work. **Exit 6 is opt-in**: the reference docs are explicit that re-running an identical broken configuration reproduces the failure, so `6` may be added per pipeline but is capped at **one** extra attempt.
   Additionally: `unity test --timeout` exits **14** with `TEST_TIMED_OUT` (the reference doc's claim that it exits 6 is wrong), and a timed-out suite is an **infrastructure** failure — `summary.json` must not report it as red tests.
 - **GC9 — License teardown is unconditional.** `unity license return --yes` runs in a `finally` after every `run test` / `run build`, including on failure, on SIGINT and on SIGTERM, with a bounded 60 s timeout. A failure of the teardown is logged loudly and **never** changes the primary exit code.
 - **GC10 — Output layout.** Everything is written under `output.dir` (default `ci-output/`):
@@ -741,16 +741,23 @@ git commit -m "feat: add license activate and return lifecycle"
 ```ts
 it('retries exit code 7 up to maxAttempts', () => { /* 2 attempts when 7 persists */ });
 it('never retries exit code 8', () => { /* 1 attempt, even with 8 in onExitCodes */ });
+it('never retries exit code 0 even when the policy opts it in', () => { /* 0 is success */ });
+it('never retries interrupts from a hand-built policy', () => { /* 130 and 143 */ });
 it('never retries exit code 6 by default', () => { /* 6 is not in the default onExitCodes */ });
 it('retries exit code 6 once when it is opted in', () => { /* maxAttempts 2 → 2 attempts */ });
 it('does not retry when the attempt count is exhausted', () => { /* exactly maxAttempts calls */ });
 it('waits backoffMs before the second attempt', () => { /* fake timers */ });
 it('doubles the wait before each further attempt', () => { /* backoffMs, then 2x backoffMs */ });
 it('caps the wait at 60 seconds', () => { /* many attempts */ });
+it('caps the first wait at 60 seconds', () => { /* backoffMs 90_000 → waits 60_000 */ });
 it('returns the last attempt value and the number of attempts', () => { /* attempts === 2 */ });
-it('returns the last attempt exit code', () => { /* code === 7 */ });
+it('returns the last attempt exit code', () => { /* attempt 1 → 7, attempt 2 → 9, code === 9 */ });
 it('rethrows a rejection from the attempt without retrying', () => { /* an internal error is not a Unity exit code */ });
+it('does not start an attempt when the signal is already aborted', () => { /* fn called zero times */ });
+it('ends the backoff wait immediately when the signal aborts', () => { /* the timer is cleared */ });
+it('retries normally when the signal never fires', () => { /* the normal path is unchanged */ });
 it('calls onRetry with the attempt, the code and the wait', () => { /* */ });
+it('reports the attempt that just finished to onRetry', () => { /* maxAttempts 3 → attempt 1 then attempt 2 */ });
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
