@@ -323,7 +323,9 @@ ci-output/
 
 The `!*/src/packages/**` negation is **not** cosmetic. The pre-existing NuGet rule `**/[Pp]ackages/*` matches the toolkit's **own** source directory `core/src/packages/`, so without the negation any new file placed there is invisible to `git status` and to `git add .` — it would be silently lost. Verified: with the rule alone, `git check-ignore --no-index -v core/src/packages/<new>.ts` matches; with the negation, `git status` reports the file and `git add -n` stages it.
 
-`core/package.json` declares `"type": "module"`, `"bin": { "unityci": "./dist/cli.js" }`, the three dev dependencies at their exact pinned versions (`typescript@5.9.3`, `vitest@5.0.5`, `@types/node@26.6.5`), the scripts `build` (`tsc -p tsconfig.json`), `typecheck` (`tsc --noEmit`) and `test` (`vitest run`), and `"engines": { "node": ">=22.4" }`.
+`core/package.json` declares `"type": "module"`, `"bin": { "unityci": "./dist/cli.js" }`, the three dev dependencies at their exact pinned versions (`typescript@5.9.3`, `vitest@5.0.5`, `@types/node@26.6.5`), the scripts `build` (`tsc -p tsconfig.json`), `typecheck` (`tsc -p tsconfig.test.json`) and `test` (`vitest run`), and `"engines": { "node": ">=22.4" }`.
+
+**The tests are typechecked too.** `core/tsconfig.json` is the *build* config — `include: ["src/**/*.ts"]`, `rootDir: "src"`, `outDir: "dist"` — so the test files are outside it. `core/tsconfig.test.json` extends it, sets `noEmit: true`, `rootDir: "."` and `include: ["src/**/*.ts", "test/**/*.ts"]`, and the `typecheck` script points at **that** file. A plain `tsc --noEmit` over the build config silently skips every test file, so a test that does not compile would pass the typecheck and fail only at runtime.
 
 The **root** `package.json` declares `"engines": { "node": ">=22.12" }` — the development toolchain's floor — and `pnpm-workspace.yaml` contains `engineStrict: true` alongside `packages:` so pnpm refuses to install on an older Node instead of failing later at test time.
 
