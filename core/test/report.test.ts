@@ -60,7 +60,7 @@ function makeContext(env: NodeJS.ProcessEnv = {}, projectPath = process.cwd()): 
  * `<test.outputDir>/<mode>.xml` and `summary.json` under `<output.dir>`.
  */
 function reportProject(
-  fixture: string = FAIL_FIXTURE,
+  fixture: string | null = PASS_FIXTURE,
 ): { ctx: CoreContext; root: string; testDir: string } {
   const root = tempDir();
   const ctx = makeContext({}, root);
@@ -68,8 +68,15 @@ function reportProject(
   ctx.config.test.outputDir = 'ci-output/tests';
   const testDir = join(root, 'ci-output', 'tests');
   mkdirSync(testDir, { recursive: true });
-  writeFileSync(join(testDir, 'EditMode.xml'), fixture);
+  if (fixture !== null) writeFileSync(join(testDir, 'EditMode.xml'), fixture);
   return { ctx, root, testDir };
+}
+
+function readSummary(root: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(join(root, 'ci-output', 'summary.json'), 'utf8')) as Record<
+    string,
+    unknown
+  >;
 }
 
 function captureStdout(): { text: () => string; spy: ReturnType<typeof vi.spyOn> } {
@@ -127,6 +134,67 @@ describe('NUnit parsing', () => {
       </test-suite>
     </test-results>`;
     expect(parseNUnit(nunit2)).toEqual({ total: 2, passed: 1, failed: 1, skipped: 0 });
+  });
+
+  it('rejects well-formed XML that is not a test report', () => {
+    // A proxy error page and a JSON blob are well-formed text but not reports:
+    // treating either as zero tests would be a silent green (GC7).
+    expect(() => parseNUnit('<html><body>502 Bad Gateway</body></html>')).toThrow(
+      ReportParseError,
+    );
+    expect(() => parseNUnit('{"error":"bad gateway"}')).toThrow(ReportParseError);
+    expect(() => parseNFailures('<testsuites><testsuite /></testsuites>')).toThrow(
+      ReportParseError,
+    );
+
+    // A real report with zero tests is legitimate and still parses to zeros.
+    expect(
+      parseNUnit('<test-run total="0" passed="0" failed="0" skipped="0" inconclusive="0" />'),
+    ).toEqual({ total: 0, passed: 0, failed: 0, skipped: 0 });
+    expect(parseNUnit('<test-run total="0" />')).toEqual({
+      total: 0,
+      passed: 0,
+      failed: 0,
+      skipped: 0,
+    });
+  });
+
+  it('counts a root-level inconclusive attribute as skipped', () => {
+    // Deleting the `inconclusive` lookup must not stay green: the walk would
+    // report skipped 0 here because there are no <test-case> children.
+    expect(
+      parseNUnit('<test-run total="2" passed="1" failed="0" skipped="0" inconclusive="1" />'),
+    ).toEqual({ total: 2, passed: 1, failed: 0, skipped: 1 });
+  });
+
+  it('reads the NUnit 2 not-run and ignored counts', () => {
+    // `not-run` is preferred; `ignored` is the fallback. The walk cannot see
+    // either because there are no <test-case> children.
+    expect(parseNUnit('<test-results total="5" failures="1" not-run="2" />')).toEqual({
+      total: 5,
+      passed: 2,
+      failed: 1,
+      skipped: 2,
+    });
+    expect(parseNUnit('<test-results total="2" failures="0" ignored="1" />')).toEqual({
+      total: 2,
+      passed: 1,
+      failed: 0,
+      skipped: 1,
+    });
+  });
+
+  it('prefers the root counts over the test-case children when they disagree', () => {
+    // The implementation honours the root: it is the authoritative summary the
+    // runner wrote. Walking the two children would instead say
+    // { total: 2, passed: 1, failed: 1, skipped: 0 }.
+    const disagreement = `<test-run total="10" passed="7" failed="2" skipped="1" inconclusive="0">
+      <test-suite>
+        <test-case result="Passed" />
+        <test-case result="Failed" />
+      </test-suite>
+    </test-run>`;
+    expect(parseNUnit(disagreement)).toEqual({ total: 10, passed: 7, failed: 2, skipped: 1 });
   });
 
   it('extracts failure names, messages and stacks', () => {
@@ -358,6 +426,87 @@ describe('annotations', () => {
 });
 
 describe('report command', () => {
+  it('returns 0 and writes passed when every configured mode parses with no failures', async () => {
+    const { ctx, root } = reportProject(PASS_FIXTURE);
+
+    expect(await reportCommand(ctx)).toBe(0);
+
+    const summary = readSummary(root);
+    expect(summary.status).toBe('passed');
+    expect(summary.exitCode).toBe(0);
+    expect(summary.tests).toEqual({ total: 3, passed: 2, failed: 0, skipped: 1 });
+  });
+
+  it('returns 8 and writes tests_failed when a report shows a failure', async () => {
+    const { ctx, root } = reportProject(FAIL_FIXTURE);
+
+    expect(await reportCommand(ctx)).toBe(8);
+
+    const summary = readSummary(root);
+    expect(summary.status).toBe('tests_failed');
+    expect(summary.exitCode).toBe(8);
+    expect(summary.tests).toEqual({ total: 2, passed: 1, failed: 1, skipped: 0 });
+  });
+
+  it('returns 6 and writes infra_failed when no configured mode produced a report', async () => {
+    const { ctx, root } = reportProject(null);
+
+    expect(await reportCommand(ctx)).toBe(6);
+
+    const summary = readSummary(root);
+    expect(summary.status).toBe('infra_failed');
+    expect(summary.exitCode).toBe(6);
+  });
+
+  it('returns 65 and writes infra_failed, replacing a stale green summary, when a report cannot be parsed', async () => {
+    const { ctx, root, testDir } = reportProject(PASS_FIXTURE);
+    expect(await reportCommand(ctx)).toBe(0);
+    expect(readSummary(root).status).toBe('passed');
+
+    writeFileSync(join(testDir, 'EditMode.xml'), '<test-run total="1"');
+
+    expect(await reportCommand(ctx)).toBe(65);
+    const summary = readSummary(root);
+    expect(summary.status).toBe('infra_failed');
+    expect(summary.exitCode).toBe(65);
+    // The stale green counts are gone too.
+    expect(summary.tests).toEqual({ total: 0, passed: 0, failed: 0, skipped: 0 });
+  });
+
+  it('ignores unrelated XML and derives the verdict from the configured modes', async () => {
+    const { ctx, root, testDir } = reportProject(PASS_FIXTURE);
+    // A stale failing report in the directory is not a configured mode.
+    writeFileSync(join(testDir, 'Unrelated.xml'), FAIL_FIXTURE);
+
+    expect(await reportCommand(ctx)).toBe(0);
+    expect(readSummary(root).status).toBe('passed');
+
+    // With the configured mode's report gone, the unrelated file cannot make
+    // the run look green (or red): no configured mode produced a report.
+    rmSync(join(testDir, 'EditMode.xml'));
+    expect(await reportCommand(ctx)).toBe(6);
+    const summary = readSummary(root);
+    expect(summary.status).toBe('infra_failed');
+    expect(summary.exitCode).toBe(6);
+  });
+
+  it('falls back to converting when the JUnit file Unity wrote is empty', async () => {
+    const { ctx, root, testDir } = reportProject(FAIL_FIXTURE);
+    const junitPath = join(testDir, 'EditMode.junit.xml');
+    writeFileSync(junitPath, '');
+
+    expect(await reportCommand(ctx)).toBe(8);
+    const junit = readFileSync(junitPath, 'utf8');
+    expect(junit.length).toBeGreaterThan(0);
+    expect(junit).toContain('<testcase ');
+    expect(readSummary(root).status).toBe('tests_failed');
+
+    // An empty JUnit with no NUnit report to convert is nothing usable (R18).
+    rmSync(join(testDir, 'EditMode.xml'));
+    writeFileSync(junitPath, '');
+    expect(await reportCommand(ctx)).toBe(6);
+  });
+
   it('redacts a secret in the JUnit file it writes', async () => {
     const secret = 's3cr3t-token';
     const xml = `<test-run total="1" passed="0" failed="1" skipped="0" inconclusive="0">
@@ -370,15 +519,16 @@ describe('report command', () => {
         </test-case>
       </test-suite>
     </test-run>`;
-    const { ctx, testDir } = reportProject(xml);
+    const { ctx, root, testDir } = reportProject(xml);
     ctx.redactor.register(secret);
 
-    expect(await reportCommand(ctx)).toBe(0);
+    expect(await reportCommand(ctx)).toBe(8);
 
     // nunitToJUnit stays pure; reportCommand redacts at the write boundary.
     const junit = readFileSync(join(testDir, 'EditMode.junit.xml'), 'utf8');
     expect(junit).toContain('***');
     expect(junit).not.toContain(secret);
+    expect(readSummary(root).status).toBe('tests_failed');
   });
 
   it('throws a typed error when the NUnit XML cannot be parsed', async () => {
@@ -389,8 +539,10 @@ describe('report command', () => {
     expect(() => nunitToJUnit(malformed)).toThrow(ReportParseError);
 
     // The caller maps the typed error to exit 65 (GC7), never a zero-count pass.
-    const { ctx, testDir } = reportProject(malformed);
+    const { ctx, root, testDir } = reportProject(malformed);
     expect(await reportCommand(ctx)).toBe(65);
     expect(existsSync(join(testDir, 'EditMode.junit.xml'))).toBe(false);
+    expect(readSummary(root).status).toBe('infra_failed');
+    expect(readSummary(root).exitCode).toBe(65);
   });
 });

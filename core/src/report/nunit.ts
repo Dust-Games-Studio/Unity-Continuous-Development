@@ -329,12 +329,23 @@ function readCase(testCase: XmlElement): NUnitCase {
   };
 }
 
+/** The roots NUnit 2 and NUnit 3 reports use. */
+const REPORT_ROOTS = new Set(['test-run', 'test-results', 'test-suite']);
+
 /**
  * Parses a whole report once, so `parseNUnit`, `parseNFailures` and the JUnit
  * converter agree on what the document says.
  */
 export function parseNUnitReport(xml: string): NUnitReport {
   const root = parseXml(xml);
+  // Well-formed XML is not necessarily a test report: an HTML error page or a
+  // JSON blob left by a proxy must be a parse error (GC7), never a zero-count
+  // pass. A real report with zero tests is still legitimate and parses below.
+  if (!REPORT_ROOTS.has(root.name)) {
+    throw new ReportParseError(
+      `not an NUnit report: root element <${root.name}> is not test-run, test-results or test-suite`,
+    );
+  }
   const allCases = collectTestCases(root);
   const walked = walkCounts(allCases);
 
