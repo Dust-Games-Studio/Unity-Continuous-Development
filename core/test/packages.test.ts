@@ -12,7 +12,8 @@ import {
 } from '../src/packages/deps.js';
 import { preflightGitDependencies } from '../src/packages/git.js';
 import {
-  BUILD_TARGET_MODULES,
+  hostPlatform,
+  isBuildTargetSupportedOnHost,
   modulesForBuildTarget,
   modulesForTestMode,
 } from '../src/packages/modules.js';
@@ -21,9 +22,12 @@ const mocks = vi.hoisted(() => ({
   spawnProcess: vi.fn(),
 }));
 
-vi.mock('../src/exec.js', () => ({
-  spawnProcess: mocks.spawnProcess,
-}));
+vi.mock('../src/exec.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/exec.js')>();
+  return { ...actual, spawnProcess: mocks.spawnProcess };
+});
+
+import { stripSensitiveEnv } from '../src/exec.js';
 
 const FIXTURE = new URL('./fixtures/manifest-git-deps.json', import.meta.url);
 const tempDirs: string[] = [];
@@ -256,30 +260,60 @@ describe('preflightGitDependencies', () => {
 });
 
 describe('modulesForBuildTarget', () => {
-  it('maps every documented build target to its Hub module ids', () => {
-    expect(modulesForBuildTarget('StandaloneWindows64')).toEqual([]);
-    expect(modulesForBuildTarget('StandaloneLinux64')).toEqual(['linux-il2cpp']);
-    expect(modulesForBuildTarget('StandaloneOSX')).toEqual(['mac-mono']);
-    expect(modulesForBuildTarget('Android')).toEqual(['android', 'android-sdk-ndk-tools']);
-    expect(modulesForBuildTarget('iOS')).toEqual(['ios']);
-    expect(modulesForBuildTarget('WebGL')).toEqual(['webgl']);
-    expect(modulesForBuildTarget('tvOS')).toEqual(['appletv']);
-    expect(modulesForBuildTarget('visionOS')).toEqual(['visionos']);
-    expect(modulesForBuildTarget('WindowsStoreApps')).toEqual([
-      'universal-windows-platform',
-    ]);
-    expect(modulesForBuildTarget('LinuxServer')).toEqual(['linux-server']);
-    expect(modulesForBuildTarget('MacServer')).toEqual(['mac-server']);
+  it('maps native builds to no player module', () => {
+    expect(modulesForBuildTarget('StandaloneWindows64', 'windows')).toEqual([]);
+    expect(modulesForBuildTarget('StandaloneLinux64', 'linux')).toEqual([]);
+    expect(modulesForBuildTarget('StandaloneOSX', 'macos')).toEqual(['mac-mono']);
   });
 
-  it('returns an empty list for an unknown target instead of throwing', () => {
-    expect(modulesForBuildTarget('PlayStation9')).toEqual([]);
+  it('requires the target player module for a cross-build', () => {
+    expect(modulesForBuildTarget('StandaloneWindows64', 'linux')).toEqual([
+      'windows-il2cpp',
+    ]);
+    expect(modulesForBuildTarget('StandaloneWindows64', 'macos')).toEqual([
+      'windows-il2cpp',
+    ]);
+    expect(modulesForBuildTarget('StandaloneLinux64', 'windows')).toEqual([
+      'linux-il2cpp',
+    ]);
+    expect(modulesForBuildTarget('StandaloneLinux64', 'macos')).toEqual([
+      'linux-il2cpp',
+    ]);
+  });
+
+  it('maps the platform modules every host needs', () => {
+    for (const host of ['windows', 'macos', 'linux'] as const) {
+      expect(modulesForBuildTarget('Android', host)).toEqual([
+        'android',
+        'android-sdk-ndk-tools',
+      ]);
+      expect(modulesForBuildTarget('WebGL', host)).toEqual(['webgl']);
+      expect(modulesForBuildTarget('WindowsStoreApps', host)).toEqual([
+        'universal-windows-platform',
+      ]);
+      expect(modulesForBuildTarget('LinuxServer', host)).toEqual(['linux-server']);
+    }
+  });
+
+  it('maps the macOS-only targets to their modules on macOS', () => {
+    expect(modulesForBuildTarget('iOS', 'macos')).toEqual(['ios']);
+    expect(modulesForBuildTarget('tvOS', 'macos')).toEqual(['appletv']);
+    expect(modulesForBuildTarget('visionOS', 'macos')).toEqual(['visionos']);
+    expect(modulesForBuildTarget('MacServer', 'macos')).toEqual(['mac-server']);
+  });
+
+  it('returns an empty list for an unknown target or an unsupported host', () => {
+    expect(modulesForBuildTarget('PlayStation9', 'linux')).toEqual([]);
+    expect(modulesForBuildTarget('iOS', 'linux')).toEqual([]);
   });
 
   it('returns a copy, so a caller cannot mutate the table', () => {
-    const modules = modulesForBuildTarget('Android');
+    const modules = modulesForBuildTarget('Android', 'linux');
     modules.push('mutated');
-    expect(BUILD_TARGET_MODULES['Android']).toEqual(['android', 'android-sdk-ndk-tools']);
+    expect(modulesForBuildTarget('Android', 'linux')).toEqual([
+      'android',
+      'android-sdk-ndk-tools',
+    ]);
   });
 
   it('requires no platform module for EditMode or PlayMode', () => {
@@ -288,4 +322,106 @@ describe('modulesForBuildTarget', () => {
     expect(modulesForTestMode('UnknownMode')).toEqual([]);
   });
 });
+
+describe('isBuildTargetSupportedOnHost', () => {
+  it('allows Windows, Linux, Android and WebGL from every host', () => {
+    for (const host of ['windows', 'macos', 'linux'] as const) {
+      for (const target of [
+        'StandaloneWindows64',
+        'StandaloneLinux64',
+        'Android',
+        'WebGL',
+        'WindowsStoreApps',
+        'LinuxServer',
+      ]) {
+        expect(isBuildTargetSupportedOnHost(target, host)).toEqual({ supported: true });
+      }
+    }
+  });
+
+  it('requires macOS for macOS, iOS, tvOS, visionOS and MacServer targets', () => {
+    for (const target of [
+      'StandaloneOSX',
+      'iOS',
+      'tvOS',
+      'visionOS',
+      'MacServer',
+    ]) {
+      expect(isBuildTargetSupportedOnHost(target, 'macos')).toEqual({ supported: true });
+      for (const host of ['windows', 'linux'] as const) {
+        const result = isBuildTargetSupportedOnHost(target, host);
+        expect(result.supported).toBe(false);
+        expect(result.reason).toContain('macOS');
+      }
+    }
+  });
+
+  it('leaves an unknown target to the Editor', () => {
+    expect(isBuildTargetSupportedOnHost('PlayStation9', 'linux')).toEqual({
+      supported: true,
+    });
+  });
+});
+
+describe('hostPlatform', () => {
+  it('returns one of the three supported hosts', () => {
+    expect(['windows', 'macos', 'linux']).toContain(hostPlatform());
+  });
+});
+
+describe('stripSensitiveEnv', () => {
+  it('removes Unity service-account and forge tokens from every child env', () => {
+    const env = stripSensitiveEnv({
+      PATH: '/bin',
+      UNITY_SERVICE_ACCOUNT_ID: 'id',
+      UNITY_SERVICE_ACCOUNT_SECRET: 'secret',
+      UNITY_GITHUB_TOKEN: 'github',
+      UNITY_GITLAB_TOKEN: 'gitlab',
+      UNITY_LICENSE_SERIAL: 'serial',
+    });
+
+    expect(env['PATH']).toBe('/bin');
+    expect(env['UNITY_LICENSE_SERIAL']).toBe('serial');
+    for (const name of [
+      'UNITY_SERVICE_ACCOUNT_ID',
+      'UNITY_SERVICE_ACCOUNT_SECRET',
+      'UNITY_GITHUB_TOKEN',
+      'UNITY_GITLAB_TOKEN',
+    ]) {
+      expect(env[name]).toBeUndefined();
+    }
+  });
+
+  it('strips the tokens from a real child process started by spawnProcess', async () => {
+    const actual = await vi.importActual<typeof import('../src/exec.js')>(
+      '../src/exec.js',
+    );
+    const result = await actual.spawnProcess({
+      file: process.execPath,
+      args: [
+        '-e',
+        'process.stdout.write(JSON.stringify({ id: process.env.UNITY_SERVICE_ACCOUNT_ID ?? null, github: process.env.UNITY_GITHUB_TOKEN ?? null, serial: process.env.UNITY_LICENSE_SERIAL ?? null }))',
+      ],
+      cwd: CWD,
+      env: {
+        ...process.env,
+        UNITY_SERVICE_ACCOUNT_ID: 'service-id',
+        UNITY_SERVICE_ACCOUNT_SECRET: 'service-secret',
+        UNITY_GITHUB_TOKEN: 'github-token',
+        UNITY_GITLAB_TOKEN: 'gitlab-token',
+        UNITY_LICENSE_SERIAL: 'serial-passthrough',
+      },
+      ...harness(),
+    });
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      id: null,
+      github: null,
+      serial: 'serial-passthrough',
+    });
+  });
+});
+
+
 

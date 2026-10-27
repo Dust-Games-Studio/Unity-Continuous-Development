@@ -26,7 +26,7 @@ export async function setupCommand(
       `Editor ${result.editorVersion} is ready (Unity CLI ${result.cliVersion}` +
         `${result.cliChannel === null ? '' : ` ${result.cliChannel}`}` +
         `${result.cliCommit === null ? '' : ` @ ${result.cliCommit}`}` +
-        `; ${result.installed ? 'installed this run' : 'already installed'}; doctor: ${result.doctorVerdict}).`,
+        `; ${result.installed ? 'installed this run' : 'already installed'}).`,
     );
     return EXIT.SUCCESS;
   } catch (error) {

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { setupCommand } from '../src/commands/setup.js';
 import { DEFAULT_CONFIG, type Config } from '../src/config/schema.js';
 import type { CoreContext } from '../src/context.js';
+import { describeGitFailures } from '../src/lifecycle/setup.js';
 import { createLogger } from '../src/logger.js';
 import { createRedactor } from '../src/redact.js';
 
@@ -158,6 +159,8 @@ function makeProject(withProjectVersion = true): string {
 
 function makeContext(projectPath: string, edit?: (config: Config) => void): CoreContext {
   const config = structuredClone(DEFAULT_CONFIG);
+  // Never let the host's free space decide whether the suite passes (M10).
+  config.doctor.minFreeBytes = 1;
   edit?.(config);
   const redactor = createRedactor();
   const logger = createLogger({
@@ -300,19 +303,31 @@ describe('setupCommand', () => {
     expect(installCalls()).toEqual([]);
   });
 
-  it('fails when doctor --ci reports a blocking failure', async () => {
-    scenario.doctor = {
-      verdict: 'fail',
-      checks: [
-        {
-          id: 'entitlement',
-          status: 'fail',
-          code: 'EDITOR_NOT_ENTITLED',
-          blocking: true,
-          message: 'the machine is not entitled to run the Editor',
-        },
-      ],
-    };
+  it('rejects an option-like Editor version read from ProjectVersion.txt', async () => {
+    const project = makeProject(false);
+    mkdirSync(join(project, 'ProjectSettings'), { recursive: true });
+    writeFileSync(
+      join(project, 'ProjectSettings', 'ProjectVersion.txt'),
+      'm_EditorVersion: --help\n',
+      'utf8',
+    );
+    const ctx = makeContext(project, (config) => {
+      config.unity.editor.version = 'from-project';
+      config.unity.editor.terms = true;
+    });
+
+    const code = await setupCommand(ctx);
+
+    expect(code).toBe(64);
+    const output = lines.join('');
+    expect(output).toContain('ProjectVersion.txt');
+    expect(output).toContain('"--help"');
+    expect(output).toContain('not a valid Editor version');
+    // The terms command is never reached.
+    expect(calls.some((args) => args[0] === 'terms')).toBe(false);
+  });
+
+  it('does not run unity doctor: doctor is a separate preflight', async () => {
     const project = makeProject();
     const ctx = makeContext(project, (config) => {
       config.unity.editor.terms = false;
@@ -320,8 +335,8 @@ describe('setupCommand', () => {
 
     const code = await setupCommand(ctx);
 
-    expect(code).not.toBe(0);
-    expect(lines.join('')).toContain('EDITOR_NOT_ENTITLED');
+    expect(code).toBe(0);
+    expect(calls.some((args) => args[0] === 'doctor')).toBe(false);
   });
 
   it('does not pass --accept-eula unless the config opts in', async () => {
@@ -357,6 +372,34 @@ describe('setupCommand', () => {
     expect(install).not.toContain('--allow-install');
   });
 
+  it('keeps --cm out of the argv and the printed command when no module is selected', async () => {
+    scenario.editors = [];
+    const project = makeProject();
+    const installCtx = makeContext(project, (config) => {
+      config.unity.editor.acceptEula = true;
+      config.unity.editor.childModules = true;
+      config.unity.editor.modules = [];
+      config.unity.editor.terms = false;
+    });
+
+    expect(await setupCommand(installCtx)).toBe(0);
+    const install = installCalls()[0]!;
+    expect(install).not.toContain('--cm');
+    expect(install).not.toContain('--no-cm');
+
+    scenario.editors = [];
+    lines.length = 0;
+    const messageCtx = makeContext(project, (config) => {
+      config.unity.editor.acceptEula = false;
+      config.unity.editor.childModules = true;
+      config.unity.editor.modules = [];
+    });
+
+    expect(await setupCommand(messageCtx)).toBe(64);
+    expect(lines.join('')).toContain(`unity install ${EDITOR} --yes --accept-eula`);
+    expect(lines.join('')).not.toContain('--cm');
+  });
+
   it('fails when the installed editor is missing the module the build target needs', async () => {
     scenario.editors = [editorRow(EDITOR, '')];
     scenario.modules = [
@@ -374,11 +417,64 @@ describe('setupCommand', () => {
 
     expect(code).toBe(64);
     expect(lines.join('')).toContain('android');
-    expect(lines.join('')).toContain(`unity install ${EDITOR} --module android --yes --accept-eula`);
+    expect(lines.join('')).toContain(`unity install ${EDITOR} --module android --no-cm --yes --accept-eula`);
     expect(installCalls()).toEqual([]);
     // The display-name `modules` string is never used: the authoritative check
     // is `--list-modules` + `isInstalled`.
     expect(calls.some((args) => args.includes('--list-modules'))).toBe(true);
+  });
+
+  it('installs nothing when the Editor and every required module are present', async () => {
+    scenario.editors = [editorRow(EDITOR, '')];
+    scenario.modules = [
+      moduleRow('android', true),
+      moduleRow('android-sdk-ndk-tools', true),
+    ];
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.build.target = 'Android';
+      config.unity.editor.acceptEula = true;
+      config.unity.editor.terms = false;
+    });
+
+    const code = await setupCommand(ctx, { command: 'build' });
+
+    expect(code).toBe(0);
+    expect(installCalls()).toEqual([]);
+    expect(calls.filter((args) => args.includes('--list-modules'))).toHaveLength(1);
+  });
+
+  it('installs only the missing module and re-checks when the EULA is accepted', async () => {
+    let listCalls = 0;
+    mocks.runUnity.mockImplementation(async (options: { args: string[] }) => {
+      calls.push(options.args);
+      if (options.args[0] === 'install' && options.args.includes('--list-modules')) {
+        listCalls += 1;
+        return envelope(
+          listCalls === 1
+            ? [moduleRow('android', false), moduleRow('android-sdk-ndk-tools', true)]
+            : [moduleRow('android', true), moduleRow('android-sdk-ndk-tools', true)],
+        );
+      }
+      return responder(options.args);
+    });
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.build.target = 'Android';
+      config.unity.editor.acceptEula = true;
+      config.unity.editor.childModules = false;
+      config.unity.editor.terms = false;
+    });
+
+    const code = await setupCommand(ctx, { command: 'build' });
+
+    expect(code).toBe(0);
+    const installs = installCalls();
+    expect(installs).toHaveLength(1);
+    expect(installs[0]).toContain('--module');
+    expect(installs[0]).toContain('android');
+    expect(installs[0]).not.toContain('android-sdk-ndk-tools');
+    expect(calls.filter((args) => args.includes('--list-modules'))).toHaveLength(2);
   });
 
   it('fails fast with the exact install command when the editor is missing', async () => {
@@ -543,6 +639,54 @@ describe('setupCommand', () => {
     expect(lines.join('')).toContain('not fetchable');
   });
 
+  it('passes git dependencies and probes each unique repository once', async () => {
+    const project = makeProject();
+    mkdirSync(join(project, 'Packages'), { recursive: true });
+    writeFileSync(
+      join(project, 'Packages', 'manifest.json'),
+      JSON.stringify({
+        dependencies: {
+          'com.example.one': 'https://github.com/example/mono.git',
+          'com.example.two': 'https://github.com/example/mono.git',
+          'com.example.three': 'https://github.com/example/other.git',
+        },
+      }),
+      'utf8',
+    );
+    const ctx = makeContext(project, (config) => {
+      config.unity.editor.terms = false;
+      config.packages.preflight = true;
+    });
+
+    const code = await setupCommand(ctx);
+
+    expect(code).toBe(0);
+    expect(mocks.spawnProcess).toHaveBeenCalledTimes(2);
+  });
+
+  it('redacts a credential-bearing URL in a git failure message', () => {
+    const redactor = createRedactor();
+    redactor.register('token-9f3d');
+    const message = describeGitFailures(
+      [
+        {
+          dependency: {
+            name: 'com.example.private',
+            url: 'https://user:token-9f3d@github.com/example/private.git',
+            host: 'github.com',
+            hasEmbeddedCredentials: true,
+          },
+          reachable: false,
+          detail: 'not contacted',
+        },
+      ],
+      redactor,
+    );
+
+    expect(message).not.toContain('token-9f3d');
+    expect(message).toContain('***');
+  });
+
   it('derives the required modules from config.build.target for a build', async () => {
     scenario.modules = [
       moduleRow('android', true),
@@ -576,10 +720,68 @@ describe('setupCommand', () => {
       config.unity.editor.terms = false;
     });
 
-    const code = await setupCommand(ctx, { command: 'build' });
+    const code = await setupCommand(ctx, { command: 'build', host: 'windows' });
 
     expect(code).toBe(0);
     expect(calls.some((args) => args.includes('--list-modules'))).toBe(false);
+  });
+
+  it('requires windows-il2cpp when a Windows player is built on Linux', async () => {
+    scenario.modules = [moduleRow('windows-il2cpp', false)];
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.build.target = 'StandaloneWindows64';
+      config.unity.editor.terms = false;
+      config.unity.editor.acceptEula = false;
+      config.unity.editor.childModules = false;
+    });
+
+    const code = await setupCommand(ctx, { command: 'build', host: 'linux' });
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toContain('windows-il2cpp');
+    expect(calls).toContainEqual([
+      'install',
+      EDITOR,
+      '--list-modules',
+      '--format',
+      'json',
+    ]);
+  });
+
+  it('fails in seconds for a macOS-only target on a non-macOS host', async () => {
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.build.target = 'StandaloneOSX';
+      config.unity.editor.terms = false;
+    });
+
+    const code = await setupCommand(ctx, { command: 'build', host: 'linux' });
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toContain('requires a macOS host');
+    expect(calls.some((args) => args[0] === 'editors')).toBe(false);
+  });
+
+  it('treats an empty requiredModules array as no override', async () => {
+    scenario.modules = [moduleRow('android', false)];
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.build.target = 'Android';
+      config.unity.editor.terms = false;
+      config.unity.editor.acceptEula = false;
+      config.unity.editor.childModules = false;
+    });
+
+    const code = await setupCommand(ctx, {
+      command: 'build',
+      requiredModules: [],
+      host: 'windows',
+    });
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toContain('android');
+    expect(calls.some((args) => args.includes('--list-modules'))).toBe(true);
   });
 
   it('checks no platform module for a test run', async () => {
@@ -613,21 +815,6 @@ describe('setupCommand', () => {
     expect(code).toBe(64);
     expect(lines.join('')).toContain('webgl');
     expect(calls.some((args) => args.includes('--list-modules'))).toBe(true);
-  });
-
-  it('fails before the Editor check when disk space is below the floor', async () => {
-    const project = makeProject();
-    const ctx = makeContext(project, (config) => {
-      config.doctor.minFreeBytes = Number.MAX_SAFE_INTEGER;
-      config.unity.editor.terms = false;
-    });
-
-    const code = await setupCommand(ctx);
-
-    expect(code).toBe(64);
-    expect(lines.join('')).toContain('disk-space');
-    expect(lines.join('')).toContain('below the configured floor');
-    expect(calls.some((args) => args[0] === 'editors')).toBe(false);
   });
 
   it('reports an unsupported editors command instead of a generic failure', async () => {

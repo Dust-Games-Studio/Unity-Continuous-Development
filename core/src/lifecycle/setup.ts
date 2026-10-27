@@ -5,12 +5,18 @@ import { EXIT } from '../exit-codes.js';
 import type { GitDependency } from '../packages/deps.js';
 import { readGitDependencies, redactGitUrl } from '../packages/deps.js';
 import { preflightGitDependencies } from '../packages/git.js';
-import { modulesForBuildTarget, modulesForTestMode } from '../packages/modules.js';
+import {
+  hostPlatform,
+  isBuildTargetSupportedOnHost,
+  modulesForBuildTarget,
+  modulesForTestMode,
+  type HostPlatform,
+} from '../packages/modules.js';
+import type { Redactor } from '../redact.js';
 import {
   TESTED_CLI_MAX,
   TESTED_CLI_MIN,
   isUnsupportedCommand,
-  unityDoctorCi,
   unityEditorsInstalled,
   unityInstall,
   unityLicenseStatus,
@@ -39,6 +45,11 @@ export interface SetupResult {
   cliCommit: string | null;
   /** True when this run installed the Editor or a missing module. */
   installed: boolean;
+  /**
+   * Retained for the shared result shape. `setup` no longer runs
+   * `unity doctor --ci` (the run path calls `doctor` separately), so this is
+   * always `'unknown'`.
+   */
   doctorVerdict: 'pass' | 'fail' | 'unknown';
 }
 
@@ -50,15 +61,22 @@ export interface SetupResult {
 export interface SetupOptions {
   command?: 'build' | 'test';
   /**
-   * An explicit override. When present the config-derived list is ignored, so a
-   * caller that knows better (or a future command) can state its modules.
+   * An explicit, non-empty override. When present the config-derived list is
+   * ignored, so a caller that knows better (or a future command) can state its
+   * modules. An empty array means "no override", never "disable the check".
    */
   requiredModules?: string[];
+  /**
+   * The host whose build-support modules are required. Defaults to
+   * `hostPlatform()`; injectable so cross-build behaviour is testable.
+   */
+  host?: HostPlatform;
 }
 
 /**
  * Backwards-compatible call shape: a plain array is the explicit override.
- * `setup(ctx)` remains the version-only check.
+ * `setup(ctx)` remains the version-only check. Note: `[]` is treated
+ * as no override (M7), so it cannot silently disable a build's module check.
  */
 export type SetupInput = SetupOptions | string[];
 
@@ -492,12 +510,38 @@ export function capabilityCheck(ctx: CoreContext): PreflightCheck {
   };
 }
 
-/** The cheap checks shared by `doctor` and `setup`. */
+/** The cheap host checks `doctor` runs (setup deliberately does not). */
 export function coreEnvironmentChecks(ctx: CoreContext): PreflightCheck[] {
   return [capabilityCheck(ctx), glibcCheck(), diskSpaceCheck(ctx)];
 }
 
 // --- Editor version and modules --------------------------------------------------
+
+/**
+ * Applies the same allow-list and `latest` gate to every Editor version,
+ * whatever its source. `ProjectVersion.txt` is repository content, so a pull
+ * request can choose it: an option-looking value there must never reach argv
+ * (I1).
+ */
+function assertSafeEditorVersion(
+  ctx: CoreContext,
+  value: string,
+  source: string,
+): string {
+  if (!SAFE_VERSION.test(value)) {
+    throw new SetupError(
+      `${source} ${JSON.stringify(value)} is not a valid Editor version: it reaches argv and must match ${SAFE_VERSION.source}.`,
+      EXIT.CONFIG_ERROR,
+    );
+  }
+  if (value === 'latest' && ctx.config.unity.cli.allowLatest !== true) {
+    throw new SetupError(
+      `${source} is "latest", which is opt-in: set unity.cli.allowLatest: true to accept an untested CLI/Editor.`,
+      EXIT.CONFIG_ERROR,
+    );
+  }
+  return value;
+}
 
 /** Resolves `unity.editor.version`, reading `ProjectVersion.txt` for `from-project`. */
 export function resolveEditorVersion(ctx: CoreContext): string {
@@ -521,27 +565,14 @@ export function resolveEditorVersion(ctx: CoreContext): string {
         EXIT.CONFIG_ERROR,
       );
     }
-    return match[1]!;
+    return assertSafeEditorVersion(ctx, match[1]!, `${path} declares m_EditorVersion:`);
   }
 
-  if (!SAFE_VERSION.test(configured)) {
-    throw new SetupError(
-      `unity.editor.version ${JSON.stringify(configured)} is not a valid Editor version: it reaches argv and must match ${SAFE_VERSION.source}.`,
-      EXIT.CONFIG_ERROR,
-    );
-  }
-  if (configured === 'latest' && ctx.config.unity.cli.allowLatest !== true) {
-    throw new SetupError(
-      'unity.editor.version is "latest", which is opt-in: set unity.cli.allowLatest: true to accept an untested CLI/Editor.',
-      EXIT.CONFIG_ERROR,
-    );
-  }
-  return configured;
+  return assertSafeEditorVersion(ctx, configured, 'unity.editor.version');
 }
 
 interface EditorRow {
   version: string | null;
-  modules: string;
 }
 
 interface ModuleRow {
@@ -572,10 +603,7 @@ function editorRows(result: UnityResult): EditorRow[] {
   }
   return rows.map((raw) => {
     const row = asObject(raw);
-    return {
-      version: stringField(row, 'version'),
-      modules: stringField(row, 'modules') ?? '',
-    };
+    return { version: stringField(row, 'version') };
   });
 }
 
@@ -631,9 +659,9 @@ function installCommand(
   const parts = ['unity', 'install', version];
   if (modules.length > 0) {
     parts.push('--module', ...modules);
-    // `--cm` only has meaning with a module selection; without one it would
-    // silently pull every child module of the Editor.
-    if (childModules) parts.push('--cm');
+    // `--cm`/`--no-cm` only mean anything with a module selection. Keep the
+    // printed command identical to the argv `installEditor` runs (I4).
+    parts.push(childModules ? '--cm' : '--no-cm');
   }
   parts.push('--yes', '--accept-eula');
   return parts.join(' ');
@@ -647,7 +675,11 @@ async function installEditor(
   const result = await unityInstall(unityBaseOptions(ctx), {
     version,
     modules,
-    childModules: ctx.config.unity.editor.childModules,
+    // `--cm` only means anything with a module selection: without one it would
+    // pull every child module (or is meaningless). Keep the argv in lockstep
+    // with `installCommand`'s printed form in both directions (I4).
+    childModules:
+      modules.length > 0 ? ctx.config.unity.editor.childModules : undefined,
     changeset: ctx.config.unity.editor.changeset ?? undefined,
     acceptEula: true,
   });
@@ -789,12 +821,14 @@ export function refuseEmbeddedCredentials(dependencies: GitDependency[]): void {
 /** Formats the blocking git-preflight failures for a command's error output. */
 export function describeGitFailures(
   results: Awaited<ReturnType<typeof preflightGitDependencies>>,
+  redactor: Redactor,
 ): string {
   const failures = results.filter((result) => !result.reachable);
   return failures
-    .map(
-      ({ dependency, detail }) =>
+    .map(({ dependency, detail }) =>
+      redactor.redact(
         `${dependency.name} (${dependency.url}) is not fetchable: ${detail}`,
+      ),
     )
     .join('; ');
 }
@@ -802,21 +836,28 @@ export function describeGitFailures(
 // --- The preflight --------------------------------------------------------------
 
 function normaliseSetupInput(input: SetupInput): SetupOptions {
-  return Array.isArray(input) ? { requiredModules: input } : input;
+  if (!Array.isArray(input)) return input;
+  // An explicit empty array is not an override: it must not silently disable
+  // the module check for the invoked command (M7).
+  return input.length > 0 ? { requiredModules: input } : {};
 }
 
 /**
- * The command owns its module requirement. An explicit `requiredModules`
+ * The command owns its module requirement. A non-empty `requiredModules`
  * override always wins; otherwise a build derives from `config.build.target`
- * and a test from the configured test modes. No command means no module
- * requirement — the spec's version-only check.
+ * on the given host and a test from the configured test modes. No command
+ * means no module requirement — the spec's version-only check.
  */
-function requiredModulesFor(ctx: CoreContext, options: SetupOptions): string[] {
-  if (options.requiredModules !== undefined) {
+function requiredModulesFor(
+  ctx: CoreContext,
+  options: SetupOptions,
+  host: HostPlatform,
+): string[] {
+  if (options.requiredModules !== undefined && options.requiredModules.length > 0) {
     return unique(options.requiredModules);
   }
   if (options.command === 'build') {
-    return unique(modulesForBuildTarget(ctx.config.build.target));
+    return unique(modulesForBuildTarget(ctx.config.build.target, host));
   }
   if (options.command === 'test') {
     return unique(ctx.config.test.modes.flatMap((mode) => modulesForTestMode(mode)));
@@ -826,12 +867,16 @@ function requiredModulesFor(ctx: CoreContext, options: SetupOptions): string[] {
 
 /**
  * Resolves the CLI identity, then the Editor version and modules, then terms,
- * the doctor report, the licence precondition and the private-git preflight.
+ * the licence precondition and the private-git preflight.
+ *
+ * `setup` deliberately does **not** run `unity doctor --ci` or the host checks
+ * (glibc, disk space, capability matrix): those belong to `unityci doctor`,
+ * which the run path invokes once, after setup and before the licence step.
  *
  * The module requirement belongs to the **invoked command**:
  * `setup(ctx, { command: 'build' })` derives it from `config.build.target`,
  * `{ command: 'test' }` checks no platform module, and `setup(ctx)` checks only
- * the Editor version. `requiredModules` is an explicit override.
+ * the Editor version. `requiredModules` is an explicit, non-empty override.
  *
  * The core never installs silently: a missing Editor or module always requires
  * `unity.editor.acceptEula: true`, and `--allow-install` is never sent.
@@ -842,22 +887,21 @@ export async function setup(
 ): Promise<SetupResult> {
   const options = normaliseSetupInput(input);
   const identity = await resolveCliIdentity(ctx);
-
-  // The same gate as `doctor`: a broken host fails setup before a multi-gigabyte
-  // install or an Editor launch.
-  const environmentFailures = coreEnvironmentChecks(ctx).filter(isBlockingFailure);
-  if (environmentFailures.length > 0) {
-    throw new SetupError(
-      `preflight failed: ${environmentFailures
-        .map((check) => `${check.id}: ${check.message}`)
-        .join('; ')}`,
-      EXIT.CONFIG_ERROR,
-    );
-  }
+  const host = options.host ?? hostPlatform();
 
   const editorVersion = resolveEditorVersion(ctx);
 
-  const required = requiredModulesFor(ctx, options);
+  if (options.command === 'build') {
+    const support = isBuildTargetSupportedOnHost(ctx.config.build.target, host);
+    if (!support.supported) {
+      throw new SetupError(
+        `build target ${ctx.config.build.target} cannot be built here: ${support.reason ?? 'unsupported host'}.`,
+        EXIT.CONFIG_ERROR,
+      );
+    }
+  }
+
+  const required = requiredModulesFor(ctx, options, host);
   const configuredModules = ctx.config.unity.editor.modules;
   const installModules = unique([...configuredModules, ...required]);
   const childModules = ctx.config.unity.editor.childModules;
@@ -917,30 +961,6 @@ export async function setup(
     }
   }
 
-  const doctorResult = await unityDoctorCi(unityBaseOptions(ctx));
-  if (isUnsupportedCommand(doctorResult)) {
-    throw new SetupError(
-      'this Unity CLI does not support `doctor --ci`; upgrade the CLI before running this pipeline.',
-      EXIT.CONFIG_ERROR,
-    );
-  }
-  const doctor = evaluateUnityDoctor(doctorResult);
-  if (!doctor.reportOk) {
-    throw new SetupError(
-      `\`unity doctor --ci --format json\` did not return a machine-readable report (exit ${doctorResult.code})${resultDetail(doctorResult)}`,
-      EXIT.CONFIG_ERROR,
-    );
-  }
-  const blocking = doctor.checks.filter(isBlockingFailure);
-  if (blocking.length > 0) {
-    throw new SetupError(
-      `\`unity doctor --ci\` reported a blocking failure: ${blocking
-        .map((check) => `${check.id}${check.code === '' ? '' : ` (${check.code})`}${check.message === '' ? '' : `: ${check.message}`}`)
-        .join('; ')}`,
-      EXIT.CONFIG_ERROR,
-    );
-  }
-
   const license = await checkLicense(ctx);
   if (license.unsupported) {
     throw new SetupError(
@@ -971,7 +991,7 @@ export async function setup(
     });
     if (results.some((result) => !result.reachable)) {
       throw new SetupError(
-        `the project's private git package${results.length === 1 ? '' : 's'} cannot be fetched: ${describeGitFailures(results)}. ` +
+        `the project's private git package${results.length === 1 ? '' : 's'} cannot be fetched: ${describeGitFailures(results, ctx.redactor)}. ` +
           'Fix the credential with a git URL rewrite or correct the package URL.',
         EXIT.CONFIG_ERROR,
       );
@@ -984,6 +1004,8 @@ export async function setup(
     cliChannel: identity.channel,
     cliCommit: identity.commit,
     installed,
-    doctorVerdict: doctor.verdict,
+    // `doctor` runs separately in the run path; setup no longer produces a
+    // verdict of its own.
+    doctorVerdict: 'unknown',
   };
 }

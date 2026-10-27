@@ -108,6 +108,8 @@ function makeProject(manifest?: unknown): string {
 
 function makeContext(projectPath: string, edit?: (config: Config) => void): CoreContext {
   const config = structuredClone(DEFAULT_CONFIG);
+  // A fake host's free space must never decide whether the suite passes (M10).
+  config.doctor.minFreeBytes = 1;
   edit?.(config);
   const redactor = createRedactor();
   const logger = createLogger({
@@ -139,7 +141,7 @@ function reportPath(project: string): string {
 function readReport(project: string): {
   verdict: string;
   checks: { id: string; status: string; code: string; blocking: boolean; message: string }[];
-  gitDependencies: { name: string; url: string; host: string; reachable: boolean }[];
+  projectsVerify: { status: string; blocking: boolean; detail: string };
 } {
   return JSON.parse(readFileSync(reportPath(project), 'utf8')) as never;
 }
@@ -314,42 +316,7 @@ describe('doctorCommand', () => {
     expect(ctx.cliCommit).toBe('cli-commit-abc');
   });
 
-  it('reports the git package dependencies and their hosts', async () => {
-    const project = makeProject({
-      dependencies: {
-        'com.example.one': 'https://github.com/example/one.git',
-        'com.example.two': 'git@gitlab.com:example/two.git',
-      },
-    });
-
-    const code = await doctorCommand(makeContext(project));
-
-    expect(code).toBe(0);
-    const deps = readReport(project).gitDependencies;
-    expect(deps.map((dep) => dep.name).sort()).toEqual(['com.example.one', 'com.example.two']);
-    expect(deps.map((dep) => dep.host).sort()).toEqual(['github.com', 'gitlab.com']);
-  });
-
-  it('fails when a git package dependency is not fetchable', async () => {
-    const project = makeProject({
-      dependencies: { 'com.example.private': 'https://github.com/example/private.git' },
-    });
-    mocks.spawnProcess.mockResolvedValue({
-      code: 128,
-      stdout: '',
-      stderr: 'fatal: repository not found\n',
-      rawStdout: '',
-      rawStderr: 'fatal: repository not found\n',
-    });
-
-    const code = await doctorCommand(makeContext(project));
-
-    expect(code).not.toBe(0);
-    expect(lines.join('')).toContain('https://github.com/example/private.git');
-    expect(lines.join('')).toContain('not fetchable');
-  });
-
-  it('passes when every git package dependency is fetchable', async () => {
+  it('does not run the git preflight: setup owns it', async () => {
     const project = makeProject({
       dependencies: { 'com.example.private': 'https://github.com/example/private.git' },
     });
@@ -357,46 +324,64 @@ describe('doctorCommand', () => {
     const code = await doctorCommand(makeContext(project));
 
     expect(code).toBe(0);
-    expect(readReport(project).gitDependencies).toEqual([
-      {
-        name: 'com.example.private',
-        url: 'https://github.com/example/private.git',
-        host: 'github.com',
-        reachable: true,
-        detail: 'git ls-remote succeeded',
-      },
-    ]);
-  });
-
-  it('refuses to run when a git dependency URL embeds credentials', async () => {
-    const project = makeProject({
-      dependencies: {
-        'com.example.private': 'https://user:token@github.com/example/private.git',
-      },
-    });
-
-    const code = await doctorCommand(makeContext(project));
-
-    expect(code).toBe(64);
-    expect(lines.join('')).toContain('com.example.private');
-    expect(lines.join('')).not.toContain('token');
     expect(mocks.spawnProcess).not.toHaveBeenCalled();
   });
 
-  it('does not run git ls-remote more than once per unique repository URL', async () => {
-    const project = makeProject({
-      dependencies: {
-        'com.example.one': 'https://github.com/example/mono.git',
-        'com.example.two': 'https://github.com/example/mono.git',
-        'com.example.three': 'https://github.com/example/other.git',
-      },
+  it('redacts a secret in a check message before writing the report', async () => {
+    const secret = 'doctor-secret-token-9f3d';
+    const project = makeProject();
+    scenario.doctor = {
+      verdict: 'pass',
+      checks: [
+        {
+          id: 'machine',
+          status: 'pass',
+          code: 'OK',
+          blocking: true,
+          message: `licence echo: ${secret}`,
+        },
+      ],
+    };
+    const ctx = makeContext(project);
+    ctx.redactor.register(secret);
+
+    const code = await doctorCommand(ctx);
+
+    expect(code).toBe(0);
+    const file = readFileSync(reportPath(project), 'utf8');
+    expect(file).not.toContain(secret);
+    expect(file).toContain('***');
+    expect(lines.join('')).not.toContain(secret);
+  });
+
+  it('does not treat an unparsable projects verify report as a pass', async () => {
+    const project = makeProject();
+    mocks.runUnity.mockImplementation(async (options: { args: string[] }) => {
+      if (options.args[0] === 'projects') {
+        return { code: 0, stdout: 'not json', stderr: '', json: null };
+      }
+      return responder(options.args);
     });
 
     const code = await doctorCommand(makeContext(project));
 
     expect(code).toBe(0);
-    expect(mocks.spawnProcess).toHaveBeenCalledTimes(2);
-    expect(readReport(project).gitDependencies).toHaveLength(3);
+    const report = readReport(project);
+    expect(report.projectsVerify).toMatchObject({ status: 'info', blocking: false });
+    expect(
+      report.checks.find((check) => check.id === 'projects-verify'),
+    ).toMatchObject({ status: 'info', code: 'PROJECT_VERIFY_NO_REPORT', blocking: false });
+  });
+
+  it('returns a clear failure when the report cannot be written', async () => {
+    const project = makeProject();
+    // A regular file where the output directory must be makes mkdir fail.
+    writeFileSync(join(project, 'ci-output'), 'not a directory', 'utf8');
+
+    const code = await doctorCommand(makeContext(project));
+
+    expect(code).toBe(6);
+    expect(lines.join('')).toContain('could not write the doctor report');
   });
 
   it('reports an inactive license under license.mode: none as a blocking failure', async () => {

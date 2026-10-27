@@ -167,11 +167,11 @@ export function unityProjectsVerify(
 /**
  * `unity editors --installed --format json`: which Editors are present.
  *
- * Each row's `modules` is a comma-separated list of lowercase module ids from
- * `unity install --list-modules` (`android`, `ios`, `webgl`, `linux-il2cpp`,
- * `linux-mono`, `linux-server`, `mac-mono`,
- * `universal-windows-platform`, …). A later step verifies the installed modules
- * against the build target's needs; `""` is a valid Editor with no modules.
+ * Each row's `modules` string holds **display names** (`"Linux"`,
+ * `"Android, Android SDK & NDK Tools, …"`), not the lowercase module ids. It is
+ * reported here but must never be compared against ids: the authoritative
+ * per-module answer is `unityModulesList` and its `isInstalled` boolean. `""`
+ * is a valid installed Editor that carries no platform modules.
  */
 export function unityEditorsInstalled(opts: UnityBaseOptions): Promise<UnityResult> {
   return run(opts, ['editors', '--installed', '--format', 'json']);

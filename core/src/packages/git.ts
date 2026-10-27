@@ -73,9 +73,9 @@ async function probe(
  * two packages can come from one repository — and returns one result per
  * dependency, in input order.
  *
- * A URL that embeds credentials is never handed to a child process: it is
- * refused by `doctor`/`setup` before this function is reached, and this
- * function refuses it again as a last line of defence.
+ * A URL that embeds credentials is never handed to a child process: `setup`
+ * refuses it before this function is reached, and this function refuses it
+ * again as a last line of defence.
  */
 export async function preflightGitDependencies(
   deps: GitDependency[],

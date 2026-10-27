@@ -30,6 +30,28 @@ export interface SpawnOptions {
   timeoutMs?: number;
 }
 
+/**
+ * Credentials that must never reach a child process: Unity's own CLI strips
+ * these before it starts anything, and the Package Manager's git inherits
+ * whatever this layer leaves behind (GC23).
+ *
+ * Exported so the policy has one home; `spawnProcess` enforces it for every
+ * child, Unity and git alike.
+ */
+export const STRIPPED_ENV_VARIABLES = [
+  'UNITY_SERVICE_ACCOUNT_ID',
+  'UNITY_SERVICE_ACCOUNT_SECRET',
+  'UNITY_GITHUB_TOKEN',
+  'UNITY_GITLAB_TOKEN',
+] as const;
+
+/** A copy of `env` with every stripped variable removed. */
+export function stripSensitiveEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const childEnv: NodeJS.ProcessEnv = { ...env };
+  for (const name of STRIPPED_ENV_VARIABLES) delete childEnv[name];
+  return childEnv;
+}
+
 /** How long a child gets to honour SIGTERM before it is killed outright. */
 const SIGTERM_GRACE_MS = 2000;
 /** Last resort: resolve even if `close` never arrives after SIGKILL. */
@@ -164,7 +186,7 @@ export function spawnProcess(opts: SpawnOptions): Promise<SpawnResult> {
 
     const child = spawn(opts.file, opts.args, {
       cwd: opts.cwd,
-      env: opts.env,
+      env: stripSensitiveEnv(opts.env),
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
       // A new process group is what makes the POSIX tree kill possible. On
