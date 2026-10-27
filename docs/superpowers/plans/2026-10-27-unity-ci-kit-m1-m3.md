@@ -6,7 +6,7 @@
 
 **Architecture:** Three layers, dependencies pointing one way: **Core** (`@unityci/core`, TypeScript → npm bin `unityci`) spawns `unity` via argv arrays only and owns the pass/fail verdict; **Adapters** (GitHub composite action, generic docs) are thin provider-specific YAML that call `unityci` and display results; **Unity CLI** is the only thing that touches the Editor. Core never reads `GITHUB_*`/`GITLAB_*`/`JENKINS_*`.
 
-**Tech Stack:** TypeScript 5.9.3 (ESM, `module: nodenext`), Node **22.4+** runtime (`util.parseArgs`'s `allowNegative` needs 22.4), pnpm workspace, vitest 5, `yaml` 2.9 for `unity-ci.yml`. No runtime dependencies beyond `yaml`.
+**Tech Stack:** TypeScript 5.9.3 (ESM, `module: nodenext`), Node runtime with **two floors** — **22.4** for the published package (`util.parseArgs`'s `allowNegative`) and **22.12** for the development toolchain (`vitest@5` declares `^22.12.0 || ^24.0.0 || >=26.0.0`, `vite@8` declares `^20.19.0 || >=22.12.0`), pnpm workspace, vitest 5, `yaml` 2.9 for `unity-ci.yml`. No runtime dependencies beyond `yaml`.
 
 **Spec:** `unity-ci-design.md` (repo root). The plan argues from it; conflicts resolve against it, except where the plan's Global Constraints record a ruling that supersedes it.
 
@@ -16,7 +16,7 @@
 
 These bind every task. Copy them verbatim into every dispatch.
 
-- **GC1 — Runtime.** TypeScript 5.9.3 (NOT 7.x), ESM only (`"type": "module"`), `module`/`moduleResolution` = `nodenext`, `target` = `es2023`, `strict: true`. Build with `tsc`. Package name `@unityci/core`, bin name `unityci`. Runtime floor **Node 22.4** (`util.parseArgs`'s `allowNegative` landed in 22.4), declared as `"engines": { "node": ">=22.4" }`.
+- **GC1 — Runtime.** TypeScript 5.9.3 (NOT 7.x), ESM only (`"type": "module"`), `module`/`moduleResolution` = `nodenext`, `target` = `es2023`, `strict: true`. Build with `tsc`. Package name `@unityci/core`, bin name `unityci`. **Two Node floors, deliberately different:** the **published runtime** floor is **22.4** (`util.parseArgs`'s `allowNegative` landed in 22.4) → `core/package.json` declares `"engines": { "node": ">=22.4" }`; the **development toolchain** floor is **22.12** (`vitest@5` declares `^22.12.0 || ^24.0.0 || >=26.0.0` and `vite@8` declares `^20.19.0 || >=22.12.0`) → the root `package.json` declares `"engines": { "node": ">=22.12" }`, and `.npmrc` sets `engine-strict=true` so an old runner fails the **install** with a clear message instead of failing obscurely at test time.
 - **GC2 — Package manager.** pnpm workspaces. Root `package.json` is `private: true`. Only workspace package is `core`. `pnpm install` at the root installs everything.
 - **GC3 — One spawn point.** `core/src/exec.ts` is the **only** module that may spawn any child process, and it always uses `spawn(file, argsArray, { shell: false })` — never a concatenated command string, never `shell: true`. `core/src/unity/exec.ts` is the only module that may spawn **`unity`**, and `core/src/packages/git.ts` the only one that may spawn **`git`**. Lint: `grep -rnE "\b(spawn|spawnSync|exec|execFile|execSync)\(" core/src --include=*.ts` must match only `core/src/exec.ts`; and the same grep for the literal `unity` must additionally match only `core/src/unity/exec.ts`.
 - **GC4 — Provider neutrality.** `core/src/**` must not match `GITHUB_|GITLAB_|JENKINS_|CIRCLECI_|BUILDKITE_|AZURE_` except inside `core/src/report/annotations.ts`, which may reference `GITHUB_STEP_SUMMARY` and `GITHUB_OUTPUT` only. A conformance check enforces this.
@@ -183,7 +183,7 @@ Expected: no output (exit 1 from grep is the pass condition).
 ## Task 2: Workspace scaffolding and core skeleton
 
 **Files:**
-- Create: `package.json`, `pnpm-workspace.yaml`, `core/package.json`, `core/tsconfig.json`, `core/vitest.config.ts`
+- Create: `package.json`, `pnpm-workspace.yaml`, `core/package.json`, `core/tsconfig.json`, `core/vitest.config.ts`, `.npmrc`
 - Modify: `.gitignore`
 - Create: `core/src/exit-codes.ts`, `core/src/logger.ts`, `core/src/redact.ts`, `core/src/args.ts`
 - Test: `core/test/redact.test.ts`, `core/test/logger.test.ts`, `core/test/args.test.ts`
@@ -319,6 +319,8 @@ ci-output/
 ```
 
 `core/package.json` declares `"type": "module"`, `"bin": { "unityci": "./dist/cli.js" }`, the three dev dependencies at their exact pinned versions (`typescript@5.9.3`, `vitest@5.0.5`, `@types/node@26.6.5`), the scripts `build` (`tsc -p tsconfig.json`), `typecheck` (`tsc --noEmit`) and `test` (`vitest run`), and `"engines": { "node": ">=22.4" }`.
+
+The **root** `package.json` declares `"engines": { "node": ">=22.12" }` — the development toolchain's floor — and a root `.npmrc` contains `engine-strict=true` so pnpm refuses to install on an older Node instead of failing later at test time.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
