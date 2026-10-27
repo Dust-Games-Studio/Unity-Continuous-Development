@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { licenseActivateCommand, licenseReturnCommand } from '../src/commands/license.js';
@@ -15,6 +15,41 @@ import { createRedactor } from '../src/redact.js';
 const mocks = vi.hoisted(() => ({
   runUnity: vi.fn(),
 }));
+
+/**
+ * Controllable faults for the temp-file lifecycle. The real `node:fs` is used
+ * for everything else, so the tests still touch the filesystem they assert on.
+ */
+const fsFaults = vi.hoisted(() => ({
+  failRm: false,
+  failMkdtemp: false,
+}));
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...actual,
+    mkdtempSync: (prefix: string) => {
+      if (fsFaults.failMkdtemp) {
+        const error = new Error('EACCES: permission denied, mkdtemp') as NodeJS.ErrnoException;
+        error.code = 'EACCES';
+        throw error;
+      }
+      return actual.mkdtempSync(prefix);
+    },
+    rmSync: (
+      path: Parameters<typeof actual.rmSync>[0],
+      options?: Parameters<typeof actual.rmSync>[1],
+    ) => {
+      if (fsFaults.failRm) {
+        const error = new Error('EBUSY: resource busy or locked') as NodeJS.ErrnoException;
+        error.code = 'EBUSY';
+        throw error;
+      }
+      return actual.rmSync(path, options);
+    },
+  };
+});
 
 vi.mock('../src/unity/exec.js', () => ({
   runUnity: mocks.runUnity,
@@ -89,6 +124,8 @@ const originalFile = process.env.UNITY_LICENSE_FILE_BASE64;
 beforeEach(() => {
   calls.length = 0;
   lines.length = 0;
+  fsFaults.failRm = false;
+  fsFaults.failMkdtemp = false;
   // The anatomy of a leak: a value left in the real environment must never
   // make an "env var is empty" test pass or fail by accident.
   delete process.env.UNITY_LICENSE_SERIAL;
@@ -321,6 +358,121 @@ describe('activateLicense', () => {
     expect(output).not.toContain(bare);
     expect(output).not.toContain(wrapped);
     expect(output).toContain('***');
+  });
+
+  it('warns and resolves when the temporary licence file cannot be deleted', async () => {
+    const encoded = Buffer.from('ulf-bytes', 'utf8').toString('base64');
+    let tempPath = '';
+    mocks.runUnity.mockImplementation(async (options: UnityCall) => {
+      record(options);
+      tempPath = options.args[options.args.indexOf('--file') + 1] ?? '';
+      return ok({ activated: true });
+    });
+
+    fsFaults.failRm = true;
+    let result: Awaited<ReturnType<typeof activateLicense>>;
+    try {
+      result = await activateLicense(
+        makeContext('offline-file', { UNITY_LICENSE_FILE_BASE64: encoded }),
+      );
+    } finally {
+      fsFaults.failRm = false;
+    }
+
+    // The cleanup failure must not replace the activation outcome.
+    expect(result!).toEqual({ activated: true, mode: 'offline-file' });
+    const output = lines.join('');
+    expect(output).toMatch(/could not delete the temporary offline license file/i);
+    expect(output).toMatch(/delete it by hand/i);
+    // The file really is still there, which is why the warning exists.
+    expect(existsSync(tempPath)).toBe(true);
+    rmSync(dirname(tempPath), { recursive: true, force: true });
+  });
+
+  it('keeps the controlled 64 when cleanup also fails after a failed activation', async () => {
+    const encoded = Buffer.from('ulf-bytes', 'utf8').toString('base64');
+    let tempPath = '';
+    mocks.runUnity.mockImplementation(async (options: UnityCall) => {
+      record(options);
+      tempPath = options.args[options.args.indexOf('--file') + 1] ?? '';
+      return failed(3, 'activation refused');
+    });
+
+    fsFaults.failRm = true;
+    let code = -1;
+    try {
+      code = await licenseActivateCommand(
+        makeContext('offline-file', { UNITY_LICENSE_FILE_BASE64: encoded }),
+      );
+    } finally {
+      fsFaults.failRm = false;
+    }
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toMatch(/delete it by hand/i);
+    rmSync(dirname(tempPath), { recursive: true, force: true });
+  });
+
+  it('fails with 64 instead of rejecting when the temp directory cannot be created', async () => {
+    const encoded = Buffer.from('ulf-bytes', 'utf8').toString('base64');
+    fsFaults.failMkdtemp = true;
+    let code = -1;
+    try {
+      code = await licenseActivateCommand(
+        makeContext('offline-file', { UNITY_LICENSE_FILE_BASE64: encoded }),
+      );
+    } finally {
+      fsFaults.failMkdtemp = false;
+    }
+
+    expect(code).toBe(64);
+    expect(mocks.runUnity).not.toHaveBeenCalled();
+    expect(lines.join('')).toMatch(/could not create a temporary directory/i);
+  });
+
+  it('fails with 64 instead of rejecting on a malformed errors envelope', async () => {
+    mocks.runUnity.mockImplementation(async (options: UnityCall): Promise<FakeResult> => {
+      record(options);
+      // Unity is a third party: `errors` is not guaranteed to be an array.
+      return { code: 3, stdout: '', stderr: '', json: { success: false, errors: 'not-an-array' } };
+    });
+
+    const code = await licenseActivateCommand(
+      makeContext('serial', { UNITY_LICENSE_SERIAL: SERIAL }),
+    );
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toMatch(/license\.mode "serial"/);
+  });
+
+  it('fails with 64 when errors holds a non-object entry', async () => {
+    mocks.runUnity.mockImplementation(async (options: UnityCall): Promise<FakeResult> => {
+      record(options);
+      return {
+        code: 3,
+        stdout: '',
+        stderr: '',
+        json: { success: false, errors: ['a bare string rather than an error object'] },
+      };
+    });
+
+    const code = await licenseActivateCommand(
+      makeContext('serial', { UNITY_LICENSE_SERIAL: SERIAL }),
+    );
+
+    expect(code).toBe(64);
+  });
+
+  it('does not register a whitespace-only base64 value as a redaction pattern', async () => {
+    const ctx = makeContext('offline-file', { UNITY_LICENSE_FILE_BASE64: '\n' });
+
+    const code = await licenseActivateCommand(ctx);
+
+    expect(code).toBe(64);
+    expect(ctx.redactor.secrets).toEqual([]);
+    // A pattern of "\n" would mask every newline of every later log line.
+    ctx.logger.info('first line\nsecond line');
+    expect(lines.at(-1)).toBe('first line\nsecond line\n');
   });
 
   it('activates personal with --personal --accept-eula', async () => {

@@ -223,8 +223,16 @@ const UNSUPPORTED_COMMAND_MESSAGE =
 export function isUnsupportedCommand(result: UnityResult): boolean {
   if (result.code === 0) return false;
 
-  for (const error of result.json?.errors ?? []) {
-    const code = (error.code ?? '').toUpperCase();
+  // `result.json` comes from Unity's unvalidated stdout: `errors` may be a
+  // string, and an entry may be a primitive. A malformed envelope must not
+  // throw here — the caller's controlled exit code depends on this answer.
+  const rawErrors: unknown = result.json?.errors;
+  const errors = Array.isArray(rawErrors) ? rawErrors : [];
+
+  for (const entry of errors) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const error = entry as { code?: unknown; message?: unknown };
+    const code = typeof error.code === 'string' ? error.code.toUpperCase() : '';
     if (
       UNSUPPORTED_COMMAND_CODES.has(code) ||
       code.includes('UNKNOWN_COMMAND') ||
@@ -232,7 +240,8 @@ export function isUnsupportedCommand(result: UnityResult): boolean {
     ) {
       return true;
     }
-    if (UNSUPPORTED_COMMAND_MESSAGE.test(error.message ?? '')) return true;
+    const message = typeof error.message === 'string' ? error.message : '';
+    if (UNSUPPORTED_COMMAND_MESSAGE.test(message)) return true;
   }
 
   return (

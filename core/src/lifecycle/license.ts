@@ -110,7 +110,10 @@ function rawSecretValue(ctx: CoreContext, name: string): string | null {
  * activation stops at 64.
  */
 function registerSecret(ctx: CoreContext, value: string | null): void {
-  if (value === null) return;
+  // A whitespace-only value (a half-written CI secret file holding just "\n")
+  // would otherwise become a redaction pattern and mask every newline in every
+  // later log line of the process. Only a value with real content is a secret.
+  if (value === null || value.trim() === '') return;
   try {
     ctx.redactor.register(value);
   } catch {
@@ -176,15 +179,24 @@ function licenseBaseOptions(
   return { ...base, env: { ...base.env, ...overrides }, timeoutMs };
 }
 
+/** One `errors[]` entry as text, tolerating the unvalidated child envelope. */
+function errorText(entry: unknown): string {
+  if (typeof entry !== 'object' || entry === null) return '';
+  const record = entry as { code?: unknown; message?: unknown };
+  const code = typeof record.code === 'string' ? record.code : '';
+  const message = typeof record.message === 'string' ? record.message : '';
+  if (code !== '' && message !== '') return `${code}: ${message}`;
+  return message !== '' ? message : code;
+}
+
 /** A one-line description of a failed `unity` call, for a log/error message. */
 function failureDetail(result: UnityResult): string {
-  const errors = (result.json?.errors ?? [])
-    .map((error) => {
-      const code = error.code ?? '';
-      const message = error.message ?? '';
-      if (code !== '' && message !== '') return `${code}: ${message}`;
-      return message !== '' ? message : code;
-    })
+  // `result.json` is parsed from Unity's raw stdout and is not validated: a
+  // third-party CLI may put a string where an array belongs. Guard the shape
+  // here so a malformed envelope becomes a controlled 64, not a TypeError.
+  const raw: unknown = result.json?.errors;
+  const errors = (Array.isArray(raw) ? raw : [])
+    .map(errorText)
     .filter((value) => value !== '');
   if (errors.length > 0) return `: ${errors.join('; ')}`;
 
@@ -248,14 +260,30 @@ async function activateFromFile(
 
   // A private directory, so the file name is not guessable by another user on
   // the same runner, and a `.ulf` suffix because the CLI dispatches on it.
-  const directory = mkdtempSync(join(tmpdir(), 'unityci-license-'));
+  let directory: string;
+  try {
+    directory = mkdtempSync(join(tmpdir(), 'unityci-license-'));
+  } catch (error) {
+    throw new LicenseError(
+      `could not create a temporary directory for the offline license file: ${describeThrown(error)}.`,
+      EXIT.CONFIG_ERROR,
+    );
+  }
   const path = join(directory, 'license.ulf');
 
   try {
-    writeFileSync(path, bytes, { mode: 0o600 });
-    // The umask can only clear bits, but be explicit: the licence material is
-    // readable by its owner and nobody else.
-    chmodSync(path, 0o600);
+    try {
+      writeFileSync(path, bytes, { mode: 0o600 });
+      // The umask can only clear bits, but be explicit: on POSIX the licence
+      // material is readable by its owner and nobody else (NTFS ACLs are not
+      // governed by this mode).
+      chmodSync(path, 0o600);
+    } catch (error) {
+      throw new LicenseError(
+        `could not write the temporary offline license file ${path}: ${describeThrown(error)}.`,
+        EXIT.CONFIG_ERROR,
+      );
+    }
 
     // An operational fact, not a footnote: `unity license return` leaves an
     // offline licence in place, so this runner's seat must be reclaimed by
@@ -276,7 +304,19 @@ async function activateFromFile(
     );
     return { activated: true, mode: 'offline-file' };
   } finally {
-    rmSync(directory, { recursive: true, force: true });
+    // A cleanup failure must not replace the activation result (or the
+    // LicenseError) with an internal error. On Windows the Unity child or an
+    // antivirus scanner can still hold the file; say so and move on.
+    try {
+      rmSync(directory, { recursive: true, force: true });
+    } catch (error) {
+      safeLog(
+        ctx,
+        'warn',
+        `could not delete the temporary offline license file at ${path}: ${describeThrown(error)}. ` +
+          'It contains license material and may remain on this runner; delete it by hand.',
+      );
+    }
   }
 }
 
