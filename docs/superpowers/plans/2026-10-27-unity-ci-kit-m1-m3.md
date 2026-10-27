@@ -414,7 +414,7 @@ it('returns the resolved project path', () => { /* echoed back */ });
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm -C core test core/test/config.test.ts`
+Run: `pnpm -C core test test/config.test.ts`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement the four modules**
@@ -439,6 +439,7 @@ output: { dir: 'ci-output', annotations: 'none', ci: true }
 - `output.dir`, `test.outputDir`, `build.outputPath` must resolve inside the project root (reject `..` escapes and absolute paths outside the root).
 - A report path (`test.outputDir` files) that is an **existing directory** → issue. `unity test --output <dir>` runs the tests and writes no report at all, silently. The rule applies to **test report paths only**: `build.outputPath` may legitimately be a directory, because Unity's own CLI documents `unity build --profile WebGL --output-path ./Build/WebGL` — a directory — for directory-style targets. The core creates the output's **parent directory** before invoking `unity build`.
 - `test.modes` entries must be `EditMode` or `PlayMode`.
+- `license.serialEnv` and `license.fileEnv` must **not** name one of the variables the spawn layer strips (`UNITY_SERVICE_ACCOUNT_ID`, `UNITY_SERVICE_ACCOUNT_SECRET`, `UNITY_GITHUB_TOKEN`, `UNITY_GITLAB_TOKEN` — exported as `STRIPPED_ENV_VARIABLES` from `core/src/exec.ts`). A serial carried in a stripped variable would be removed from the child environment before `unity license activate` could read it, and the activation would fail with a message that says nothing about the cause.
 - `license.mode` must be one of the five listed values.
 - `build.target` and `build.profile` must match the version-string regex.
 - `retry.maxAttempts` must be an integer ≥ 1.
@@ -506,7 +507,7 @@ it('kills the child and returns 14 when the timeout elapses', () => { /* code ==
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm -C core test core/test/unity-exec.test.ts`
+Run: `pnpm -C core test test/unity-exec.test.ts`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement `exec.ts`, `unity/exec.ts` and `unity/cli.ts`**
@@ -606,7 +607,7 @@ it('fails when unity license status reports no active license', () => {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm -C core test core/test/doctor.test.ts core/test/setup.test.ts`
+Run: `pnpm -C core test test/doctor.test.ts core/test/setup.test.ts`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement**
@@ -662,8 +663,8 @@ git commit -m "feat: add doctor and setup commands"
 **Interfaces:**
 - Consumes: `runUnity` wrappers; `Config`; `CoreContext`.
 - Produces:
-  - `core/src/lifecycle/license.ts` → `export async function activateLicense(ctx: CoreContext): Promise<{ activated: boolean; mode: string }>` and `export async function returnLicense(ctx: CoreContext): Promise<void>`.
-  - `core/src/commands/license.ts` → `export async function licenseActivateCommand(ctx: CoreContext): Promise<number>` and `export async function licenseReturnCommand(ctx: CoreContext): Promise<number>`.
+  - `core/src/lifecycle/license.ts` → `export interface LicenseActivation { activated: boolean; mode: string }`, `export interface LicenseReturnResult { returned: boolean; code: number; error?: string }`, `export async function activateLicense(ctx: CoreContext): Promise<LicenseActivation>` and `export async function returnLicense(ctx: CoreContext): Promise<LicenseReturnResult>`. `returnLicense` **never throws** — it catches everything and reports the outcome in its result. That is what lets the teardown log the failure loudly without changing the primary exit code (GC9), while the **standalone** `unityci license return` command can still report the failure honestly.
+  - `core/src/commands/license.ts` → `export async function licenseActivateCommand(ctx: CoreContext): Promise<number>` and `export async function licenseReturnCommand(ctx: CoreContext): Promise<number>`. The standalone `license return` command exits **non-zero** (`EXIT.COMMAND_FAILED`, 6) when the return failed — a user who explicitly asked for a seat to be returned must not be told it succeeded when it did not. That is a different question from the teardown, which has a primary exit code to preserve.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -684,7 +685,7 @@ it('swallows a return failure without changing the caller exit code', () => { /*
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm -C core test core/test/license.test.ts`
+Run: `pnpm -C core test test/license.test.ts`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement**
@@ -737,7 +738,7 @@ it('returns the last attempt value and the number of attempts', () => { /* attem
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm -C core test core/test/retry.test.ts`
+Run: `pnpm -C core test test/retry.test.ts`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement**
@@ -795,7 +796,7 @@ it('throws a typed error when the NUnit XML cannot be parsed', () => { /* caller
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm -C core test core/test/report.test.ts`
+Run: `pnpm -C core test test/report.test.ts`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement**
@@ -859,7 +860,7 @@ it('never leaks the license serial into summary.json', () => { /* no secret in f
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm -C core test core/test/run-test.test.ts`
+Run: `pnpm -C core test test/run-test.test.ts`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement**
@@ -931,7 +932,7 @@ it('does not convert when unity already produced a JUnit file', () => { /* no co
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm -C core test core/test/run-build.test.ts`
+Run: `pnpm -C core test test/run-build.test.ts`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement**
@@ -984,7 +985,7 @@ it('bounds the teardown with a timeout so a hung return cannot block the exit', 
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm -C core test core/test/signals.test.ts`
+Run: `pnpm -C core test test/signals.test.ts`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement**
@@ -1027,7 +1028,7 @@ it('prints valid JSON when --json is passed', () => { /* JSON.parse */ });
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm -C core test core/test/cache-info.test.ts`
+Run: `pnpm -C core test test/cache-info.test.ts`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement**
@@ -1082,7 +1083,7 @@ it('uses the fake unity binary when the config points at it', () => { /* scenari
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm -C core test core/test/cli.test.ts`
+Run: `pnpm -C core test test/cli.test.ts`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement**
@@ -1194,7 +1195,7 @@ it('detects a token used without being masked', () => { /* fails masks-credentia
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm -C core test core/test/conformance.test.ts`
+Run: `pnpm -C core test test/conformance.test.ts`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement**
@@ -1244,7 +1245,7 @@ it('the example config sets the output dir and the test modes', () => { /* yaml 
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm -C core test core/test/example-project.test.ts`
+Run: `pnpm -C core test test/example-project.test.ts`
 Expected: FAIL — the project does not exist yet.
 
 - [ ] **Step 3: Create the project**
@@ -1306,7 +1307,7 @@ it('the nightly workflow is not secret-bearing on fork pull requests', () => { /
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `pnpm -C core test core/test/example-project.test.ts`
+Run: `pnpm -C core test test/example-project.test.ts`
 Expected: FAIL — the scripts and workflow do not exist yet.
 
 - [ ] **Step 3: Implement**
