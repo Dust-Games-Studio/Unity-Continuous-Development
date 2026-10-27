@@ -10,8 +10,9 @@ const SAFE_VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/;
 /** `from-project` is a sentinel; `latest` is opt-in through `allowLatest`. */
 const VERSION_SENTINELS: ReadonlySet<string> = new Set(['from-project', 'latest']);
 
-/** Codes the retry loop must never see: a failing suite, SIGINT and SIGTERM. */
+/** Codes the retry loop must never see: success, a failing suite, and interrupts. */
 const NEVER_RETRY: ReadonlyMap<number, string> = new Map([
+  [EXIT.SUCCESS, 'exit 0 is success'],
   [EXIT.TESTS_FAILED, 'the tests ran and some failed'],
   [EXIT.INTERRUPTED, 'the job was interrupted (SIGINT)'],
   [EXIT.TERMINATED, 'the job was terminated (SIGTERM)'],
@@ -188,6 +189,16 @@ export function validateConfig(config: Config, projectRoot: string = process.cwd
     issues.push({
       path: 'retry.maxAttempts',
       message: `retry.maxAttempts must be an integer of at least 1; got ${JSON.stringify(config.retry.maxAttempts)}`,
+    });
+  }
+
+  // A negative or non-integer delay would reach `setTimeout`, which treats a
+  // negative value as 0: the backoff would silently vanish instead of failing
+  // loudly. 0 is allowed — it means "retry immediately".
+  if (!Number.isInteger(config.retry.backoffMs) || config.retry.backoffMs < 0) {
+    issues.push({
+      path: 'retry.backoffMs',
+      message: `retry.backoffMs must be an integer of at least 0; got ${JSON.stringify(config.retry.backoffMs)}`,
     });
   }
 

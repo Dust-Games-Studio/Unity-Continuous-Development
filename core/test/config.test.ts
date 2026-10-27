@@ -294,6 +294,35 @@ describe('config validation', () => {
     }
   });
 
+  it('rejects exit code 0 in retry.onExitCodes', () => {
+    const tmp = workspace();
+    const { issues } = loadIn(tmp, { env: { UNITYCI_RETRY_EXIT_CODES: '0,7' } });
+    expect(
+      issues.some(
+        (i) =>
+          i.path === 'retry.onExitCodes' && /success/.test(i.message) && /never retried/.test(i.message),
+      ),
+    ).toBe(true);
+  });
+
+  it('rejects a negative or non-integer retry.backoffMs', () => {
+    const tmp = workspace();
+    for (const value of ['-1', '1500.5']) {
+      const configFile = write(tmp, 'unity-ci.yml', `retry:\n  backoffMs: ${value}\n`);
+      const { issues } = loadIn(tmp, { configFile });
+      expect(issues.some((i) => i.path === 'retry.backoffMs')).toBe(true);
+    }
+  });
+
+  it('accepts a zero retry.backoffMs', () => {
+    // 0 is a deliberate "retry immediately", not a missing value.
+    const tmp = workspace();
+    const configFile = write(tmp, 'unity-ci.yml', 'retry:\n  backoffMs: 0\n');
+    const { config, issues } = loadIn(tmp, { configFile });
+    expect(config.retry.backoffMs).toBe(0);
+    expect(issues).toEqual([]);
+  });
+
   it('caps exit code 6 at one extra attempt when it is enabled', () => {
     const tmp = workspace();
     const configFile = write(
