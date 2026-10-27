@@ -384,7 +384,7 @@ it('warns but does not fail on an unknown UNITYCI_ var', () => { /* unknownEnvVa
 
 // secrets
 it('rejects a unity-ci.yml that contains a secret key', () => {
-  const { issues } = loadConfig({ cwd: tmp, argv: {}, env: {}, configFile: write('unity-ci.yml', 'license:\n  serial: "hunter2"\n') });
+  const { issues } = loadConfig({ projectPath: tmp, cwd: tmp, argv: {}, env: {}, configFile: write('unity-ci.yml', 'license:\n  serial: "hunter2"\n') });
   expect(issues.some(i => /secret/i.test(i.message))).toBe(true);
 });
 
