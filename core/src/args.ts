@@ -6,11 +6,13 @@ export interface ParseResult {
    * Parsed flags, keyed by their long name.
    *
    * An option declared with `multiple: true` is always an **array** when it is
-   * present — a single occurrence is `['value']`, never `'value'` — and its key
-   * is **absent** (not `[]`) when the option was never supplied. Consumers must
-   * check for the key's presence rather than assume an empty array.
+   * present — a single occurrence is `['value']`, never `'value'`, and a
+   * `multiple` **boolean** option yields a boolean array such as `[true]` — and
+   * its key is **absent** (not `[]`) when the option was never supplied.
+   * Consumers must check for the key's presence rather than assume an empty
+   * array.
    */
-  flags: Record<string, string | boolean | string[]>;
+  flags: Record<string, string | boolean | string[] | boolean[]>;
   passthrough: string[];
 }
 
@@ -63,14 +65,20 @@ export function parseArgs(
   };
 }
 
-function normaliseFlags(values: Record<string, unknown>): Record<string, string | boolean | string[]> {
-  const flags: Record<string, string | boolean | string[]> = {};
+function normaliseFlags(
+  values: Record<string, unknown>,
+): Record<string, string | boolean | string[] | boolean[]> {
+  const flags: Record<string, string | boolean | string[] | boolean[]> = {};
   for (const [name, value] of Object.entries(values)) {
     if (value === undefined) continue;
     if (typeof value === 'string' || typeof value === 'boolean') {
       flags[name] = value;
     } else if (Array.isArray(value)) {
-      flags[name] = value.map(String);
+      // parseArgs returns homogeneous arrays: booleans for a `multiple`
+      // boolean option, strings for a `multiple` string option.
+      flags[name] = value.every((item) => typeof item === 'boolean')
+        ? (value as boolean[])
+        : value.map(String);
     }
   }
   return flags;

@@ -6,6 +6,6 @@
   "license": "MIT",
   "packageManager": "pnpm@12.15.0",
   "engines": {
-    "node": ">=22.4"
+    "node": ">=22.12"
   }
 }
