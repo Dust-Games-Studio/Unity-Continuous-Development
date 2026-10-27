@@ -24,6 +24,10 @@ export interface Config {
     fileEnv: string;
   };
   packages: { preflight: boolean };
+  doctor: {
+    /** Free space the project root must have, in bytes (default 10 GiB). */
+    minFreeBytes: number;
+  };
   test: {
     modes: string[];
     outputDir: string;
@@ -72,6 +76,7 @@ export const DEFAULT_CONFIG: Config = {
     fileEnv: 'UNITY_LICENSE_FILE_BASE64',
   },
   packages: { preflight: true },
+  doctor: { minFreeBytes: 10 * 1024 * 1024 * 1024 },
   test: {
     modes: ['EditMode'],
     outputDir: 'ci-output/tests',

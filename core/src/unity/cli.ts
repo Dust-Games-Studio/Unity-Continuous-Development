@@ -193,3 +193,50 @@ export function unityModulesList(
 ): Promise<UnityResult> {
   return run(opts, ['install', version, '--list-modules', '--format', 'json']);
 }
+
+/** Error codes a CLI uses when the verb (or one of its words) does not exist. */
+const UNSUPPORTED_COMMAND_CODES: ReadonlySet<string> = new Set([
+  'UNKNOWN_COMMAND',
+  'UNSUPPORTED_COMMAND',
+  'COMMAND_NOT_FOUND',
+  'NO_SUCH_COMMAND',
+]);
+
+/**
+ * Matches the CLI's own wording for a missing verb, e.g. `unknown command
+ * 'doctor'` or `command 'projects' is not supported`.
+ *
+ * Deliberately narrow: an *option* error (`unknown option --foo`) is a
+ * different problem, and a compile or licence failure must never be reported
+ * as an unsupported command.
+ */
+const UNSUPPORTED_COMMAND_MESSAGE =
+  /\b(?:unknown|unsupported|unrecognized|unrecognised)\s+(?:command|subcommand)\b(?=\s*(?:[:("'`]|$))|\bcommand\s+["'`]?[\w:.-]+["'`]?\s+(?:is\s+)?not\s+(?:found|supported|recognized|recognised)\b|\bdoes\s+not\s+support\s+(?:the\s+)?["'`]?[\w:.-]+["'`]?\s+command\b/i;
+
+/**
+ * True when a failed `unity` call means "this CLI does not know the command".
+ *
+ * The core probes this instead of gating on a version string: beta releases add
+ * and rename commands between fortnightly drops, and a clear "this Unity CLI
+ * does not support X" beats a crash or a generic exit 6 (R13).
+ */
+export function isUnsupportedCommand(result: UnityResult): boolean {
+  if (result.code === 0) return false;
+
+  for (const error of result.json?.errors ?? []) {
+    const code = (error.code ?? '').toUpperCase();
+    if (
+      UNSUPPORTED_COMMAND_CODES.has(code) ||
+      code.includes('UNKNOWN_COMMAND') ||
+      code.includes('UNSUPPORTED_COMMAND')
+    ) {
+      return true;
+    }
+    if (UNSUPPORTED_COMMAND_MESSAGE.test(error.message ?? '')) return true;
+  }
+
+  return (
+    UNSUPPORTED_COMMAND_MESSAGE.test(result.stderr) ||
+    UNSUPPORTED_COMMAND_MESSAGE.test(result.stdout)
+  );
+}

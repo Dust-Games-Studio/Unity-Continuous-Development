@@ -157,6 +157,17 @@ export function validateConfig(config: Config, projectRoot: string = process.cwd
     });
   }
 
+  // --- doctor -------------------------------------------------------------------
+  if (
+    !Number.isInteger(config.doctor.minFreeBytes) ||
+    config.doctor.minFreeBytes <= 0
+  ) {
+    issues.push({
+      path: 'doctor.minFreeBytes',
+      message: `doctor.minFreeBytes must be a positive integer number of bytes; got ${JSON.stringify(config.doctor.minFreeBytes)}`,
+    });
+  }
+
   // --- test ---------------------------------------------------------------------
   const modes = config.test.modes;
   if (!Array.isArray(modes) || modes.length === 0) {

@@ -1,13 +1,15 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, statfsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { CoreContext } from '../context.js';
 import { EXIT } from '../exit-codes.js';
 import type { GitDependency } from '../packages/deps.js';
 import { readGitDependencies, redactGitUrl } from '../packages/deps.js';
 import { preflightGitDependencies } from '../packages/git.js';
+import { modulesForBuildTarget, modulesForTestMode } from '../packages/modules.js';
 import {
   TESTED_CLI_MAX,
   TESTED_CLI_MIN,
+  isUnsupportedCommand,
   unityDoctorCi,
   unityEditorsInstalled,
   unityInstall,
@@ -39,6 +41,39 @@ export interface SetupResult {
   installed: boolean;
   doctorVerdict: 'pass' | 'fail' | 'unknown';
 }
+
+/**
+ * Which command is invoking setup. The module requirement belongs to the
+ * command, not to the project: a build needs its target's modules, a test needs
+ * none, and a command with no requirement checks only the Editor version.
+ */
+export interface SetupOptions {
+  command?: 'build' | 'test';
+  /**
+   * An explicit override. When present the config-derived list is ignored, so a
+   * caller that knows better (or a future command) can state its modules.
+   */
+  requiredModules?: string[];
+}
+
+/**
+ * Backwards-compatible call shape: a plain array is the explicit override.
+ * `setup(ctx)` remains the version-only check.
+ */
+export type SetupInput = SetupOptions | string[];
+
+/** A row of the toolkit's own doctor output. */
+export interface PreflightCheck {
+  id: string;
+  status: string;
+  code: string;
+  blocking: boolean;
+  message: string;
+  source: 'unity' | 'core';
+}
+
+/** Unity's CLI requires this glibc floor on Linux. */
+export const GLIBC_FLOOR = '2.34';
 
 /** One row of `unity doctor --ci --format json`'s `data.checks[]`. */
 export interface UnityDoctorCheck {
@@ -163,6 +198,27 @@ function compareCliVersions(a: string, b: string): number | null {
   return leftNumber - rightNumber;
 }
 
+/** Where a running CLI sits relative to the range this toolkit is tested on. */
+export function cliVersionStatus(
+  version: string,
+): 'below' | 'inside' | 'above' | 'unknown' {
+  const belowFloor = compareCliVersions(version, TESTED_CLI_MIN);
+  const aboveCeiling = compareCliVersions(version, TESTED_CLI_MAX);
+  if (belowFloor === null || aboveCeiling === null) return 'unknown';
+  if (belowFloor < 0) return 'below';
+  if (aboveCeiling > 0) return 'above';
+  return 'inside';
+}
+
+export interface ResolveCliIdentityOptions {
+  /**
+   * `true` (the default) keeps the gate fatal below the tested floor. `doctor`
+   * passes `false` so it can record the finding as a blocking check and still
+   * write its report.
+   */
+  throwBelowFloor?: boolean;
+}
+
 /**
  * Reads `unity version --format json` — never `unity --version`, which
  * self-reported a different build on the spike machine — records the identity
@@ -171,8 +227,15 @@ function compareCliVersions(a: string, b: string): number | null {
  */
 export async function resolveCliIdentity(
   ctx: CoreContext,
+  options: ResolveCliIdentityOptions = {},
 ): Promise<{ version: string; channel: string | null; commit: string | null }> {
   const result = await unityVersion(unityBaseOptions(ctx));
+  if (isUnsupportedCommand(result)) {
+    throw new SetupError(
+      'this Unity CLI does not support `version`; the toolkit cannot record which CLI build is running.',
+      EXIT.CONFIG_ERROR,
+    );
+  }
   const data = asObject(result.json?.data);
   const version = stringField(data, 'version');
 
@@ -189,28 +252,249 @@ export async function resolveCliIdentity(
   ctx.cliChannel = channel;
   ctx.cliCommit = commit;
 
-  const belowFloor = compareCliVersions(version, TESTED_CLI_MIN);
-  const aboveCeiling = compareCliVersions(version, TESTED_CLI_MAX);
-
-  if (belowFloor === null || aboveCeiling === null) {
+  const status = cliVersionStatus(version);
+  if (status === 'unknown') {
     ctx.logger.warn(
       `Unity CLI version ${version} is not comparable to the tested range ${TESTED_CLI_MIN}..${TESTED_CLI_MAX}; continuing without a version verdict.`,
     );
-  } else {
-    if (belowFloor < 0) {
-      throw new SetupError(
-        `Unity CLI ${version} is older than the tested floor ${TESTED_CLI_MIN}; upgrade the Unity CLI before running this pipeline.`,
-        EXIT.CONFIG_ERROR,
-      );
-    }
-    if (aboveCeiling > 0) {
-      ctx.logger.warn(
-        `Unity CLI ${version} is newer than the tested ceiling ${TESTED_CLI_MAX}; continuing, but this build's behaviour is unverified.`,
-      );
-    }
+  } else if (status === 'below' && options.throwBelowFloor !== false) {
+    throw new SetupError(
+      `Unity CLI ${version} is older than the tested floor ${TESTED_CLI_MIN}; upgrade the Unity CLI before running this pipeline.`,
+      EXIT.CONFIG_ERROR,
+    );
+  } else if (status === 'above') {
+    ctx.logger.warn(
+      `Unity CLI ${version} is newer than the tested ceiling ${TESTED_CLI_MAX}; continuing, but this build's behaviour is unverified.`,
+    );
   }
 
   return { version, channel, commit };
+}
+
+// --- Core environment checks (R13) ----------------------------------------------
+
+/** The running libc's version, when Node can report it. */
+function runtimeGlibcVersion(): string | null {
+  try {
+    const report = process.report.getReport() as {
+      header?: { glibcVersionRuntime?: unknown };
+    };
+    const version = report.header?.glibcVersionRuntime;
+    return typeof version === 'string' ? version : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseGlibc(version: string): { major: number; minor: number } | null {
+  const match = version.match(/^(\d+)\.(\d+)/);
+  if (match === null) return null;
+  return { major: Number(match[1]), minor: Number(match[2]) };
+}
+
+/**
+ * F1a: Unity's CLI requires glibc >= 2.34 on Linux. The comparison is numeric
+ * (`2.9` is older than `2.34`, although it sorts later as a string).
+ *
+ * `platform` and `version` are injectable so the Linux branch is testable on
+ * Windows/macOS, where the check is always `info` ("not applicable").
+ */
+export function glibcCheck(
+  platform: NodeJS.Platform = process.platform,
+  version: string | null = runtimeGlibcVersion(),
+): PreflightCheck {
+  if (platform !== 'linux') {
+    return {
+      id: 'glibc',
+      status: 'info',
+      code: 'GLIBC_NOT_APPLICABLE',
+      blocking: false,
+      message: `glibc >= ${GLIBC_FLOOR} is a Linux requirement; not applicable on ${platform}`,
+      source: 'core',
+    };
+  }
+
+  if (version === null) {
+    return {
+      id: 'glibc',
+      status: 'info',
+      code: 'GLIBC_UNKNOWN',
+      blocking: false,
+      message: `could not determine the glibc version; Unity's CLI requires glibc >= ${GLIBC_FLOOR}`,
+      source: 'core',
+    };
+  }
+
+  const parsed = parseGlibc(version);
+  if (parsed === null) {
+    return {
+      id: 'glibc',
+      status: 'info',
+      code: 'GLIBC_UNKNOWN',
+      blocking: false,
+      message: `could not parse glibc version ${JSON.stringify(version)}; Unity's CLI requires glibc >= ${GLIBC_FLOOR}`,
+      source: 'core',
+    };
+  }
+
+  const floor = parseGlibc(GLIBC_FLOOR)!;
+  const tooOld =
+    parsed.major < floor.major ||
+    (parsed.major === floor.major && parsed.minor < floor.minor);
+
+  if (tooOld) {
+    return {
+      id: 'glibc',
+      status: 'fail',
+      code: 'GLIBC_TOO_OLD',
+      blocking: true,
+      message: `glibc ${version} is below Unity's required floor ${GLIBC_FLOOR}; the CLI is unsupported on this machine`,
+      source: 'core',
+    };
+  }
+
+  return {
+    id: 'glibc',
+    status: 'pass',
+    code: 'GLIBC_OK',
+    blocking: false,
+    message: `glibc ${version} meets Unity's floor ${GLIBC_FLOOR}`,
+    source: 'core',
+  };
+}
+
+/** The subset of `fs.statfsSync`'s result the check needs, in number form. */
+export interface StatfsResult {
+  bsize: number | bigint;
+  bavail: number | bigint;
+}
+
+export type StatfsFn = (path: string) => StatfsResult;
+
+function formatBytes(bytes: number): string {
+  const gib = bytes / 1024 ** 3;
+  if (gib >= 1) return `${gib.toFixed(1)} GiB`;
+  const mib = bytes / 1024 ** 2;
+  return `${mib.toFixed(1)} MiB`;
+}
+
+/**
+ * F1b: the Editor install and the project's `Library/` both need room. The
+ * check is on the project root, where `Library/` lives, and the threshold is
+ * `doctor.minFreeBytes` (default 10 GiB).
+ *
+ * A filesystem that cannot answer `statfs` is `info`, never a failure: the
+ * check is advisory in that case, not a false red build.
+ */
+export function diskSpaceCheck(
+  ctx: CoreContext,
+  statfs: StatfsFn = statfsSync as unknown as StatfsFn,
+): PreflightCheck {
+  let free: number;
+  try {
+    const stats = statfs(ctx.projectPath);
+    free = Number(stats.bsize) * Number(stats.bavail);
+    if (!Number.isFinite(free) || free < 0) throw new Error('statfs returned no usable byte count');
+  } catch (error) {
+    return {
+      id: 'disk-space',
+      status: 'info',
+      code: 'DISK_SPACE_UNKNOWN',
+      blocking: false,
+      message: `could not determine free space at ${ctx.projectPath}: ${(error as Error).message}; disk space was not checked`,
+      source: 'core',
+    };
+  }
+
+  const minimum = ctx.config.doctor.minFreeBytes;
+  if (free < minimum) {
+    return {
+      id: 'disk-space',
+      status: 'fail',
+      code: 'DISK_SPACE_LOW',
+      blocking: true,
+      message: `${formatBytes(free)} free at ${ctx.projectPath}, below the configured floor ${formatBytes(minimum)} (doctor.minFreeBytes)`,
+      source: 'core',
+    };
+  }
+
+  return {
+    id: 'disk-space',
+    status: 'pass',
+    code: 'DISK_SPACE_OK',
+    blocking: false,
+    message: `${formatBytes(free)} free at ${ctx.projectPath}; floor ${formatBytes(minimum)}`,
+    source: 'core',
+  };
+}
+
+/**
+ * F1c: the CLI identity is a first-class check, not only a log line. Inside the
+ * tested range `pass`; above the ceiling `info` (advisory); below the floor a
+ * blocking failure. `doctor` calls `resolveCliIdentity` with
+ * `throwBelowFloor: false` so this row can exist in the report.
+ */
+export function capabilityCheck(ctx: CoreContext): PreflightCheck {
+  const version = ctx.cliVersion;
+  if (version === null) {
+    return {
+      id: 'cli-version',
+      status: 'info',
+      code: 'CLI_VERSION_UNKNOWN',
+      blocking: false,
+      message: 'the Unity CLI version is unknown',
+      source: 'core',
+    };
+  }
+
+  const identity =
+    `Unity CLI ${version} (channel ${ctx.cliChannel ?? 'unknown'}, commit ${ctx.cliCommit ?? 'unknown'})`;
+  const status = cliVersionStatus(version);
+
+  if (status === 'below') {
+    return {
+      id: 'cli-version',
+      status: 'fail',
+      code: 'CLI_VERSION_TOO_OLD',
+      blocking: true,
+      message: `${identity} is older than the tested floor ${TESTED_CLI_MIN}; upgrade the Unity CLI`,
+      source: 'core',
+    };
+  }
+  if (status === 'above') {
+    return {
+      id: 'cli-version',
+      status: 'info',
+      code: 'CLI_VERSION_NEWER',
+      blocking: false,
+      message: `${identity} is newer than the tested ceiling ${TESTED_CLI_MAX}; continuing, but its behaviour is unverified`,
+      source: 'core',
+    };
+  }
+  if (status === 'unknown') {
+    return {
+      id: 'cli-version',
+      status: 'info',
+      code: 'CLI_VERSION_UNKNOWN',
+      blocking: false,
+      message: `${identity} could not be compared with the tested range ${TESTED_CLI_MIN}..${TESTED_CLI_MAX}`,
+      source: 'core',
+    };
+  }
+
+  return {
+    id: 'cli-version',
+    status: 'pass',
+    code: 'CLI_VERSION_TESTED',
+    blocking: false,
+    message: `${identity} is inside the tested range ${TESTED_CLI_MIN}..${TESTED_CLI_MAX}`,
+    source: 'core',
+  };
+}
+
+/** The cheap checks shared by `doctor` and `setup`. */
+export function coreEnvironmentChecks(ctx: CoreContext): PreflightCheck[] {
+  return [capabilityCheck(ctx), glibcCheck(), diskSpaceCheck(ctx)];
 }
 
 // --- Editor version and modules --------------------------------------------------
@@ -266,6 +550,12 @@ interface ModuleRow {
 }
 
 function editorRows(result: UnityResult): EditorRow[] {
+  if (isUnsupportedCommand(result)) {
+    throw new SetupError(
+      'this Unity CLI does not support `editors --installed`; the toolkit cannot tell which Editors are installed.',
+      EXIT.CONFIG_ERROR,
+    );
+  }
   if (result.code !== 0) {
     throw new SetupError(
       `\`unity editors --installed --format json\` failed (exit ${result.code})${resultDetail(result)}`,
@@ -290,6 +580,12 @@ function editorRows(result: UnityResult): EditorRow[] {
 }
 
 function moduleRows(result: UnityResult): ModuleRow[] {
+  if (isUnsupportedCommand(result)) {
+    throw new SetupError(
+      'this Unity CLI does not support `install --list-modules`; the toolkit cannot verify the Editor modules.',
+      EXIT.CONFIG_ERROR,
+    );
+  }
   if (result.code !== 0) {
     throw new SetupError(
       `\`unity install <version> --list-modules --format json\` failed (exit ${result.code})${resultDetail(result)}`,
@@ -355,6 +651,12 @@ async function installEditor(
     changeset: ctx.config.unity.editor.changeset ?? undefined,
     acceptEula: true,
   });
+  if (isUnsupportedCommand(result)) {
+    throw new SetupError(
+      'this Unity CLI does not support `install`; install the Editor with the Hub or upgrade the CLI.',
+      EXIT.CONFIG_ERROR,
+    );
+  }
   if (result.code !== 0) {
     throw new SetupError(
       `\`${installCommand(version, modules, ctx.config.unity.editor.childModules)}\` failed (exit ${result.code})${resultDetail(result)}`,
@@ -406,6 +708,8 @@ export interface LicenseStatusSummary {
   detail: string;
   licenses: string[];
   floatingServer: string | null;
+  /** True when this CLI does not know `license status`. */
+  unsupported: boolean;
 }
 
 /**
@@ -416,6 +720,7 @@ export interface LicenseStatusSummary {
  */
 export async function checkLicense(ctx: CoreContext): Promise<LicenseStatusSummary> {
   const result = await unityLicenseStatus(unityBaseOptions(ctx));
+  const unsupported = isUnsupportedCommand(result);
   const data = asObject(result.json?.data);
   const active = data?.active === true;
 
@@ -435,11 +740,13 @@ export async function checkLicense(ctx: CoreContext): Promise<LicenseStatusSumma
     ? licenses.length > 0
       ? licenses.join(', ')
       : 'active'
-    : result.code !== 0
-      ? `exit ${result.code}${resultDetail(result)}`
-      : 'no active license';
+    : unsupported
+      ? 'this Unity CLI does not support `license status`'
+      : result.code !== 0
+        ? `exit ${result.code}${resultDetail(result)}`
+        : 'no active license';
 
-  return { active, detail, licenses, floatingServer };
+  return { active, detail, licenses, floatingServer, unsupported };
 }
 
 function licenseActivationHint(ctx: CoreContext): string {
@@ -494,24 +801,63 @@ export function describeGitFailures(
 
 // --- The preflight --------------------------------------------------------------
 
+function normaliseSetupInput(input: SetupInput): SetupOptions {
+  return Array.isArray(input) ? { requiredModules: input } : input;
+}
+
+/**
+ * The command owns its module requirement. An explicit `requiredModules`
+ * override always wins; otherwise a build derives from `config.build.target`
+ * and a test from the configured test modes. No command means no module
+ * requirement — the spec's version-only check.
+ */
+function requiredModulesFor(ctx: CoreContext, options: SetupOptions): string[] {
+  if (options.requiredModules !== undefined) {
+    return unique(options.requiredModules);
+  }
+  if (options.command === 'build') {
+    return unique(modulesForBuildTarget(ctx.config.build.target));
+  }
+  if (options.command === 'test') {
+    return unique(ctx.config.test.modes.flatMap((mode) => modulesForTestMode(mode)));
+  }
+  return [];
+}
+
 /**
  * Resolves the CLI identity, then the Editor version and modules, then terms,
  * the doctor report, the licence precondition and the private-git preflight.
  *
- * `requiredModules` belongs to the **invoked command**: a test run passes the
- * test platform's modules, a build its target's modules, and a command with no
- * module requirement passes none (the default). The core never installs
- * silently: a missing Editor or module always requires
+ * The module requirement belongs to the **invoked command**:
+ * `setup(ctx, { command: 'build' })` derives it from `config.build.target`,
+ * `{ command: 'test' }` checks no platform module, and `setup(ctx)` checks only
+ * the Editor version. `requiredModules` is an explicit override.
+ *
+ * The core never installs silently: a missing Editor or module always requires
  * `unity.editor.acceptEula: true`, and `--allow-install` is never sent.
  */
 export async function setup(
   ctx: CoreContext,
-  requiredModules: string[] = [],
+  input: SetupInput = {},
 ): Promise<SetupResult> {
+  const options = normaliseSetupInput(input);
   const identity = await resolveCliIdentity(ctx);
+
+  // The same gate as `doctor`: a broken host fails setup before a multi-gigabyte
+  // install or an Editor launch.
+  const environmentFailures = coreEnvironmentChecks(ctx).filter(isBlockingFailure);
+  if (environmentFailures.length > 0) {
+    throw new SetupError(
+      `preflight failed: ${environmentFailures
+        .map((check) => `${check.id}: ${check.message}`)
+        .join('; ')}`,
+      EXIT.CONFIG_ERROR,
+    );
+  }
+
   const editorVersion = resolveEditorVersion(ctx);
 
-  const required = unique(requiredModules);
+  const required = requiredModulesFor(ctx, options);
   const configuredModules = ctx.config.unity.editor.modules;
   const installModules = unique([...configuredModules, ...required]);
   const childModules = ctx.config.unity.editor.childModules;
@@ -557,6 +903,12 @@ export async function setup(
 
   if (ctx.config.unity.editor.terms) {
     const terms = await unityTermsAccept(unityBaseOptions(ctx), editorVersion);
+    if (isUnsupportedCommand(terms)) {
+      throw new SetupError(
+        'this Unity CLI does not support `terms accept`; the Editor terms cannot be accepted with this CLI.',
+        EXIT.CONFIG_ERROR,
+      );
+    }
     if (terms.code !== 0) {
       throw new SetupError(
         `\`unity terms accept ${editorVersion} --yes\` failed (exit ${terms.code})${resultDetail(terms)}`,
@@ -566,6 +918,12 @@ export async function setup(
   }
 
   const doctorResult = await unityDoctorCi(unityBaseOptions(ctx));
+  if (isUnsupportedCommand(doctorResult)) {
+    throw new SetupError(
+      'this Unity CLI does not support `doctor --ci`; upgrade the CLI before running this pipeline.',
+      EXIT.CONFIG_ERROR,
+    );
+  }
   const doctor = evaluateUnityDoctor(doctorResult);
   if (!doctor.reportOk) {
     throw new SetupError(
@@ -584,6 +942,12 @@ export async function setup(
   }
 
   const license = await checkLicense(ctx);
+  if (license.unsupported) {
+    throw new SetupError(
+      'this Unity CLI does not support `license status`; the toolkit cannot verify the licence precondition.',
+      EXIT.CONFIG_ERROR,
+    );
+  }
   if (!license.active) {
     if (ctx.config.license.mode === 'none') {
       throw new SetupError(

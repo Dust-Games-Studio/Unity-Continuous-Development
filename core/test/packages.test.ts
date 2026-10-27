@@ -11,6 +11,11 @@ import {
   type GitDependency,
 } from '../src/packages/deps.js';
 import { preflightGitDependencies } from '../src/packages/git.js';
+import {
+  BUILD_TARGET_MODULES,
+  modulesForBuildTarget,
+  modulesForTestMode,
+} from '../src/packages/modules.js';
 
 const mocks = vi.hoisted(() => ({
   spawnProcess: vi.fn(),
@@ -249,3 +254,38 @@ describe('preflightGitDependencies', () => {
     expect(result?.detail).toMatch(/credentials/);
   });
 });
+
+describe('modulesForBuildTarget', () => {
+  it('maps every documented build target to its Hub module ids', () => {
+    expect(modulesForBuildTarget('StandaloneWindows64')).toEqual([]);
+    expect(modulesForBuildTarget('StandaloneLinux64')).toEqual(['linux-il2cpp']);
+    expect(modulesForBuildTarget('StandaloneOSX')).toEqual(['mac-mono']);
+    expect(modulesForBuildTarget('Android')).toEqual(['android', 'android-sdk-ndk-tools']);
+    expect(modulesForBuildTarget('iOS')).toEqual(['ios']);
+    expect(modulesForBuildTarget('WebGL')).toEqual(['webgl']);
+    expect(modulesForBuildTarget('tvOS')).toEqual(['appletv']);
+    expect(modulesForBuildTarget('visionOS')).toEqual(['visionos']);
+    expect(modulesForBuildTarget('WindowsStoreApps')).toEqual([
+      'universal-windows-platform',
+    ]);
+    expect(modulesForBuildTarget('LinuxServer')).toEqual(['linux-server']);
+    expect(modulesForBuildTarget('MacServer')).toEqual(['mac-server']);
+  });
+
+  it('returns an empty list for an unknown target instead of throwing', () => {
+    expect(modulesForBuildTarget('PlayStation9')).toEqual([]);
+  });
+
+  it('returns a copy, so a caller cannot mutate the table', () => {
+    const modules = modulesForBuildTarget('Android');
+    modules.push('mutated');
+    expect(BUILD_TARGET_MODULES['Android']).toEqual(['android', 'android-sdk-ndk-tools']);
+  });
+
+  it('requires no platform module for EditMode or PlayMode', () => {
+    expect(modulesForTestMode('EditMode')).toEqual([]);
+    expect(modulesForTestMode('PlayMode')).toEqual([]);
+    expect(modulesForTestMode('UnknownMode')).toEqual([]);
+  });
+});
+

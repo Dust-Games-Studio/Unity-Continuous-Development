@@ -28,6 +28,7 @@ export const ENV_KEYS: Record<string, string> = {
   UNITYCI_ANNOTATIONS: 'output.annotations',
   UNITYCI_CI: 'output.ci',
   UNITYCI_PACKAGES_PREFLIGHT: 'packages.preflight',
+  UNITYCI_DOCTOR_MIN_FREE_BYTES: 'doctor.minFreeBytes',
 };
 
 /**

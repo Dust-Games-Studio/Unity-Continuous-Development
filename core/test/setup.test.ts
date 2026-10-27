@@ -66,6 +66,18 @@ function moduleRow(id: string, isInstalled: boolean): unknown {
   return { id, name: id, status: isInstalled ? 'installed' : 'available', aliases: [], isInstalled };
 }
 
+function unsupportedResult(command: string) {
+  return {
+    code: 2,
+    stdout: '',
+    stderr: `error: unknown command '${command}'`,
+    json: {
+      success: false,
+      errors: [{ code: 'UNKNOWN_COMMAND', message: `unknown command '${command}'` }],
+    },
+  };
+}
+
 function defaultDoctor(): unknown {
   return {
     verdict: 'pass',
@@ -529,5 +541,124 @@ describe('setupCommand', () => {
     expect(mocks.spawnProcess).toHaveBeenCalledTimes(1);
     expect(lines.join('')).toContain('https://github.com/example/private.git');
     expect(lines.join('')).toContain('not fetchable');
+  });
+
+  it('derives the required modules from config.build.target for a build', async () => {
+    scenario.modules = [
+      moduleRow('android', true),
+      moduleRow('android-sdk-ndk-tools', false),
+    ];
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.build.target = 'Android';
+      config.unity.editor.terms = false;
+      config.unity.editor.acceptEula = false;
+      config.unity.editor.childModules = false;
+    });
+
+    const code = await setupCommand(ctx, { command: 'build' });
+
+    expect(code).toBe(64);
+    expect(calls).toContainEqual([
+      'install',
+      EDITOR,
+      '--list-modules',
+      '--format',
+      'json',
+    ]);
+    expect(lines.join('')).toContain('android-sdk-ndk-tools');
+  });
+
+  it('checks only the Editor version for a build target that needs no module', async () => {
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.build.target = 'StandaloneWindows64';
+      config.unity.editor.terms = false;
+    });
+
+    const code = await setupCommand(ctx, { command: 'build' });
+
+    expect(code).toBe(0);
+    expect(calls.some((args) => args.includes('--list-modules'))).toBe(false);
+  });
+
+  it('checks no platform module for a test run', async () => {
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.test.modes = ['EditMode', 'PlayMode'];
+      config.unity.editor.terms = false;
+    });
+
+    const code = await setupCommand(ctx, { command: 'test' });
+
+    expect(code).toBe(0);
+    expect(calls.some((args) => args.includes('--list-modules'))).toBe(false);
+  });
+
+  it('lets an explicit requiredModules override win over the config derivation', async () => {
+    scenario.modules = [moduleRow('webgl', false)];
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.build.target = 'StandaloneWindows64';
+      config.unity.editor.terms = false;
+      config.unity.editor.acceptEula = false;
+      config.unity.editor.childModules = false;
+    });
+
+    const code = await setupCommand(ctx, {
+      command: 'build',
+      requiredModules: ['webgl'],
+    });
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toContain('webgl');
+    expect(calls.some((args) => args.includes('--list-modules'))).toBe(true);
+  });
+
+  it('fails before the Editor check when disk space is below the floor', async () => {
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.doctor.minFreeBytes = Number.MAX_SAFE_INTEGER;
+      config.unity.editor.terms = false;
+    });
+
+    const code = await setupCommand(ctx);
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toContain('disk-space');
+    expect(lines.join('')).toContain('below the configured floor');
+    expect(calls.some((args) => args[0] === 'editors')).toBe(false);
+  });
+
+  it('reports an unsupported editors command instead of a generic failure', async () => {
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.unity.editor.terms = false;
+    });
+    mocks.runUnity.mockImplementation(async (options: { args: string[] }) => {
+      if (options.args[0] === 'editors') return unsupportedResult('editors');
+      return responder(options.args);
+    });
+
+    const code = await setupCommand(ctx);
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toContain('does not support `editors --installed`');
+  });
+
+  it('reports an unsupported license status command instead of a generic failure', async () => {
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.unity.editor.terms = false;
+    });
+    mocks.runUnity.mockImplementation(async (options: { args: string[] }) => {
+      if (options.args[0] === 'license') return unsupportedResult('license');
+      return responder(options.args);
+    });
+
+    const code = await setupCommand(ctx);
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toContain('does not support `license status`');
   });
 });

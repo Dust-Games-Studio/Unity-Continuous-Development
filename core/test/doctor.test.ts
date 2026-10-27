@@ -6,7 +6,9 @@ import { doctorCommand } from '../src/commands/doctor.js';
 import { DEFAULT_CONFIG, type Config } from '../src/config/schema.js';
 import type { CoreContext } from '../src/context.js';
 import { createLogger } from '../src/logger.js';
+import { diskSpaceCheck, glibcCheck } from '../src/lifecycle/setup.js';
 import { createRedactor } from '../src/redact.js';
+import { isUnsupportedCommand } from '../src/unity/cli.js';
 
 const mocks = vi.hoisted(() => ({
   runUnity: vi.fn(),
@@ -136,7 +138,7 @@ function reportPath(project: string): string {
 
 function readReport(project: string): {
   verdict: string;
-  checks: { id: string; status: string; blocking: boolean }[];
+  checks: { id: string; status: string; code: string; blocking: boolean; message: string }[];
   gitDependencies: { name: string; url: string; host: string; reachable: boolean }[];
 } {
   return JSON.parse(readFileSync(reportPath(project), 'utf8')) as never;
@@ -144,6 +146,18 @@ function readReport(project: string): {
 
 function gitOk() {
   return { code: 0, stdout: '', stderr: '', rawStdout: '', rawStderr: '' };
+}
+
+function unsupportedResult(command: string) {
+  return {
+    code: 2,
+    stdout: '',
+    stderr: `error: unknown command '${command}'`,
+    json: {
+      success: false,
+      errors: [{ code: 'UNKNOWN_COMMAND', message: `unknown command '${command}'` }],
+    },
+  };
 }
 
 beforeEach(() => {
@@ -176,6 +190,10 @@ describe('doctorCommand', () => {
     expect(code).toBe(0);
     expect(readReport(project).verdict).toBe('pass');
     expect(lines.join('')).toContain('PASS machine');
+    const report = readReport(project);
+    for (const id of ['cli-version', 'glibc', 'disk-space', 'projects-verify', 'license']) {
+      expect(report.checks.some((check) => check.id === id)).toBe(true);
+    }
   });
 
   it('exits non-zero when a blocking check fails', async () => {
@@ -261,9 +279,13 @@ describe('doctorCommand', () => {
     expect(code).toBe(0);
     expect(lines.join('')).toContain('1.0.0-beta.14');
     expect(lines.join('')).toMatch(/newer than the tested ceiling/);
+    const capability = readReport(project).checks.find((check) => check.id === 'cli-version');
+    expect(capability).toMatchObject({ status: 'info', blocking: false });
+    expect(capability?.message).toContain('1.0.0-beta.20');
+    expect(capability?.message).toContain('cli-commit-abc');
   });
 
-  it('fails with exit 64 when the CLI is older than the tested floor', async () => {
+  it('fails with exit 64 when the CLI is older than the tested floor, and records it', async () => {
     scenario.version = '1.0.0-beta.8';
     const project = makeProject();
 
@@ -271,6 +293,13 @@ describe('doctorCommand', () => {
 
     expect(code).toBe(64);
     expect(lines.join('')).toContain('1.0.0-beta.9');
+    const capability = readReport(project).checks.find((check) => check.id === 'cli-version');
+    expect(capability).toMatchObject({
+      status: 'fail',
+      code: 'CLI_VERSION_TOO_OLD',
+      blocking: true,
+    });
+    expect(readReport(project).verdict).toBe('fail');
   });
 
   it('records the CLI version, channel and commit on the context', async () => {
@@ -393,5 +422,152 @@ describe('doctorCommand', () => {
     expect(code).toBe(0);
     const license = readReport(project).checks.find((check) => check.id === 'license');
     expect(license).toMatchObject({ status: 'info', blocking: false });
+  });
+
+  it('reports an unsupported doctor command as a clear named check', async () => {
+    const project = makeProject();
+    mocks.runUnity.mockImplementation(async (options: { args: string[] }) => {
+      if (options.args[0] === 'doctor') return unsupportedResult('doctor');
+      return responder(options.args);
+    });
+
+    const code = await doctorCommand(makeContext(project));
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toContain('does not support `doctor --ci`');
+    expect(
+      readReport(project).checks.find((check) => check.id === 'unity-doctor'),
+    ).toMatchObject({ status: 'fail', code: 'UNSUPPORTED_COMMAND', blocking: true });
+  });
+
+  it('reports an unsupported projects verify command as a clear named check', async () => {
+    const project = makeProject();
+    mocks.runUnity.mockImplementation(async (options: { args: string[] }) => {
+      if (options.args[0] === 'projects') return unsupportedResult('projects');
+      return responder(options.args);
+    });
+
+    const code = await doctorCommand(makeContext(project));
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toContain('does not support `projects verify --strict`');
+    expect(
+      readReport(project).checks.find((check) => check.id === 'projects-verify'),
+    ).toMatchObject({ code: 'UNSUPPORTED_COMMAND', blocking: true });
+  });
+
+  it('reports an unsupported license status command as a clear named check', async () => {
+    const project = makeProject();
+    mocks.runUnity.mockImplementation(async (options: { args: string[] }) => {
+      if (options.args[0] === 'license') return unsupportedResult('license');
+      return responder(options.args);
+    });
+
+    const code = await doctorCommand(makeContext(project));
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toContain('does not support `license status`');
+    expect(
+      readReport(project).checks.find((check) => check.id === 'license'),
+    ).toMatchObject({ status: 'fail', code: 'UNSUPPORTED_COMMAND', blocking: true });
+  });
+});
+
+describe('core environment checks', () => {
+  it('reports glibc as info on Windows and macOS, and fails on Linux below 2.34', () => {
+    expect(glibcCheck('win32')).toMatchObject({ status: 'info', blocking: false });
+    expect(glibcCheck('darwin')).toMatchObject({ status: 'info', blocking: false });
+
+    const tooOld = glibcCheck('linux', '2.31');
+    expect(tooOld).toMatchObject({ status: 'fail', blocking: true, code: 'GLIBC_TOO_OLD' });
+    expect(tooOld.message).toContain('2.34');
+
+    // Numeric, not string ordering: 2.9 is older than 2.34.
+    expect(glibcCheck('linux', '2.9')).toMatchObject({ status: 'fail', blocking: true });
+    expect(glibcCheck('linux', '2.34')).toMatchObject({ status: 'pass', blocking: false });
+    expect(glibcCheck('linux', '3.0')).toMatchObject({ status: 'pass', blocking: false });
+    expect(glibcCheck('linux', null)).toMatchObject({ status: 'info', blocking: false });
+  });
+
+  it('reports disk space as info when free space cannot be determined', () => {
+    const ctx = makeContext(makeProject());
+    const check = diskSpaceCheck(ctx, () => {
+      throw new Error('statfs unavailable');
+    });
+
+    expect(check).toMatchObject({ id: 'disk-space', status: 'info', blocking: false });
+    expect(check.message).toContain('statfs unavailable');
+    expect(check.message).toContain('was not checked');
+  });
+
+  it('fails disk space below the configured floor and passes at or above it', () => {
+    const ctx = makeContext(makeProject(), (config) => {
+      config.doctor.minFreeBytes = 1024;
+    });
+
+    const low = diskSpaceCheck(ctx, () => ({ bsize: 1024, bavail: 0 }));
+    expect(low).toMatchObject({ status: 'fail', blocking: true, code: 'DISK_SPACE_LOW' });
+    expect(low.message).toContain('below the configured floor');
+
+    const ok = diskSpaceCheck(ctx, () => ({ bsize: 1024, bavail: 2 }));
+    expect(ok).toMatchObject({ status: 'pass', blocking: false });
+    expect(ok.message).toContain('floor');
+  });
+
+  it('recognises only a missing command, never a genuine failure', () => {
+    expect(
+      isUnsupportedCommand({
+        code: 2,
+        stdout: '',
+        stderr: '',
+        json: {
+          success: false,
+          errors: [{ code: 'UNKNOWN_COMMAND', message: "unknown command 'doctor'" }],
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isUnsupportedCommand({
+        code: 2,
+        stdout: '',
+        stderr: "error: unknown command 'projects'",
+        json: null,
+      }),
+    ).toBe(true);
+
+    expect(
+      isUnsupportedCommand({
+        code: 6,
+        stdout: '',
+        stderr: 'error: compilation failed',
+        json: {
+          success: false,
+          errors: [{ code: 'COMPILE_ERROR', message: 'compilation failed' }],
+        },
+      }),
+    ).toBe(false);
+
+    expect(
+      isUnsupportedCommand({
+        code: 2,
+        stdout: '',
+        stderr: 'error: unknown option --format',
+        json: null,
+      }),
+    ).toBe(false);
+
+    expect(
+      isUnsupportedCommand({
+        code: 2,
+        stdout: '',
+        stderr: 'error: unknown command line argument --format',
+        json: null,
+      }),
+    ).toBe(false);
+
+    expect(
+      isUnsupportedCommand({ code: 0, stdout: '', stderr: '', json: null }),
+    ).toBe(false);
   });
 });

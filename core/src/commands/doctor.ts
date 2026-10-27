@@ -5,25 +5,24 @@ import { EXIT } from '../exit-codes.js';
 import {
   SetupError,
   checkLicense,
+  coreEnvironmentChecks,
   evaluateUnityDoctor,
   loadGitDependencies,
   refuseEmbeddedCredentials,
   resolveCliIdentity,
   unityBaseOptions,
+  type PreflightCheck,
 } from '../lifecycle/setup.js';
 import { preflightGitDependencies } from '../packages/git.js';
 import type { GitDependency } from '../packages/deps.js';
-import { unityDoctorCi, unityProjectsVerify } from '../unity/cli.js';
+import {
+  isUnsupportedCommand,
+  unityDoctorCi,
+  unityProjectsVerify,
+} from '../unity/cli.js';
 import type { UnityResult } from '../unity/exec.js';
 
-interface DoctorCheck {
-  id: string;
-  status: string;
-  code: string;
-  blocking: boolean;
-  message: string;
-  source: 'unity' | 'core';
-}
+type DoctorCheck = PreflightCheck;
 
 interface GitDependencyReport {
   name: string;
@@ -110,40 +109,61 @@ function writeReport(ctx: CoreContext, report: unknown): string {
 /**
  * `unityci doctor`: the preflight gate (R11).
  *
- * It consumes Unity's own report, adds the core's checks (CLI identity,
- * `projects verify`, the mode-aware licence check and private-git
- * reachability), writes `<output.dir>/logs/doctor.json` and prints one line
- * per check. It is pure: it activates and returns no licence.
+ * It consumes Unity's own report, adds the core's checks (CLI capability matrix,
+ * glibc and disk space on the host, `projects verify`, the mode-aware licence
+ * check and private-git reachability), writes `<output.dir>/logs/doctor.json`
+ * and prints one line per check. It is pure: it activates and returns no
+ * licence.
  */
 export async function doctorCommand(ctx: CoreContext): Promise<number> {
   try {
-    await resolveCliIdentity(ctx);
+    // `doctor` records a below-floor CLI as a blocking check in its report
+    // instead of aborting before the report exists.
+    await resolveCliIdentity(ctx, { throwBelowFloor: false });
     const base = unityBaseOptions(ctx);
-    const checks: DoctorCheck[] = [];
+    const checks: DoctorCheck[] = [...coreEnvironmentChecks(ctx)];
+    let unityVerdict: 'pass' | 'fail' | 'unknown' = 'unknown';
 
     const doctorResult = await unityDoctorCi(base);
-    const doctor = evaluateUnityDoctor(doctorResult);
-    if (!doctor.reportOk) {
-      const detail = resultDetail(doctorResult);
+    if (isUnsupportedCommand(doctorResult)) {
       checks.push({
-        id: 'doctor-report',
+        id: 'unity-doctor',
         status: 'fail',
-        code: 'CORE_DOCTOR_REPORT_MISSING',
+        code: 'UNSUPPORTED_COMMAND',
         blocking: true,
-        message:
-          '`unity doctor --ci --format json` did not return a machine-readable report' +
-          (detail === '' ? ` (exit ${doctorResult.code})` : ` (exit ${doctorResult.code}): ${detail}`),
+        message: 'this Unity CLI does not support `doctor --ci`',
         source: 'core',
       });
     } else {
-      for (const check of doctor.checks) {
-        checks.push({ ...check, source: 'unity' });
+      const doctor = evaluateUnityDoctor(doctorResult);
+      unityVerdict = doctor.verdict;
+      if (!doctor.reportOk) {
+        const detail = resultDetail(doctorResult);
+        checks.push({
+          id: 'doctor-report',
+          status: 'fail',
+          code: 'CORE_DOCTOR_REPORT_MISSING',
+          blocking: true,
+          message:
+            '`unity doctor --ci --format json` did not return a machine-readable report' +
+            (detail === '' ? ` (exit ${doctorResult.code})` : ` (exit ${doctorResult.code}): ${detail}`),
+          source: 'core',
+        });
+      } else {
+        for (const check of doctor.checks) {
+          checks.push({ ...check, source: 'unity' });
+        }
       }
     }
 
-    const verify = evaluateVerify(
-      await unityProjectsVerify(base, ctx.projectPath),
-    );
+    const verifyResult = await unityProjectsVerify(base, ctx.projectPath);
+    const verify: VerifyEvaluation = isUnsupportedCommand(verifyResult)
+      ? {
+          ok: false,
+          code: 'UNSUPPORTED_COMMAND',
+          detail: 'this Unity CLI does not support `projects verify --strict`',
+        }
+      : evaluateVerify(verifyResult);
     checks.push({
       id: 'projects-verify',
       status: verify.ok ? 'pass' : 'fail',
@@ -155,21 +175,31 @@ export async function doctorCommand(ctx: CoreContext): Promise<number> {
 
     const license = await checkLicense(ctx);
     const licenseFails =
-      !license.active && ctx.config.license.mode === 'none';
+      !license.active && !license.unsupported && ctx.config.license.mode === 'none';
     checks.push({
       id: 'license',
-      status: license.active ? 'pass' : licenseFails ? 'fail' : 'info',
-      code: license.active
-        ? 'OK'
-        : licenseFails
-          ? 'LICENSE_NOT_ACTIVE'
-          : 'LICENSE_INACTIVE_REPORTED',
-      blocking: licenseFails,
-      message: license.active
-        ? `active: ${license.detail}`
-        : licenseFails
-          ? `no active Unity license (${license.detail}); a run with license.mode: none requires one`
-          : `no active Unity license yet (${license.detail}); license.mode "${ctx.config.license.mode}" activates it in the lifecycle`,
+      status: license.unsupported
+        ? 'fail'
+        : license.active
+          ? 'pass'
+          : licenseFails
+            ? 'fail'
+            : 'info',
+      code: license.unsupported
+        ? 'UNSUPPORTED_COMMAND'
+        : license.active
+          ? 'OK'
+          : licenseFails
+            ? 'LICENSE_NOT_ACTIVE'
+            : 'LICENSE_INACTIVE_REPORTED',
+      blocking: license.unsupported || licenseFails,
+      message: license.unsupported
+        ? 'this Unity CLI does not support `license status`'
+        : license.active
+          ? `active: ${license.detail}`
+          : licenseFails
+            ? `no active Unity license (${license.detail}); a run with license.mode: none requires one`
+            : `no active Unity license yet (${license.detail}); license.mode "${ctx.config.license.mode}" activates it in the lifecycle`,
       source: 'core',
     });
 
@@ -245,7 +275,7 @@ export async function doctorCommand(ctx: CoreContext): Promise<number> {
         commit: ctx.cliCommit,
       },
       verdict,
-      unityVerdict: doctor.verdict,
+      unityVerdict,
       checks,
       projectsVerify: { ok: verify.ok, detail: verify.detail },
       license: {
