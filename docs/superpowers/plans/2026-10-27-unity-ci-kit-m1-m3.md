@@ -194,7 +194,7 @@ Expected: no output (exit 1 from grep is the pass condition).
   - `core/src/exit-codes.ts` → `export const EXIT = { SUCCESS: 0, ERROR: 1, BAD_ARGS: 2, AUTH_ERROR: 3, NEEDS_CONFIG: 4, COMMAND_FAILED: 6, NETWORK_UNREACHABLE: 7, TESTS_FAILED: 8, NOT_FOUND: 11, EDITOR_UNREACHABLE: 12, REMOTE_COMMAND_FAILED: 13, TIMEOUT: 14, CONFIG_ERROR: 64, INTERNAL_ERROR: 65, INTERRUPTED: 130, TERMINATED: 143 } as const`, `export type ExitCode = (typeof EXIT)[keyof typeof EXIT]`, `export function describeExit(code: number): string`.
   - `core/src/redact.ts` → `export interface Redactor { register(value: string | undefined | null): void; redact(text: string): string; readonly secrets: string[] }`, `export function createRedactor(): Redactor`.
   - `core/src/logger.ts` → `export interface Logger { info(msg: string): void; warn(msg: string): void; error(msg: string): void; debug(msg: string): void }`, `export function createLogger(opts: { redactor: Redactor; level?: 'debug'|'info'|'warn'|'error'; sink?: (line: string) => void }): Logger`. Every line the logger writes passes through `redactor.redact()`.
-  - `core/src/args.ts` → `export function parseArgs(argv: string[]): { command: string[]; flags: Record<string, string | boolean | string[]> }` built on `node:util`'s `parseArgs`, with the global flags `--project-path/-p`, `--config`, `--output-dir`, `--annotations`, `--ci/--no-ci`, `--verbose`, `--quiet`, `--help/-h`, `--version/-v`.
+  - `core/src/args.ts` → `export interface ParseResult { command: string[]; flags: Record<string, string | boolean | string[]>; passthrough: string[] }`, `export interface OptionSpec { type: 'string' | 'boolean'; short?: string; multiple?: boolean }`, `export function parseArgs(argv: string[], extraOptions?: Record<string, OptionSpec>): ParseResult` built on `node:util`'s `parseArgs` in a **single strict pass**. The declared schema is the global flags `--project-path/-p`, `--config`, `--output-dir`, `--annotations`, `--ci`/`--no-ci`, `--verbose`, `--quiet`, `--help/-h`, `--version/-v`, `--json`; `extraOptions` is the extension point later tasks use to declare command-specific flags (GC14's "flags beat env beat file"). **Unknown options are a usage error — there is no open set.** Tokens after a literal `--` are collected in `passthrough` and are never parsed as options.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -273,6 +273,8 @@ Fix the root `.gitignore` at the same time. It carries a NuGet rule `**/[Pp]acka
 !**/[Pp]ackages/manifest.json
 !**/[Pp]ackages/packages-lock.json
 node_modules/
+dist/
+*.tsbuildinfo
 ci-output/
 .superpowers/
 ```
