@@ -19,6 +19,12 @@ export interface CoreContext {
   binary: string;
   /** Milliseconds since the epoch, for duration reporting. */
   startedAt: number;
-  /** Filled in by `setup` from `unity version --format json`. */
+  /**
+   * The running Unity CLI's identity, filled in by `setup` (and `doctor`) from
+   * `unity version --format json`. `summary.json` records all three so a
+   * failure can be traced to an exact CLI build (R16).
+   */
   cliVersion: string | null;
+  cliChannel: string | null;
+  cliCommit: string | null;
 }

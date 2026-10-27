@@ -1,0 +1,10 @@
+{
+  "dependencies": {
+    "com.unity.ugui": "1.0.0",
+    "com.unity.modules.ai": "1.0.0",
+    "com.example.public": "https://github.com/example/public.git",
+    "com.example.ssh": "ssh://git@github.com/example/ssh.git",
+    "com.example.scp": "git@github.com:example/scp.git",
+    "com.example.registry": "https://packages.unity.com/com.example.registry"
+  }
+}

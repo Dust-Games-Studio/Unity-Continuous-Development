@@ -176,3 +176,20 @@ export function unityProjectsVerify(
 export function unityEditorsInstalled(opts: UnityBaseOptions): Promise<UnityResult> {
   return run(opts, ['editors', '--installed', '--format', 'json']);
 }
+
+/**
+ * `unity install <version> --list-modules --format json`: the authoritative
+ * answer to "is module X installed for editor V".
+ *
+ * Each row carries the lowercase module id, its display `name`, `status`,
+ * `aliases` and the `isInstalled` boolean. The `modules` string on an
+ * `editors --installed` row is a different namespace (display names such as
+ * `"Android, Android SDK & NDK Tools, Linux"`), so it must never be compared
+ * against the ids in `unity.editor.modules`.
+ */
+export function unityModulesList(
+  opts: UnityBaseOptions,
+  version: string,
+): Promise<UnityResult> {
+  return run(opts, ['install', version, '--list-modules', '--format', 'json']);
+}
