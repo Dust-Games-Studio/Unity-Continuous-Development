@@ -45,6 +45,10 @@ describe('parseArgs', () => {
     const r = parseArgs(['run', '--mode', 'EditMode'], { mode: { type: 'string', multiple: true } });
     expect(r.flags.mode).toEqual(['EditMode']);
   });
+  it('keeps a multiple boolean option as booleans, not strings', () => {
+    const r = parseArgs(['run', '--verbose', '--verbose'], { verbose: { type: 'boolean', multiple: true } });
+    expect(r.flags.verbose).toEqual([true, true]);
+  });
   it('omits a multiple option that was not supplied', () => {
     const r = parseArgs(['run'], { mode: { type: 'string', multiple: true } });
     expect('mode' in r.flags).toBe(false);
