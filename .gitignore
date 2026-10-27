@@ -117,5 +117,6 @@ out/
 !**/[Pp]ackages/manifest.json
 !**/[Pp]ackages/packages-lock.json
 node_modules/
+dist/
+*.tsbuildinfo
 ci-output/
-.superpowers/

@@ -3,18 +3,19 @@ import { parseArgs as parseArgsUtil } from 'node:util';
 export interface ParseResult {
   command: string[];
   flags: Record<string, string | boolean | string[]>;
+  passthrough: string[];
 }
 
-type OptionConfig = {
+export interface OptionSpec {
   type: 'string' | 'boolean';
   short?: string;
   multiple?: boolean;
-};
+}
 
 /**
- * Flags every command understands. Command-specific flags are not listed here:
- * they are discovered per invocation (see `discoverCommandOptions`) so
- * subcommands can add their own without editing the global schema.
+ * Flags every command understands. Command-specific flags are declared by the
+ * caller through `extraOptions`; there is no open set, so a typo is always a
+ * usage error.
  */
 const GLOBAL_OPTIONS = {
   'project-path': { type: 'string', short: 'p' },
@@ -26,23 +27,22 @@ const GLOBAL_OPTIONS = {
   quiet: { type: 'boolean' },
   help: { type: 'boolean', short: 'h' },
   version: { type: 'boolean', short: 'v' },
-} as const satisfies Readonly<Record<string, OptionConfig>>;
+  json: { type: 'boolean' },
+} as const satisfies Readonly<Record<string, OptionSpec>>;
 
-export function parseArgs(argv: string[]): ParseResult {
-  // The open set: learn the command-specific flags from argv, then let the
-  // strict `parseArgs` pass below validate them alongside the global flags.
-  // A command flag is recognised by carrying a value (`--mode EditMode`,
-  // `--mode=EditMode`); a bare unknown flag is indistinguishable from a typo
-  // (`--nope`) and is therefore a usage error.
-  const options: Record<string, OptionConfig> = { ...GLOBAL_OPTIONS };
-  for (const [name, shape] of discoverCommandOptions(argv)) {
-    if (!shape.hasValue) throw new Error(`Unknown option '--${name}'`);
-    options[name] = { type: 'string', multiple: shape.repeated };
-  }
+export function parseArgs(
+  argv: string[],
+  extraOptions: Record<string, OptionSpec> = {},
+): ParseResult {
+  // Everything after the first `--` belongs to the child process (editor
+  // arguments and the like). It is never parsed as an option.
+  const separator = argv.indexOf('--');
+  const args = separator === -1 ? argv : argv.slice(0, separator);
+  const passthrough = separator === -1 ? [] : argv.slice(separator + 1);
 
   const parsed = parseArgsUtil({
-    args: argv,
-    options,
+    args,
+    options: { ...GLOBAL_OPTIONS, ...extraOptions },
     allowPositionals: true,
     allowNegative: true,
     strict: true,
@@ -51,41 +51,8 @@ export function parseArgs(argv: string[]): ParseResult {
   return {
     command: [...parsed.positionals],
     flags: normaliseFlags(parsed.values),
+    passthrough,
   };
-}
-
-interface CommandOptionShape {
-  hasValue: boolean;
-  repeated: boolean;
-}
-
-function discoverCommandOptions(argv: string[]): Map<string, CommandOptionShape> {
-  const discovered = new Map<string, CommandOptionShape>();
-
-  for (let index = 0; index < argv.length; index++) {
-    const token = argv[index];
-    // Everything after `--` is positional (editor arguments and the like).
-    if (token === '--') break;
-    if (!token.startsWith('--') || token === '--') continue;
-
-    const body = token.slice(2);
-    const equals = body.indexOf('=');
-    const name = equals === -1 ? body : body.slice(0, equals);
-
-    if (name in GLOBAL_OPTIONS) continue;
-    if (name.startsWith('no-') && name.slice(3) in GLOBAL_OPTIONS) continue;
-
-    const next = argv[index + 1];
-    const hasValue = equals !== -1 || (next !== undefined && !next.startsWith('-'));
-
-    const previous = discovered.get(name);
-    discovered.set(name, {
-      hasValue: hasValue || previous?.hasValue === true,
-      repeated: previous !== undefined,
-    });
-  }
-
-  return discovered;
 }
 
 function normaliseFlags(values: Record<string, unknown>): Record<string, string | boolean | string[]> {
