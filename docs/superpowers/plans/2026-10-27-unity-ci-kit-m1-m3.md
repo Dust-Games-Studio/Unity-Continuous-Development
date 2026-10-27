@@ -727,17 +727,27 @@ git commit -m "feat: add license activate and return lifecycle"
 
 **Interfaces:**
 - Consumes: `Config['retry']`.
-- Produces: `core/src/lifecycle/retry.ts` → `export interface RetryPolicy { onExitCodes: number[]; maxAttempts: number; backoffMs: number }`, `export function shouldRetry(policy: RetryPolicy, code: number, attempt: number): boolean`, `export async function withRetry<T>(fn: (attempt: number) => Promise<T>, policy: RetryPolicy, onRetry?: (info: { attempt: number; code: number; waitMs: number }) => void): Promise<{ value: T; attempts: number; code: number }>`.
+- Produces: `core/src/lifecycle/retry.ts` → `export interface RetryPolicy { onExitCodes: number[]; maxAttempts: number; backoffMs: number }`, `export function shouldRetry(policy: RetryPolicy, code: number, attempt: number): boolean`, `export async function withRetry<T>(fn: (attempt: number) => Promise<{ value: T; code: number }>, policy: RetryPolicy, onRetry?: (info: { attempt: number; code: number; waitMs: number }) => void): Promise<{ value: T; attempts: number; code: number }>`.
+
+  **The exit code is part of the attempt's outcome, not a rejection.** `fn` resolves with `{ value, code }` — the Unity exit code and whatever the caller wants to keep — and `withRetry` decides whether to try again from that `code`. A **rejection** from `fn` is an *internal* failure (a bug in the toolkit, a thrown error), not a Unity exit code: `withRetry` rethrows it immediately and never retries it. Retrying an internal error just reproduces it more slowly.
+
+  `withRetry` returns the **last** attempt's `value` and `code` together with the number of attempts made. It does not throw when the run ends in a Unity failure — the caller needs that exit code to build `summary.json` (`unityExitCode`) and to derive the status, so turning it into an exception would throw away the one number that matters.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```ts
 it('retries exit code 7 up to maxAttempts', () => { /* 2 attempts when 7 persists */ });
-it('never retries exit code 8', () => { /* 1 attempt */ });
-it('never retries exit code 6', () => { /* 1 attempt */ });
+it('never retries exit code 8', () => { /* 1 attempt, even with 8 in onExitCodes */ });
+it('never retries exit code 6 by default', () => { /* 6 is not in the default onExitCodes */ });
+it('retries exit code 6 once when it is opted in', () => { /* maxAttempts 2 → 2 attempts */ });
 it('does not retry when the attempt count is exhausted', () => { /* exactly maxAttempts calls */ });
-it('waits backoffMs between attempts', () => { /* use fake timers */ });
+it('waits backoffMs before the second attempt', () => { /* fake timers */ });
+it('doubles the wait before each further attempt', () => { /* backoffMs, then 2x backoffMs */ });
+it('caps the wait at 60 seconds', () => { /* many attempts */ });
 it('returns the last attempt value and the number of attempts', () => { /* attempts === 2 */ });
+it('returns the last attempt exit code', () => { /* code === 7 */ });
+it('rethrows a rejection from the attempt without retrying', () => { /* an internal error is not a Unity exit code */ });
+it('calls onRetry with the attempt, the code and the wait', () => { /* */ });
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -747,9 +757,11 @@ Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement**
 
-`shouldRetry` returns `code !== 8 && policy.onExitCodes.includes(code) && attempt < policy.maxAttempts`. The `code !== 8` guard is unconditional (GC8) and is also enforced at config-validation time.
+`shouldRetry` returns `code !== 8 && policy.onExitCodes.includes(code) && attempt < policy.maxAttempts`. The `code !== 8` guard is unconditional (GC8) and is also enforced at config-validation time — exit 8 means "the tests ran and some failed", and re-running the same suite reproduces the same failures.
 
-`withRetry` calls `fn(attempt)` with a 1-based attempt number, and on a rejected result with a retryable code sleeps `backoffMs` and calls `onRetry`.
+`withRetry` calls `fn(attempt)` with a **1-based** attempt number. When the attempt resolves with a retryable `code`, it waits and calls `onRetry({ attempt, code, waitMs })`, then tries again. The wait before attempt *N+1* is `min(backoffMs * 2^(N-1), 60_000)` — the first wait is exactly `backoffMs`, and each further wait doubles, capped at one minute so a long pipeline cannot stall for hours. Implement the wait with `setTimeout`; the tests use `vi.useFakeTimers()` and `vi.advanceTimersByTimeAsync()`.
+
+**Exit 6 is opt-in and capped at one extra attempt.** Unity's own documentation is explicit that re-running an identical broken configuration reproduces the failure, so `6` may be added per pipeline — but `loadConfig` caps `retry.maxAttempts` at **2** whenever `6` is in `onExitCodes`, and the validator rejects `8`, `130` and `143` outright (GC8).
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
