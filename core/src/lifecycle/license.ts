@@ -77,11 +77,11 @@ export const LICENSE_RETURN_TIMEOUT_MS = 60_000;
  * caller (or a test) may pass a narrower set; the child inherits
  * `process.env` either way, so both sources are honoured.
  *
- * The value is trimmed. A CI secret written by `echo … >> $GITHUB_ENV` (or
- * pasted from a file) commonly carries a trailing newline: passing it on would
- * make `unity license activate` reject the serial, and registering the padded
- * form would leave the redactor unable to match the bare serial that Unity
- * echoes back.
+ * The value is trimmed. A secret written into a CI job's environment (or pasted
+ * from a file) commonly carries a trailing newline: passing it on would make
+ * `unity license activate` reject the serial, and registering the padded form
+ * would leave the redactor unable to match the bare serial that Unity echoes
+ * back.
  */
 function secretValue(ctx: CoreContext, name: string): string | null {
   const value = ctx.env[name] ?? process.env[name];

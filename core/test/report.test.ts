@@ -193,6 +193,28 @@ describe('JUnit conversion', () => {
     expect(existsSync(junitPath)).toBe(true);
     expect(readFileSync(junitPath, 'utf8')).toContain('<testsuites');
   });
+
+  it('only converts when the JUnit sibling is missing and never overwrites it', async () => {
+    const { ctx, testDir } = reportProject();
+    const nunitPath = join(testDir, 'EditMode.xml');
+    const junitPath = join(testDir, 'EditMode.junit.xml');
+    const originalNunit = readFileSync(nunitPath);
+    // What Unity's own converter wrote is authoritative (D8).
+    const unityJunit = Buffer.from(
+      '<?xml version="1.0"?><testsuites><!-- written by Unity --></testsuites>\n',
+    );
+    writeFileSync(junitPath, unityJunit);
+
+    expect(await reportCommand(ctx)).toBe(0);
+    expect(readFileSync(junitPath).equals(unityJunit)).toBe(true);
+    expect(readFileSync(nunitPath).equals(originalNunit)).toBe(true);
+
+    // With no JUnit sibling present, the core's fallback writes one.
+    rmSync(junitPath);
+    expect(await reportCommand(ctx)).toBe(0);
+    expect(existsSync(junitPath)).toBe(true);
+    expect(readFileSync(junitPath, 'utf8')).toContain('<testsuites');
+  });
 });
 
 describe('summary.json', () => {
@@ -336,6 +358,29 @@ describe('annotations', () => {
 });
 
 describe('report command', () => {
+  it('redacts a secret in the JUnit file it writes', async () => {
+    const secret = 's3cr3t-token';
+    const xml = `<test-run total="1" passed="0" failed="1" skipped="0" inconclusive="0">
+      <test-suite name="SecretTests">
+        <test-case name="Leaks" fullname="Game.Tests.SecretTests.Leaks" classname="Game.Tests.SecretTests" result="Failed" duration="0.001">
+          <failure>
+            <message>the token ${secret} must never reach the artifact</message>
+            <stack-trace>at Game.Tests.SecretTests.Leaks () in /repo/Assets/Tests/SecretTests.cs:9</stack-trace>
+          </failure>
+        </test-case>
+      </test-suite>
+    </test-run>`;
+    const { ctx, testDir } = reportProject(xml);
+    ctx.redactor.register(secret);
+
+    expect(await reportCommand(ctx)).toBe(0);
+
+    // nunitToJUnit stays pure; reportCommand redacts at the write boundary.
+    const junit = readFileSync(join(testDir, 'EditMode.junit.xml'), 'utf8');
+    expect(junit).toContain('***');
+    expect(junit).not.toContain(secret);
+  });
+
   it('throws a typed error when the NUnit XML cannot be parsed', async () => {
     const malformed = '<test-run total="1"';
 

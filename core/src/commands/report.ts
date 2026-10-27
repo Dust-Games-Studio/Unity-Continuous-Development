@@ -1,6 +1,7 @@
 /**
- * `unityci report`: converts the NUnit reports a test run left behind into their
- * JUnit siblings and refreshes `summary.json`.
+ * `unityci report`: ensures every NUnit report a test run left behind has a
+ * JUnit sibling (converting only when Unity produced none, per D8) and refreshes
+ * `summary.json`.
  *
  * The paths are the ones `run test` uses (Task 9), so the two commands agree on
  * where a report lives: `<test.outputDir>/<mode>.xml` is the input and
@@ -10,7 +11,7 @@
  * A malformed report is exit 65 (GC7): a report that cannot be read must not
  * become a silent zero-count pass.
  */
-import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, basename, join, relative, resolve, sep } from 'node:path';
 import type { CoreContext } from '../context.js';
 import { EXIT } from '../exit-codes.js';
@@ -128,7 +129,14 @@ export async function reportCommand(ctx: CoreContext): Promise<number> {
       addCounts(counts, report.counts);
 
       const junitFile = join(testDir, `${basename(file, '.xml')}.junit.xml`);
-      writeFileSync(junitFile, nunitToJUnit(xml), 'utf8');
+      // D8: Unity's own converter is authoritative. Only convert when it
+      // produced no JUnit file, and never overwrite one that exists.
+      if (!existsSync(junitFile)) {
+        // The pure converter knows nothing of secrets; the redaction happens
+        // here, at the boundary where bytes reach the filesystem (GC5), because
+        // the JUnit file is an uploaded CI artifact.
+        writeFileSync(junitFile, ctx.redactor.redact(nunitToJUnit(xml)), 'utf8');
+      }
 
       nunitReports.push(reportPath(outputDir, file));
       junitReports.push(reportPath(outputDir, junitFile));
@@ -162,7 +170,7 @@ export async function reportCommand(ctx: CoreContext): Promise<number> {
 
     writeSummary(outputDir, redactSummary(ctx, summary));
     ctx.logger.info(
-      `converted ${nunitFiles.length} NUnit report${nunitFiles.length === 1 ? '' : 's'} to JUnit and refreshed ${join(outputDir, 'summary.json')}.`,
+      `refreshed ${nunitReports.length} test report pair${nunitReports.length === 1 ? '' : 's'} and ${join(outputDir, 'summary.json')}.`,
     );
     return EXIT.SUCCESS;
   } catch (error) {
