@@ -110,3 +110,5 @@ cmake-build-*/
 
 # IntelliJ build output
 out/
+### superpowers scratch
+.superpowers/
