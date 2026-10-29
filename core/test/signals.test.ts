@@ -419,6 +419,47 @@ describe('installSignalHandlers', () => {
     }
   });
 
+  it('keeps the offline-file seat leak when the license return times out', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.license.mode = 'offline-file';
+    });
+    ctx.licenseActivated = true;
+    // The return never settles, so the 45 s fallback — not `returnLicense`'s
+    // own result — supplies `seatLeaked`.
+    mocks.runUnity.mockImplementation(() => new Promise<never>(() => {}));
+
+    vi.useFakeTimers();
+    const { exit, codes } = makeExit();
+    const handlers = installSignalHandlers(ctx, createSignalTeardown(ctx, 'test'), {
+      exit,
+    });
+    try {
+      process.emit('SIGINT');
+      await vi.advanceTimersByTimeAsync(SIGNAL_LICENSE_RETURN_TIMEOUT_MS);
+
+      expect(codes).toEqual([EXIT.INTERRUPTED]);
+      const summary = JSON.parse(readFileSync(summaryPath(root), 'utf8')) as Record<
+        string,
+        unknown
+      >;
+      // An offline file licence always leaks, whether or not the return ran:
+      // the timeout fallback must not report `seatLeaked: false`.
+      expect(summary).toMatchObject({
+        status: 'infra_failed',
+        exitCode: EXIT.INTERRUPTED,
+        license: {
+          mode: 'offline-file',
+          activated: true,
+          returned: false,
+          seatLeaked: true,
+        },
+      });
+    } finally {
+      handlers.dispose();
+    }
+  });
+
   it('exits anyway when onSignal rejects', async () => {
     const root = makeProject();
     const ctx = makeContext(root);

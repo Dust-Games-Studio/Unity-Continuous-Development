@@ -1,6 +1,7 @@
 /**
  * The one run lifecycle both commands use: `doctor` → `setup` → activate →
- * execute → verify → `summary.json`, with an unconditional licence teardown.
+ * execute → verify → `summary.json`, with the licence teardown and the summary
+ * on every path the run itself owns.
  *
  * `runTest` and `runBuild` differ only in what they execute and verify and in
  * the summary fields they contribute. The sequence, the retry loop, the
@@ -9,8 +10,10 @@
  *
  * The preflight comes first, as the spec's Section 4.5 orders it; `setup` then
  * verifies or installs the Editor and accepts its terms. The teardown is
- * entered on every path, including a doctor or setup failure, where it is a
- * no-op because nothing was activated.
+ * entered on every path this function owns, including a doctor or setup
+ * failure, where it is a no-op because nothing was activated. A signalled run
+ * is owned by the signal path instead (Task 11): it returns the seat and writes
+ * the summary, and this function's `finally` stops rather than racing it.
  */
 import { statSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -144,12 +147,14 @@ function describe(error: unknown): string {
 }
 
 /**
- * GC9's teardown, called from the `finally` on **every** path. The seat gate
- * lives in `returnLicense` and reads `ctx.licenseActivated`, so a signal-driven
- * teardown (Task 11), which cannot see this function's locals, inherits exactly
- * the same rule. Nothing activated (a failed doctor or setup, `license.mode:
- * none`) means nothing is returned — a developer's own personal licence must
- * never be returned as a side effect of running the toolkit locally.
+ * GC9's teardown, called from the `finally` on every path this function owns.
+ * The seat gate lives in `returnLicense` and reads `ctx.licenseActivated`, so a
+ * signal-driven teardown (Task 11), which cannot see this function's locals,
+ * inherits exactly the same rule. When a signal has set `ctx.signalCode` the
+ * signal path owns the teardown and `runLifecycle` does not call this function
+ * at all. Nothing activated (a failed doctor or setup, `license.mode: none`)
+ * means nothing is returned — a developer's own personal licence must never be
+ * returned as a side effect of running the toolkit locally.
  */
 export async function teardownLicense(ctx: CoreContext): Promise<LicenseReturnResult> {
   try {

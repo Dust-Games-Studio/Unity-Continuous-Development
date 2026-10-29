@@ -120,6 +120,10 @@ export function createSignalTeardown(
         returned: false,
         code: EXIT.TIMEOUT,
         error: 'the license return did not finish in time; the seat may still be held.',
+        // An offline `--file` licence is left in place by `unity license
+        // return` whichever way the call goes, so the timeout fallback must
+        // not report a leak as clean (R17).
+        seatLeaked: ctx.config.license.mode === 'offline-file',
       }),
       `the license return did not finish within ${SIGNAL_LICENSE_RETURN_TIMEOUT_MS} ms; writing summary.json and exiting anyway. The seat may still be held.`,
     );
