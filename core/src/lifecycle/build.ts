@@ -306,8 +306,11 @@ async function validateTarget(ctx: CoreContext): Promise<TargetProblem | null> {
  * and `--format ndjson` do), so without it the JSON reader sees an interleaved
  * log (GC12). The log still lands in `--log-file`.
  *
- * `-nographics` goes through `--args` (shell-split), not a `--` tail: this verb
- * has no separator. A batch build never renders, so R14 makes it unconditional.
+ * `-nographics` is deliberately **not** sent. `unity build` already spawns the
+ * Editor in batch mode, and the CLI rejects its own reserved flags on `--args`
+ * (a real build exited 6 with "Forwarded argument '-nographics' conflicts with
+ * a reserved Unity flag"). The flag remains a `unity test` concern, where the
+ * `--` separator delivers it to the Editor.
  */
 function buildArguments(
   ctx: CoreContext,
@@ -333,8 +336,6 @@ function buildArguments(
     '--provenance-path',
     provenancePath,
     '--no-tail',
-    '--args',
-    '-nographics',
   );
 
   if (build.executeMethod !== null && build.executeMethod !== '') {

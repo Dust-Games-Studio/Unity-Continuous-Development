@@ -52,6 +52,21 @@ function failure(code: number, stderr: string, data?: unknown) {
   };
 }
 
+/**
+ * Replaces the mocked `projects verify` response with a raw envelope. The real
+ * payload puts findings under `data.findings` and only a count in top-level
+ * `errors`, which the generic `envelope()` helper cannot express.
+ */
+function verifyEnvelope(payload: unknown, code = 6): void {
+  mocks.runUnity.mockImplementation(async (options: { args: string[] }) => {
+    calls.push(options.args);
+    if (options.args[0] === 'projects') {
+      return { code, stdout: '', stderr: '', json: payload };
+    }
+    return responder(options.args);
+  });
+}
+
 function defaultDoctor(): unknown {
   return {
     verdict: 'pass',
@@ -270,6 +285,124 @@ describe('doctorCommand', () => {
     expect(readReport(project).checks.find((check) => check.id === 'projects-verify')?.status).toBe(
       'fail',
     );
+  });
+
+  it('lists each projects verify finding with its path and message', async () => {
+    verifyEnvelope({
+      success: false,
+      data: {
+        ok: false,
+        findings: [
+          {
+            code: 'META_MISSING',
+            severity: 'error',
+            path: 'Assets/Editor',
+            message: 'This asset has no .meta file next to it.',
+          },
+          {
+            code: 'GUID_DUPLICATE',
+            path: 'Assets/Foo.cs',
+            message: 'Two assets share this guid.',
+          },
+        ],
+        summary: { errors: 2, warnings: 0 },
+      },
+      errors: [
+        {
+          code: 'PROJECTS_VERIFY_FAILED',
+          message: 'Project verification failed. Errors: 2',
+        },
+      ],
+    });
+    const project = makeProject();
+
+    const code = await doctorCommand(makeContext(project));
+
+    expect(code).toBe(64);
+    const output = lines.join('\n');
+    // The count line is kept; each finding follows on its own line.
+    expect(output).toContain('Project verification failed. Errors: 2');
+    expect(output).toContain(
+      '- META_MISSING Assets/Editor: This asset has no .meta file next to it.',
+    );
+    expect(output).toContain(
+      '- GUID_DUPLICATE Assets/Foo.cs: Two assets share this guid.',
+    );
+    const check = readReport(project).checks.find((entry) => entry.id === 'projects-verify');
+    expect(check).toMatchObject({ status: 'fail', code: 'PROJECT_VERIFY_FAILED' });
+    expect(check?.message).toContain('Assets/Editor');
+  });
+
+  it('falls back to the envelope error list when findings are absent', async () => {
+    verifyEnvelope({
+      success: false,
+      data: {
+        ok: false,
+        errors: [{ code: 'MANIFEST_INVALID', message: 'Packages/manifest.json is invalid' }],
+        errorCount: 1,
+      },
+      errors: [],
+    });
+    const project = makeProject();
+
+    const code = await doctorCommand(makeContext(project));
+
+    expect(code).toBe(64);
+    const output = lines.join('\n');
+    expect(output).toContain('MANIFEST_INVALID: Packages/manifest.json is invalid');
+    const check = readReport(project).checks.find((entry) => entry.id === 'projects-verify');
+    expect(check?.code).toBe('PROJECT_VERIFY_FAILED');
+    expect(check?.message).toContain('invalid');
+  });
+
+  it('tolerates malformed findings entries without crashing or printing undefined', async () => {
+    verifyEnvelope({
+      success: false,
+      data: {
+        findings: [
+          null,
+          42,
+          'a bare finding',
+          { path: 'Assets/OnlyPath.cs' },
+          { code: 'BROKEN', path: 'Assets/Broken.cs', message: 42 },
+          { code: 'META_ORPHAN', path: 'Assets/Lost.cs.meta', message: 'No asset.' },
+        ],
+      },
+      errors: [{ code: 'PROJECTS_VERIFY_FAILED', message: 'Project verification failed. Errors: 5' }],
+    });
+    const project = makeProject();
+
+    const code = await doctorCommand(makeContext(project));
+
+    expect(code).toBe(64);
+    const output = lines.join('\n');
+    expect(output).toContain('- a bare finding');
+    expect(output).toContain('- Assets/OnlyPath.cs');
+    expect(output).toContain('- BROKEN Assets/Broken.cs');
+    expect(output).toContain('- META_ORPHAN Assets/Lost.cs.meta: No asset.');
+    expect(output).not.toContain('undefined');
+  });
+
+  it('caps a long findings list and counts the remainder', async () => {
+    const findings = Array.from({ length: 7 }, (_, index) => ({
+      code: 'META_MISSING',
+      path: `Assets/File${index}.cs`,
+      message: 'no .meta file',
+    }));
+    verifyEnvelope({
+      success: false,
+      data: { findings, summary: { errors: 7 } },
+      errors: [{ code: 'PROJECTS_VERIFY_FAILED', message: 'Project verification failed. Errors: 7' }],
+    });
+    const project = makeProject();
+
+    const code = await doctorCommand(makeContext(project));
+
+    expect(code).toBe(64);
+    const output = lines.join('\n');
+    expect(output).toContain('Assets/File4.cs');
+    expect(output).not.toContain('Assets/File5.cs');
+    expect(output).toContain('and 2 more');
   });
 
   it('warns but does not fail when the CLI is newer than the tested ceiling', async () => {

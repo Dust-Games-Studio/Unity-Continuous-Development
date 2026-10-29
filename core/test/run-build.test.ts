@@ -384,12 +384,23 @@ describe('run build', () => {
       // The streamed Editor log would be interleaved into stdout, and
       // `--format json` does not disable it; the log still lands in --log-file.
       '--no-tail',
-      // R14: a batch build never renders, and there is no `--` on this verb.
-      '--args',
-      '-nographics',
       '--format',
       'json',
     ]);
+  });
+
+  it('never sends -nographics to unity build', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root);
+
+    expect(await runCommand(ctx, 'build')).toBe(0);
+
+    // `unity build` rejects its own reserved flags on the `--args` channel
+    // (COMMAND_FAILED, exit 6), and a batch build already needs no graphics.
+    // This pins the absence so a future edit cannot reintroduce it.
+    const args = buildCalls[0]!;
+    expect(args).not.toContain('--args');
+    expect(args).not.toContain('-nographics');
   });
 
   it('passes --log-file so the Editor log lands in ci-output/logs/editor.log', async () => {

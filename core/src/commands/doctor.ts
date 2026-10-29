@@ -56,37 +56,141 @@ function asObject(value: unknown): Record<string, unknown> | null {
  * R18 forbids a false green, but `doctor` already treats its own missing report
  * as blocking, and verify is a secondary check with no verdict to consume
  * (M3). A non-zero exit or an error list is always `fail`.
+ *
+ * The CLI puts the useful detail in `data.findings` (code, path, message) and
+ * only a count in the envelope's top-level `errors`. A preflight that says
+ * "Errors: 6" and nothing else cannot be acted on, so each finding is listed
+ * on its own line; the list is capped so a huge report cannot bury the exit
+ * code, with the remainder counted in one "and N more" line.
  */
+const MAX_VERIFY_FINDINGS = 5;
+
+interface VerifyFinding {
+  code: string;
+  path: string;
+  message: string;
+}
+
+/**
+ * Reads one finding without assuming a shape: the CLI has used objects, and a
+ * future/older shape may use a bare string. A missing path, code or message is
+ * tolerated; an entry with none of them is dropped as empty.
+ */
+function readFinding(entry: unknown): VerifyFinding | null {
+  if (typeof entry === 'string') {
+    const message = entry.trim();
+    return message === '' ? null : { code: '', path: '', message };
+  }
+  const object = asObject(entry);
+  if (object === null) return null;
+  const code = typeof object.code === 'string' ? object.code.trim() : '';
+  const path = typeof object.path === 'string' ? object.path.trim() : '';
+  const message = typeof object.message === 'string' ? object.message.trim() : '';
+  if (code === '' && path === '' && message === '') return null;
+  return { code, path, message };
+}
+
+/** `data.findings` (what the CLI really sends), or a top-level `findings`. */
+function readFindings(json: Record<string, unknown> | null): VerifyFinding[] {
+  const candidate = asObject(json?.data)?.findings ?? json?.findings;
+  if (!Array.isArray(candidate)) return [];
+  return candidate
+    .map((entry) => readFinding(entry))
+    .filter((finding): finding is VerifyFinding => finding !== null);
+}
+
+/**
+ * The error count in the shapes the CLI has used: `data.errorCount`,
+ * `data.summary.errors` (the current payload), or a top-level `errorCount`.
+ * Returns null when no usable count is present.
+ */
+function readErrorCount(json: Record<string, unknown> | null): number | null {
+  const data = asObject(json?.data);
+  const summary = asObject(data?.summary);
+  for (const candidate of [data?.errorCount, summary?.errors, json?.errorCount]) {
+    if (
+      typeof candidate === 'number' &&
+      Number.isSafeInteger(candidate) &&
+      candidate >= 0
+    ) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+/** `- CODE path: message`, dropping any part the report omitted. */
+function formatFinding(finding: VerifyFinding): string {
+  const location = [finding.code, finding.path].filter((part) => part !== '').join(' ');
+  if (location === '') return `- ${finding.message}`;
+  return finding.message === '' ? `- ${location}` : `- ${location}: ${finding.message}`;
+}
+
+/** Messages from an envelope `errors` array, tolerating strings and bad entries. */
+function errorMessages(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const messages: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry === 'string') {
+      const message = entry.trim();
+      if (message !== '') messages.push(message);
+      continue;
+    }
+    const object = asObject(entry);
+    if (object === null) continue;
+    const code = typeof object.code === 'string' ? object.code : '';
+    const message = typeof object.message === 'string' ? object.message : '';
+    const composed = code === '' ? message : `${code}: ${message}`;
+    if (composed.trim() !== '') messages.push(composed);
+  }
+  return messages;
+}
+
 function evaluateVerify(result: UnityResult): VerifyEvaluation {
-  const topLevel = Array.isArray(result.json?.errors) ? result.json.errors : [];
-  const nested = asObject(result.json?.data)?.errors;
-  const errors = [...topLevel, ...(Array.isArray(nested) ? nested : [])] as {
-    code?: unknown;
-    message?: unknown;
-  }[];
-  const messages = errors
-    .map((error) => {
-      const code = typeof error.code === 'string' ? error.code : '';
-      const message = typeof error.message === 'string' ? error.message : '';
-      return code === '' ? message : `${code}: ${message}`;
-    })
-    .filter((message) => message !== '');
+  const json = asObject(result.json);
+  const messages = [
+    ...errorMessages(json?.errors),
+    ...errorMessages(asObject(json?.data)?.errors),
+  ];
+  const findings = readFindings(json);
+  const errorCount = readErrorCount(json);
 
   const failed =
-    result.code !== 0 || result.json?.success === false || messages.length > 0;
+    result.code !== 0 ||
+    json?.success === false ||
+    messages.length > 0 ||
+    findings.length > 0 ||
+    (errorCount !== null && errorCount > 0);
 
   if (failed) {
     const fallback = resultDetail(result);
+    const count = errorCount ?? findings.length;
+    const detail: string[] = [];
+
+    if (messages.length > 0) {
+      // The CLI's own summary line, e.g. "PROJECTS_VERIFY_FAILED: Project
+      // verification failed. Errors: 6" — kept verbatim as the count line.
+      detail.push(messages.join('; '));
+    } else if (count > 0) {
+      detail.push(`unity projects verify found ${count} error${count === 1 ? '' : 's'}`);
+    }
+
+    detail.push(...findings.slice(0, MAX_VERIFY_FINDINGS).map(formatFinding));
+    const hidden = findings.length - MAX_VERIFY_FINDINGS;
+    if (hidden > 0) detail.push(`and ${hidden} more`);
+
+    if (detail.length === 0) {
+      detail.push(fallback === '' ? `unity projects verify exited ${result.code}` : fallback);
+    }
+
     return {
       status: 'fail',
       blocking: true,
-      code: messages.length > 0 ? 'PROJECT_VERIFY_FAILED' : `VERIFY_EXIT_${result.code}`,
-      detail:
-        messages.length > 0
-          ? messages.join('; ')
-          : fallback === ''
-            ? `unity projects verify exited ${result.code}`
-            : fallback,
+      code:
+        messages.length > 0 || findings.length > 0 || count > 0
+          ? 'PROJECT_VERIFY_FAILED'
+          : `VERIFY_EXIT_${result.code}`,
+      detail: detail.join('\n'),
     };
   }
 
