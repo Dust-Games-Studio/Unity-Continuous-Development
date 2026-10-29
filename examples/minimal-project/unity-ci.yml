@@ -1,0 +1,17 @@
+# The example project's configuration. `unityci run test` and `unityci run
+# build` read this file from the project root; `--output-dir` on the command
+# line still wins for the output directory.
+test:
+  # EditMode only: the example has no PlayMode assembly and no scene to play.
+  modes:
+    - EditMode
+
+build:
+  # `StandaloneWindows64` needs no Editor modules on a Windows runner.
+  target: StandaloneWindows64
+  # The example's own build entry point; it honours `-buildOutput`, which is how
+  # `unity build --output-path` forwards the destination.
+  executeMethod: Builder.PerformBuild
+
+output:
+  dir: ci-output
