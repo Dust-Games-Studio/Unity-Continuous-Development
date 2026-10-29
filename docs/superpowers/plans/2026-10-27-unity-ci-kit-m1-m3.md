@@ -356,7 +356,7 @@ git commit -m "chore: scaffold pnpm workspace and core primitives"
   - `core/src/config/validate.ts` → `export function validateConfig(config: Config): ConfigIssue[]`.
   - `core/src/config/env.ts` → `export const ENV_KEYS: Record<string, string>` mapping each `UNITYCI_*` env var to its config path, `export type DeepPartial<T> = { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K] }`, and `export function readEnvConfig(env: NodeJS.ProcessEnv): { patch: DeepPartial<Config>; unknown: string[]; warnings: string[] }`. The patch is **deep**: `Partial<Config>` cannot express a nested path such as `unity.cli.version`. `unknown` holds env vars that are **not** in `ENV_KEYS`; `warnings` holds **malformed values for known vars** (a non-boolean where a boolean is expected). The two are different conditions and must not share one channel.
   - `core/src/config/load.ts` → `export function loadConfig(opts: { projectPath: string; cwd: string; argv: ParseResult['flags']; env: NodeJS.ProcessEnv; configFile?: string }): { config: Config; issues: ConfigIssue[]; unknownEnvVars: string[]; warnings: string[]; projectPath: string }`. The `argv` type is the parser's own `ParseResult['flags']` — do not restate it, or the two drift apart. **`projectPath` is the already-resolved project root**, supplied by the caller (from `--project-path`, else the working directory). The config file is discovered **at the project root** (`<projectPath>/unity-ci.yml`), not at the working directory — otherwise `unityci run test --project-path examples/minimal-project` would silently ignore that project's own configuration.
-  - `core/src/context.ts` → `export interface CoreContext { config: Config; cwd: string; projectPath: string; env: NodeJS.ProcessEnv; logger: Logger; redactor: Redactor; binary: string; startedAt: number; cliVersion: string | null }`.
+  - `core/src/context.ts` → `export interface CoreContext { config: Config; cwd: string; projectPath: string; env: NodeJS.ProcessEnv; logger: Logger; redactor: Redactor; binary: string; startedAt: number; cliVersion: string | null; licenseActivated: boolean }`. `licenseActivated` starts `false` and is set to `true` by the run loop immediately after an activation that took a seat — it is how the teardown knows the difference between "return the seat we took" and "return whatever licence this machine happens to have".
 
 `Config` shape (the spec's surface plus the additions Spike 0 forces):
 
@@ -495,6 +495,8 @@ git commit -m "feat: add config schema, validation and precedence"
     `export function unityProjectsVerify(opts, projectPath: string): Promise<UnityResult>` — `['projects', 'verify', projectPath, '--strict', '--format', 'json']`. Both the positional project path and `--strict` are confirmed by `unity projects verify --help` (`Usage: unity projects verify [options] [project]`, `--strict  Treat warnings as errors`).
     `export function unityEditorsInstalled(opts): Promise<UnityResult>` — `['editors', '--installed', '--format', 'json']`. Its rows carry a `modules` string that may be **empty** for a valid Editor. **That string holds display names, not module ids** (observed: `"Linux"`, `"Android, Android SDK & NDK Tools, Linux, OpenJDK, Web"`), so it is a *different namespace* from the ids `config.unity.editor.modules` uses. Do **not** compare against it — use `unityModulesList` and match on `id` + `isInstalled`.
     Each wrapper takes `{ binary, cwd, env, logger, redactor }` plus its own arguments. **The project path is always passed positionally** to the `unity` verb, and `cwd` is the directory the child runs in (the project root) — a caller must not rely on `cwd` alone to select the project.
+
+    **The global `--format json` is inserted BEFORE any `--` separator.** Everything after a literal `--` is passed through to the Editor, not parsed by the CLI — so a wrapper that appends `['--format','json']` to the end of an argument list that ends with `-- -nographics` produces `… -- -nographics --format json`: the CLI never enters JSON mode **and** the Editor is handed a `--format` argument it does not understand. Each wrapper must therefore split its arguments at the first `--`, insert `['--format','json']` before the tail, and re-append the tail unchanged.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -668,7 +670,11 @@ git commit -m "feat: add doctor and setup commands"
 **Interfaces:**
 - Consumes: `runUnity` wrappers; `Config`; `CoreContext`.
 - Produces:
-  - `core/src/lifecycle/license.ts` → `export interface LicenseActivation { activated: boolean; mode: string }`, `export interface LicenseReturnResult { returned: boolean; code: number; error?: string; seatLeaked?: boolean }`, `export async function activateLicense(ctx: CoreContext): Promise<LicenseActivation>` and `export async function returnLicense(ctx: CoreContext): Promise<LicenseReturnResult>`. `returnLicense` **never throws** — it catches everything and reports the outcome in its result. That is what lets the teardown log the failure loudly without changing the primary exit code (GC9), while the **standalone** `unityci license return` command can still report the failure honestly. `seatLeaked` is set when the licence was an **offline `--file`** licence: `unity license return` leaves such a licence in place, so the CLI reports success while the seat is still held and must be reclaimed by hand. That fact is the **only** signal the caller gets, so it must be machine-readable rather than a log line nobody greps for.
+  - `core/src/lifecycle/license.ts` → `export interface LicenseActivation { activated: boolean; mode: string }`, `export interface LicenseReturnResult { returned: boolean; code: number; error?: string; seatLeaked?: boolean }`, `export async function activateLicense(ctx: CoreContext): Promise<LicenseActivation>` and `export async function returnLicense(ctx: CoreContext, opts?: { force?: boolean }): Promise<LicenseReturnResult>`. `returnLicense` **never throws** — it catches everything and reports the outcome in its result. That is what lets the teardown log the failure loudly without changing the primary exit code (GC9), while the **standalone** `unityci license return` command can still report the failure honestly.
+
+    **The teardown returns a seat only if the toolkit took one — and the gate lives inside `returnLicense`, not at the call site.** GC9 makes the teardown unconditional in the sense that the `finally` always calls it, but "unconditional" must not mean "return whatever licence this machine happens to have": under `license.mode: none` a developer's own personal licence is active and must be left alone, and a blanket `unity license return` would **return the developer's licence** as a side effect of running the toolkit locally. So `CoreContext` carries `licenseActivated: boolean` (default `false`), the run loop sets it to `true` immediately after an activation that took a seat, and `returnLicense` **returns nothing** — with a debug log — when `ctx.licenseActivated` is `false`. Putting the check inside `returnLicense` is what makes it hold for *every* caller, including Task 11's signal path, which has no activation state of its own. The standalone `unityci license return` command passes `{ force: true }`: the user explicitly asked for the seat back, and the toolkit did not take it.
+
+    `seatLeaked` is set when the licence was an **offline `--file`** licence: `unity license return` leaves such a licence in place, so the CLI reports success while the seat is still held and must be reclaimed by hand. That fact is the **only** signal the caller gets, so it must be machine-readable rather than a log line nobody greps for.
   - `core/src/commands/license.ts` → `export async function licenseActivateCommand(ctx: CoreContext): Promise<number>` and `export async function licenseReturnCommand(ctx: CoreContext): Promise<number>`. The standalone `license return` command exits **non-zero** (`EXIT.COMMAND_FAILED`, 6) when the return failed **or when `seatLeaked` is true** — a user who explicitly asked for a seat to be returned must not be told it succeeded when the seat is still held. That is a different question from the teardown, which has a primary exit code to preserve.
 
 - [ ] **Step 1: Write the failing tests**
@@ -879,9 +885,10 @@ git commit -m "feat: add NUnit parsing, JUnit conversion, summary and annotation
 - [ ] **Step 1: Write the failing tests**
 
 ```ts
-it('runs setup, activates the license, runs the tests and returns the license', () => { /* call order asserted */ });
+it('runs doctor, then setup, activates the license, runs the tests and returns the license', () => { /* call order asserted: doctor → setup → activate → run → teardown */ });
 it('returns the license when the test run fails', () => { /* returnLicense called */ });
-it('returns the license when setup fails', () => { /* returnLicense called anyway */ });
+it('does not return a license it never took', () => { /* doctor or setup failed before activation → no unity license return */ });
+it('does not return a license when activation did not take a seat', () => { /* activated:false → no unity license return */ });
 it('runs one unity test per configured mode and collects both reports', () => { /* 2 invocations */ });
 it('never emits two --mode flags in one invocation', () => { /* the CLI silently lets the last win */ });
 it('rejects a report path that is an existing directory', () => { /* exit 64 */ });
@@ -893,7 +900,10 @@ it('exits 8 when tests ran and some failed', () => { /* exit code 8 */ });
 it('exits 6 when the run produced no report at all', () => { /* infra_failed, not a false green */ });
 it('exits 65 when the NUnit report exists but cannot be parsed', () => { /* internal error, not a false green */ });
 it('passes -- -nographics for EditMode when nographics is enabled', () => { /* argv ends with ['--','-nographics'] */ });
+it('puts --format json before the -- separator', () => { /* the final wrapper argv, asserted exactly */ });
 it('does not pass -nographics for PlayMode', () => { /* absent */ });
+it('exits 6 when the report file exists but is zero bytes', () => { /* exists is not enough — non-empty or nothing */ });
+it('does not double-count the test totals when a run is retried', () => { /* one report's counts, not two */ });
 it('reports total 0 and failed 0 only when a report really exists', () => { /* asserts the missing-report case is infra_failed */ });
 it('writes summary.json with the documented schema', () => { /* shape check */ });
 it('never leaks the license serial into summary.json', () => { /* no secret in file */ });
@@ -907,8 +917,8 @@ Expected: FAIL — module not found.
 - [ ] **Step 3: Implement**
 
 `runTest`:
-1. `await setup(ctx)` — on failure, `finally` still runs `returnLicense`.
-2. `await doctorCommand(ctx)` — the preflight gate (R11), **once**, after `setup` and before the licence step. `setup` deliberately does not run `unity doctor --ci` (that is `doctor`'s job), so without this call the run path would never execute the preflight at all.
+1. `await doctorCommand(ctx)` — the preflight gate (R11), **first**. The spec's Section 4.5 gives the order as `doctor (preflight) → setup: verify or install (EULA-gated) + terms accept → packages preflight (git ls-remote)`, and the preflight gate comes first: if the machine itself cannot build or test (glibc, disk space, the CLI), that must be reported before the toolkit starts installing an Editor. `setup` deliberately does not run `unity doctor --ci` — that is `doctor`'s job — so without this call the run path would never execute the preflight at all.
+2. `await setup(ctx)` — on failure, `finally` still runs the teardown.
 3. `await activateLicense(ctx)` inside the same `try`.
 4. `finally { await returnLicense(ctx) }` (GC9).
 5. For each mode in `config.test.modes` (default `['EditMode']`), build argv:
@@ -956,7 +966,7 @@ git commit -m "feat: add the run test lifecycle"
 
 **Interfaces:**
 - Consumes: `setup`, `activateLicense`, `returnLicense`, `withRetry`, `unityBuild`, `writeSummary`; `Config`; `CoreContext`.
-- Produces: `core/src/lifecycle/build.ts` → `export interface BuildRunResult { status: 'passed' | 'infra_failed'; unityExitCode: number; attempts: number; artifacts: string[]; provenance: Record<string, unknown> | null }`, `export async function runBuild(ctx: CoreContext): Promise<BuildRunResult>`.
+- Produces: `core/src/lifecycle/build.ts` → `export interface BuildRunResult { status: 'passed' | 'infra_failed'; exitCode: number; unityExitCode: number; attempts: number; artifacts: string[]; provenance: Record<string, unknown> | null }`, `export async function runBuild(ctx: CoreContext): Promise<BuildRunResult>`. `exitCode` is present for the same reason `TestRunResult` carries one: **6** and **65** cannot be told apart from `status` plus `unityExitCode`, and the caller must be able to say which. A build has no `tests_failed` status — a build either produced its artifact or it did not.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -974,7 +984,8 @@ it('never passes --allow-install', () => { /* absent */ });
 it('writes the provenance manifest and merges it into summary.json', () => { /* provenance key present */ });
 it('lists the build output under artifacts in summary.json', () => { /* non-empty */ });
 it('returns the license when the build fails', () => { /* returnLicense called */ });
-it('exits with the unity exit code on a failed build', () => { /* code preserved */ });
+it('does not return a license it never took', () => { /* activation failed → no unity license return */ });
+it('returns the recorded exit code on a failed build', () => { /* code preserved, including 6 and 65 */ });
 it('converts NUnit to JUnit when unity produced no JUnit file', () => { /* fallback triggers */ });
 it('does not convert when unity already produced a JUnit file', () => { /* no conversion */ });
 ```
@@ -986,8 +997,8 @@ Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement**
 
-`runBuild` mirrors `runTest`'s lifecycle (setup → activate → build → report → **finally** return) and builds argv:
-`['build', projectPath, '--target', <target>, '--output-path', <outputPath>, '--log-file', <outputDir>/logs/editor.log, '--provenance-path', <outputDir>/build/provenance.json, '--format', 'json']`
+`runBuild` mirrors `runTest`'s lifecycle — **`doctor` → `setup` → activate → build → report → `finally` return** — and builds argv:
+`['build', projectPath, '--target', <target>, '--output-path', <outputPath>, '--log-file', <outputDir>/logs/editor.log, '--provenance-path', <outputDir>/build/provenance.json]` with `--format json` inserted **before any `--` separator** (the wrapper owns that placement, see Task 4 — do not append it to the end of the list).
 (`unity build` is the only one of the two that accepts `--log-file`; `unity test` does not, so a test run leaves `logs.editor` null — GC10.)
 plus, when set: `--profile <profile>`, `--execute-method <method>`, `--versioning-strategy <strategy>`, `--build-version <version>` (only when strategy is `custom`), `--android-export-type <type>`, `--android-version-code <n>`, `--android-target-sdk-version <n>`, `--allow-dirty-build`.
 
