@@ -1,0 +1,11 @@
+{
+  "name": "@unityci/fake-unity",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Deterministic stand-in for the Unity CLI, driven by a JSON scenario",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "fake-unity": "./fake-unity.mjs"
+  }
+}
