@@ -35,7 +35,9 @@ variable:
   working directory (`process.cwd()`); parent directories are created.
 - `json`, when present, is serialised to stdout. It is not printed when the key
   is absent.
-- `code` is the process exit code (default `0`).
+- `code` is **required** and must be an integer. A missing or non-integer code
+  fails loudly instead of becoming an implicit success, so a scenario that says
+  `"code": "8"` cannot accidentally report a green run.
 
 ## Running it
 
@@ -61,9 +63,11 @@ exec node /absolute/path/to/testing/fake-unity/fake-unity.mjs "$@"
 **Windows**
 
 Node's `spawn(file, args, { shell: false })` **cannot** launch a `.cmd` or
-`.bat`; it fails with `EINVAL`, and the core never uses `shell: true`. A real
-Windows launcher therefore has to be either a small compiled `.exe` or the
-Node-preload approach the core's own test uses (`core/test/cli.test.ts`):
+`.bat`; it fails with `EINVAL`, and the core never uses `shell: true`. The
+Windows tests therefore rely on the Node-preload hook below, because that is the
+only way to point a single `unity.cli.binary` path at this script without a
+compiled launcher. A real Windows launcher can instead be a small compiled
+`.exe`, or the same preload approach:
 
 1. point `unity.cli.binary` at `process.execPath` (Node itself);
 2. set `NODE_OPTIONS=--require <hook.cjs>` for the child;
@@ -89,9 +93,11 @@ process.argv[1] = fake;
 process.argv.splice(2, 0, entryArg);
 ```
 
-`NODE_OPTIONS` must contain the hook path unquoted with forward slashes:
-Node strips backslashes inside quotes. Running the suite under WSL also works
-and needs only the POSIX shim.
+`NODE_OPTIONS` must contain the hook path **quoted** and use forward slashes,
+for example `--require "C:/temp/hook.cjs"`: quoting keeps a `%TEMP%` path with
+spaces working, while forward slashes avoid Node stripping Windows backslashes
+inside quotes. Running the suite under WSL also works and needs only the POSIX
+shim.
 
 Point the configuration at the shim and set the scenario for the child:
 
@@ -107,6 +113,6 @@ FAKE_UNITY_SCENARIO=/absolute/path/to/scenario.json unityci run test
 
 ## Exit codes
 
-`0` for a matched entry's default `code`, that `code` when set, and `2` for a
-missing/invalid scenario or an unmatched invocation. `2` mirrors the real CLI's
-usage-error code, so an accidental extra or missing argument fails loudly.
+A matched entry's integer `code`, and `2` for a missing/invalid scenario, a
+missing or non-integer code, or an unmatched invocation. `2` mirrors the real
+CLI's usage-error code, so an accidental extra or missing argument fails loudly.

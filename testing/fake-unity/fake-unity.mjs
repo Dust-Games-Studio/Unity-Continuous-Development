@@ -29,9 +29,31 @@ function isPrefix(prefix, invocation) {
   return prefix.every((value, index) => value === invocation[index]);
 }
 
-function apply(result) {
+function entryLabel(label, result) {
+  return Array.isArray(result.args)
+    ? `${label} (args ${JSON.stringify(result.args)})`
+    : label;
+}
+
+function apply(result, label) {
   if (!isObject(result)) {
-    fail('the matched scenario entry is not an object');
+    fail(`${label} is not an object`);
+    return;
+  }
+
+  // A scenario that says "8" must never become a silent success. The code is
+  // required and must be an integer; a typo or a missing value is a broken
+  // scenario, not an implicit 0.
+  if (!Object.hasOwn(result, 'code')) {
+    fail(
+      `scenario entry ${entryLabel(label, result)} has no "code"; refusing to assume success`,
+    );
+    return;
+  }
+  if (typeof result.code !== 'number' || !Number.isInteger(result.code)) {
+    fail(
+      `scenario entry ${entryLabel(label, result)} has a non-integer "code" (${JSON.stringify(result.code)}); refusing to report success`,
+    );
     return;
   }
 
@@ -52,34 +74,43 @@ function apply(result) {
     process.stdout.write(`${JSON.stringify(result.json)}\n`);
   }
 
-  const code = typeof result.code === 'number' ? result.code : 0;
-  process.exitCode = code;
+  process.exitCode = result.code;
 }
 
 if (scenarioPath === undefined || scenarioPath === '') {
   fail('FAKE_UNITY_SCENARIO is not set');
 } else {
   let scenario;
+  let readable = true;
   try {
     // A UTF-8 BOM is common in files written by Windows editors; JSON.parse
     // rejects it, so strip it before parsing.
     scenario = JSON.parse(readFileSync(scenarioPath, 'utf8').replace(/^\uFEFF/, ''));
   } catch (error) {
-    fail(`cannot read scenario ${scenarioPath}: ${error instanceof Error ? error.message : String(error)}`);
+    readable = false;
+    fail(
+      `cannot read scenario ${scenarioPath}: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 
-  if (!isObject(scenario)) {
-    fail(`scenario ${scenarioPath} must contain a JSON object`);
-  } else {
-    const results = Array.isArray(scenario.results) ? scenario.results : [];
-    const matched = results.find((entry) => isObject(entry) && isPrefix(entry.args, argv));
-
-    if (matched !== undefined) {
-      apply(matched);
-    } else if (scenario.default !== undefined) {
-      apply(scenario.default);
+  if (readable) {
+    if (!isObject(scenario)) {
+      fail(`scenario ${scenarioPath} must contain a JSON object`);
+    } else if (scenario.results !== undefined && !Array.isArray(scenario.results)) {
+      fail(`scenario ${scenarioPath} has a non-array "results"`);
     } else {
-      fail(`no scenario entry matches: ${JSON.stringify(argv)}`);
+      const results = Array.isArray(scenario.results) ? scenario.results : [];
+      const matched = results.findIndex(
+        (entry) => isObject(entry) && isPrefix(entry.args, argv),
+      );
+
+      if (matched !== -1) {
+        apply(results[matched], `results[${matched}]`);
+      } else if (scenario.default !== undefined) {
+        apply(scenario.default, 'default');
+      } else {
+        fail(`no scenario entry matches: ${JSON.stringify(argv)}`);
+      }
     }
   }
 }

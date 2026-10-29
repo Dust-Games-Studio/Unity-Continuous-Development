@@ -14,7 +14,11 @@ import { LicenseError, activateLicense, returnLicense } from '../lifecycle/licen
  */
 export async function licenseActivateCommand(ctx: CoreContext): Promise<number> {
   try {
-    await activateLicense(ctx);
+    const activation = await activateLicense(ctx);
+    // Record that this process took a seat. The teardown gate reads this, so
+    // without it a signal during or after activation would skip the return and
+    // leak the seat.
+    ctx.licenseActivated = activation.activated;
     return EXIT.SUCCESS;
   } catch (error) {
     if (error instanceof LicenseError) {

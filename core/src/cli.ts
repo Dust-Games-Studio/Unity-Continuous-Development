@@ -1,9 +1,12 @@
 /**
- * The `unityci` entrypoint: the only module that knows the command names.
+ * The `unityci` command layer: the only module that knows the command names.
  *
  * It parses argv, loads the layered configuration, builds the {@link CoreContext}
  * and dispatches to a command module. It never spawns anything itself (GC3):
- * every child process belongs to `exec.ts`, reached through a command.
+ * every child process belongs to `exec.ts`, reached through a command. It has no
+ * top-level side effects; `bin.ts` is the published entrypoint.
+ *
+ * @see bin.ts
  *
  * Two ordering rules are load-bearing:
  *
@@ -17,7 +20,6 @@
  *    `unityci cache-info --json | jq` therefore receives a clean document.
  */
 import { readFileSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
 import { parseArgs, type OptionSpec, type ParseResult } from './args.js';
 import { cacheInfoCommand } from './commands/cache-info.js';
 import { doctorCommand } from './commands/doctor.js';
@@ -32,8 +34,10 @@ import { loadConfig } from './config/load.js';
 import { validateConfig } from './config/validate.js';
 import type { CoreContext } from './context.js';
 import { EXIT } from './exit-codes.js';
+import { returnLicense } from './lifecycle/license.js';
 import { checkLicense } from './lifecycle/setup.js';
 import {
+  SIGNAL_LICENSE_RETURN_TIMEOUT_MS,
   createSignalTeardown,
   installSignalHandlers,
 } from './lifecycle/signals.js';
@@ -51,7 +55,6 @@ const GLOBAL_FLAGS: ReadonlySet<string> = new Set([
   'quiet',
   'help',
   'version',
-  'json',
 ]);
 
 /**
@@ -66,6 +69,8 @@ const EXTRA_OPTIONS = {
 /** The command-specific options each command actually accepts. */
 const COMMAND_EXTRA_FLAGS: Readonly<Record<string, ReadonlySet<string>>> = {
   setup: new Set(['required-module']),
+  // `--json` is meaningful only where a command emits a machine document.
+  'cache-info': new Set(['json']),
 };
 
 const LICENSE_SUBCOMMANDS: ReadonlySet<string> = new Set([
@@ -121,12 +126,12 @@ Global options:
       --quiet                Errors only
   -h, --help                 Print this help and exit
   -v, --version              Print the version and exit
-      --json                 Machine-readable output (cache-info)
 
 Setup options:
       --required-module <id> Required Editor module (repeatable)
 
-Options after a literal -- are passed through to the Unity Editor.
+Cache options:
+      --json                 Print the cache descriptors as JSON (cache-info)
 `;
 
 function describe(error: unknown): string {
@@ -266,6 +271,43 @@ function requiredModulesFrom(
 }
 
 /**
+ * The signal teardown for `license activate`: there is no run summary to write,
+ * so this is licence-only, but it gets the same 45 s budget as the run path so a
+ * hung licensing service cannot hold the exit open. `force: true` is correct
+ * here because this process is the one that just took the seat.
+ */
+async function returnSeatAfterSignal(ctx: CoreContext): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      returnLicense(ctx, { force: true }).then(() => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          try {
+            ctx.logger.warn(
+              `the license return did not finish within ${SIGNAL_LICENSE_RETURN_TIMEOUT_MS} ms; exiting anyway. The seat may still be held.`,
+            );
+          } catch {
+            // Losing a line must never prevent the exit.
+          }
+          resolve();
+        }, SIGNAL_LICENSE_RETURN_TIMEOUT_MS);
+      }),
+    ]);
+  } catch (error) {
+    try {
+      ctx.logger.error(
+        `the license return failed after a signal: ${describe(error)}. The seat may still be held.`,
+      );
+    } catch {
+      // The handler still exits with the signal's code.
+    }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
  * `unityci license status`: reports the state without deciding policy. An
  * inactive licence is reported, not failed: the run lifecycle activates it in
  * an activation mode. A CLI that does not know `license status` cannot answer
@@ -310,10 +352,23 @@ async function dispatch(
       );
     }
 
-    case 'license':
-      if (sub === 'activate') return licenseActivateCommand(ctx);
+    case 'license': {
+      if (sub === 'activate') {
+        // `license activate` takes a seat of its own. The signal path is
+        // licence-only (no summary exists) and still bounded by the same 45 s
+        // budget, so an interrupt cannot leak the seat.
+        const handlers = installSignalHandlers(ctx, () =>
+          returnSeatAfterSignal(ctx),
+        );
+        try {
+          return await licenseActivateCommand(ctx);
+        } finally {
+          handlers.dispose();
+        }
+      }
       if (sub === 'return') return licenseReturnCommand(ctx);
       return licenseStatus(ctx);
+    }
 
     case 'run': {
       // The run lifecycle is the only path that holds a licence seat and writes
@@ -379,6 +434,16 @@ export async function main(argv: string[]): Promise<number> {
     if (parsed.flags.version === true) {
       safeStdout(`${packageVersion()}\n`);
       return EXIT.SUCCESS;
+    }
+
+    // A silent drop of editor arguments is worse than refusing them. Forwarding
+    // is a per-command feature (`unity test` after `--`, `unity build` through
+    // one shell-split `--args` string), deferred beyond M1-M3.
+    if (parsed.passthrough.length > 0) {
+      return usageError(
+        redactor,
+        'editor arguments after -- are not forwarded yet; test.nographics covers the common case',
+      );
     }
 
     const head = parsed.command[0];
@@ -475,10 +540,4 @@ export async function main(argv: string[]): Promise<number> {
     }
     return EXIT.INTERNAL_ERROR;
   }
-}
-
-/** The bin contract: set `process.exitCode`, never call `process.exit`. */
-const entry = process.argv[1];
-if (entry !== undefined && import.meta.url === pathToFileURL(entry).href) {
-  process.exitCode = await main(process.argv.slice(2));
 }
