@@ -1205,6 +1205,8 @@ Expected: FAIL — module not found.
 
 **The bin exits with `process.exitCode = await main(...)`, never `process.exit(code)`.** `process.exit` cuts off pending asynchronous work — including the licence return and the summary write — and a truncated stdout on a passing run looks identical to a crash. Setting `exitCode` lets the event loop drain first. The **only** place `process.exit` is legitimate is inside the signal handler, after the teardown and the summary write have both been awaited.
 
+**The logger writes to stderr; stdout carries only intentional machine-readable output.** A caller must be able to run `unityci cache-info --json | jq` and `unityci cache-info --json > info.json` and get a clean document, so no log line may share that stream. stdout is reserved for the `--json` document and for GitHub workflow commands (`::error::`), which Actions requires on stdout. Everything a human reads — progress, warnings, the redacted diagnostic detail — goes to stderr. This is a global rule for every command, not just `cache-info`.
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `pnpm -C core test`
