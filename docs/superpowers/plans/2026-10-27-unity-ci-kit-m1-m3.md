@@ -1414,7 +1414,7 @@ git commit -m "feat: add the minimal example Unity project"
 
 **Files:**
 - Create: `.github/workflows/ci.yml`, `.github/workflows/example.yml`, `.github/workflows/nightly.yml`
-- Create: `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `docs/local-development.md`, `docs/generic-ci.md`, `docs/compatibility.md`
+- Create: `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `LICENSE`, `docs/local-development.md`, `docs/generic-ci.md`, `docs/compatibility.md`, `docs/private-packages.md`
 - Modify: `unity-ci-design.md` (Section 12 hygiene items: license choice, trademark note)
 
 **Interfaces:**
@@ -1440,7 +1440,14 @@ it('the root package.json exposes test, build, typecheck and the three lint scri
 it('the self-CI workflow never runs Unity on a fork pull request', () => { /* example.yml has no pull_request trigger */ });
 it('a nightly workflow exists that installs the latest Unity CLI', () => { /* nightly.yml has a schedule trigger */ });
 it('the nightly workflow is not secret-bearing on fork pull requests', () => { /* no pull_request trigger */ });
+it('the GitHub action never exports a config override unconditionally', () => { /* every `export UNITYCI_<config>` inside a non-empty guard */ });
+it('the GitHub action gates its git teardown on a touched marker', () => { /* never removes a file it did not write */ });
+it('the published bin is executed and sets process.exitCode', () => { /* import the module, assert the code; see below */ });
 ```
+
+**The last three exist because the adapter is never executed by the suite.** Task 14's reviews found that the run step had silently overridden every project's configuration and that the git teardown could delete a `~/.gitconfig` it never wrote — both with the suite green. The action is YAML, so these tests are **structural**: parse `action.yml` with the `yaml` dependency the core already has, and assert the shape rather than the behaviour. A structural test that would have caught both bugs is worth more than no test at all, and it is the only kind available without an Actions runner.
+
+**The bin test must execute the module, not grep it.** `process.exitCode` assignment asserted by `toContain` passes on a dead branch and on a comment. Import `core/src/bin.ts` with a unique query specifier to defeat the module cache, with `process.argv` set to a known command, and assert the resulting `process.exitCode` — restoring both in a `finally`.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -1451,13 +1458,14 @@ Expected: FAIL — the scripts and workflow do not exist yet.
 
 Write the workflows and the four documents. The provider-neutrality lint script is:
 ```
-grep -rnE "GITHUB_|GITLAB_|JENKINS_|CIRCLECI_|BUILDKITE_|AZURE_" core/src --include=*.ts | grep -v "core/src/report/annotations.ts"
+grep -rnE "\b(GITHUB_|GITLAB_|JENKINS_|CIRCLECI_|BUILDKITE_|AZURE_)" core/src --include=*.ts | grep -v "core/src/report/annotations.ts"
 ```
-and must print nothing. The spawn lint script is:
+and must print nothing. **The `\b` is load-bearing**: `UNITY_GITHUB_TOKEN` and `UNITY_GITLAB_TOKEN` are *Unity's* credential names, which must stay in `core/src/exec.ts`'s strip list, and without the boundary they match. The spawn lint scripts are:
 ```
-grep -rnE "\b(spawn|spawnSync|exec|execFile|execSync)\(" core/src --include=*.ts | grep -v "core/src/exec.ts"
+grep -rnE "(^|[^.[:alnum:]_])(spawn|spawnSync|exec|execFile|execSync)\(" core/src --include=*.ts | grep -v "core/src/exec.ts"
+grep -rnE "['\"](node:)?child_process['\"]" core/src --include=*.ts | grep -v "core/src/exec.ts"
 ```
-and must print nothing.
+and both must print nothing. **The `\b` form the earlier draft used does not work either**: it matches `regex.exec(` and every other `RegExp.exec` call, of which the reporting layer has several, so the lint would fail on correct code. The lookbehind form `(?<!\.)` is worse — `grep -E` and ripgrep reject it, and it still lets `cp.spawn(` through. Excluding a preceding character that is not `.`, alphanumeric or underscore is what separates a real call from a method call; the second grep closes the import-aliasing hole the first cannot see.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
