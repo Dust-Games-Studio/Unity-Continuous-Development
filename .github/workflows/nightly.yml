@@ -1,0 +1,79 @@
+name: nightly
+
+# The upstream drift test (design Section 8.4). The Unity CLI is experimental
+# and self-updates, so a new beta can break the command/flag contract without
+# warning. This job installs the *latest* CLI on purpose (no version pin), runs
+# the unit suite and the real example integration, and opens an issue when the
+# contract has drifted. A failure here is upstream news, not a pull request
+# blocker.
+on:
+  schedule:
+    # Weekly: Monday 04:00 UTC. The design calls for a weekly drift run.
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    name: latest Unity CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pnpm
+        run: npm install --global pnpm@12.15.0
+
+      # Deliberately unpinned. `install.sh` fetches the current beta "until a
+      # stable release ships"; the Hub and winget/MSIX self-update regardless, so
+      # a version string here would be a fiction (docs/compatibility.md).
+      - name: Install the latest Unity CLI
+        run: |
+          curl -fsSL https://unity.com/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Record the CLI build under test
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          unity version --format json
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run the unit suite
+        run: pnpm run test
+
+      - name: Run the example project through the adapter
+        uses: ./adapters/github
+        with:
+          command: test
+          project-path: examples/minimal-project
+          unityci-version: source
+          accept-eula: true
+          license-mode: serial
+        env:
+          UNITY_LICENSE_SERIAL: ${{ secrets.UNITY_LICENSE_SERIAL }}
+
+      - name: Open or update the drift issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title='Nightly drift: the latest Unity CLI broke the contract'
+          body=$(printf 'The weekly upstream drift test failed against the latest Unity CLI.\n\nRun: %s\n\nA Unity CLI beta changed behaviour that unity-ci-kit depends on. Reproduce with `unity version --format json`, then check the tested range in `core/src/unity/cli.ts` and `docs/compatibility.md`.\n' "$RUN_URL")
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

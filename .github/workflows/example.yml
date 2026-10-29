@@ -1,0 +1,59 @@
+name: example
+
+# The real integration: a licensed Unity Editor runs the example project's
+# EditMode tests through the GitHub adapter.
+#
+# This workflow is deliberately NOT triggered by `pull_request` or
+# `pull_request_target`. A fork pull request cannot read repository secrets, and
+# a `pull_request_target` workflow that checks out fork code would hand those
+# secrets to it. It runs only on protected branches and on release tags.
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: example-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: example project (EditMode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # `unityci-version: source` builds the binary from this checkout, and the
+      # adapter's install step runs pnpm. Supply it before the action.
+      - name: Install pnpm
+        run: npm install --global pnpm@12.15.0
+
+      - name: Run the example project's tests
+        uses: ./adapters/github
+        with:
+          command: test
+          project-path: examples/minimal-project
+          unityci-version: source
+          # A declared choice, not a silent default: the Editor is not
+          # pre-installed on a clean runner and its licence agreements (and each
+          # required module's) must be accepted to install it unattended.
+          accept-eula: true
+          license-mode: serial
+        env:
+          # Environment only: the core reads the serial from here, so it never
+          # reaches a command line or a process listing.
+          UNITY_LICENSE_SERIAL: ${{ secrets.UNITY_LICENSE_SERIAL }}
+
+      - name: Summarise the result
+        if: always()
+        run: |
+          if [ -f examples/minimal-project/ci-output/summary.json ]; then
+            cat examples/minimal-project/ci-output/summary.json
+          fi

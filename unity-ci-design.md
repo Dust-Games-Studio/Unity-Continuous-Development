@@ -527,8 +527,8 @@ Two scoping notes on the list above. **R17** describes the default `license.mode
 
 ## 12. Open-source hygiene
 
-- License: MIT or Apache-2.0 (Apache-2.0 adds an explicit patent grant). Decide before first commit.
-- State clearly in the README: unaffiliated with Unity Technologies; "Unity" is their trademark.
+- License: **MIT** (decided — see `LICENSE`). Chosen as the lowest-friction option for a toolkit meant to be vendored and called from any CI system; Apache-2.0's explicit patent grant was considered and not required for v1.
+- **Trademark:** state clearly in the README that the project is unaffiliated with Unity Technologies and that "Unity" is their trademark. Wording used: "`unity-ci-kit` is not affiliated with, endorsed by, or sponsored by Unity Technologies. 'Unity' and the Unity logo are trademarks of Unity Technologies."
 - Semantic versioning, with a `docs/compatibility.md` matrix of tested Unity CLI and Editor versions. The runtime capability matrix from R13 is the machine-readable form of the same knowledge.
 - `CONTRIBUTING.md` documents the adapter contract (Section 5.1) and the "no core changes for a new provider" rule, with a how-to for writing a new adapter.
 - Security policy (`SECURITY.md`): how to report vulnerabilities, with a note about secrets handling.

@@ -1,0 +1,49 @@
+name: ci
+
+# The unit suite needs no Unity licence and no Editor: the fake `unity` binary
+# answers every invocation from a JSON scenario. This workflow therefore runs
+# on every push and every pull request, including forks.
+on:
+  push:
+  pull_request:
+
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests, typecheck and lint gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # pnpm is installed with npm rather than a third-party action: npm ships
+      # with every Node runtime, and the version is the one `packageManager`
+      # pins, so there is no extra action to keep pinned.
+      - name: Install pnpm
+        run: npm install --global pnpm@12.15.0
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Run the unit suite
+        run: pnpm run test
+
+      - name: Provider neutrality (core never reads provider state)
+        run: pnpm run lint:provider-neutrality
+
+      - name: Single spawn point (core spawns only through exec.ts)
+        run: pnpm run lint:spawn
+
+      - name: Adapter conformance
+        run: pnpm run check:adapters

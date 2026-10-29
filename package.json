@@ -4,8 +4,17 @@
   "private": true,
   "description": "Provider-neutral CI toolkit for Unity, built on Unity's own CLI",
   "license": "MIT",
+  "type": "module",
   "packageManager": "pnpm@12.15.0",
   "engines": {
     "node": ">=22.12"
+  },
+  "scripts": {
+    "test": "pnpm -C core test",
+    "build": "pnpm -C core build",
+    "typecheck": "pnpm -C core typecheck",
+    "lint:provider-neutrality": "node -e \"const fs=require('node:fs'),path=require('node:path');const re=/\\b(GITHUB_|GITLAB_|JENKINS_|CIRCLECI_|BUILDKITE_|AZURE_)/;const skip=path.normalize('core/src/report/annotations.ts');const hits=[];(function walk(d){for(const e of fs.readdirSync(d,{withFileTypes:true})){const p=path.normalize(path.join(d,e.name));if(e.isDirectory())walk(p);else if(e.name.endsWith('.ts')&&p!==skip){fs.readFileSync(p,'utf8').split(/\\r?\\n/).forEach((line,i)=>{if(re.test(line))hits.push(p+':'+(i+1)+':'+line)})}}})('core/src');if(hits.length){console.error(hits.join('\\n'));process.exitCode=1}\"",
+    "lint:spawn": "node -e \"const fs=require('node:fs'),path=require('node:path');const call=/(?:^|[^.\\w])(spawn|spawnSync|exec|execFile|execSync)\\(/;const importRe=/[\\x22\\x27](?:node:)?child_process[\\x22\\x27]/;const skip=path.normalize('core/src/exec.ts');const hits=[];(function walk(d){for(const e of fs.readdirSync(d,{withFileTypes:true})){const p=path.normalize(path.join(d,e.name));if(e.isDirectory())walk(p);else if(e.name.endsWith('.ts')&&p!==skip){fs.readFileSync(p,'utf8').split(/\\r?\\n/).forEach((line,i)=>{if(call.test(line)||importRe.test(line))hits.push(p+':'+(i+1)+':'+line)})}}})('core/src');if(hits.length){console.error(hits.join('\\n'));process.exitCode=1}\"",
+    "check:adapters": "node --no-warnings --experimental-strip-types --input-type=module -e \"import { checkAdapter } from './testing/conformance/check-adapters.ts'; const results = await checkAdapter('adapters/github'); const failed = results.filter((result) => !result.ok); for (const failure of failed) console.error(failure.file + ': ' + failure.rule + ': ' + failure.detail); process.exitCode = failed.length === 0 ? 0 : 1;\""
   }
 }
