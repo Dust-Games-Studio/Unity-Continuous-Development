@@ -1189,6 +1189,10 @@ Expected: FAIL — module not found.
 
 `cli.ts` wires the dispatch and is the only place that knows the command names. It registers the secret env vars with the redactor **before** the logger is created (GC6), so no secret can reach the log.
 
+**It installs the signal handlers (Task 11), or they are dead code.** `installSignalHandlers(ctx, onSignal)` must be called once, before the command runs, and `dispose()`d in a `finally`; `onSignal(code)` sets `ctx.signalCode` (so the lifecycle stops and does not write a rival summary), runs the bounded teardown, and writes `summary.json` as `infra_failed` with the signal's exit code **before** exiting. Without this wiring a Ctrl-C or a CI timeout leaves a Unity seat held, which is the one failure the toolkit exists to prevent.
+
+**The bin exits with `process.exitCode = await main(...)`, never `process.exit(code)`.** `process.exit` cuts off pending asynchronous work — including the licence return and the summary write — and a truncated stdout on a passing run looks identical to a crash. Setting `exitCode` lets the event loop drain first. The **only** place `process.exit` is legitimate is inside the signal handler, after the teardown and the summary write have both been awaited.
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `pnpm -C core test`
