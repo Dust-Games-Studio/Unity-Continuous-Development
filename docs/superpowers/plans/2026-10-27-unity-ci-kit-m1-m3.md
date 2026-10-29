@@ -323,7 +323,7 @@ ci-output/
 
 The `!*/src/packages/**` negation is **not** cosmetic. The pre-existing NuGet rule `**/[Pp]ackages/*` matches the toolkit's **own** source directory `core/src/packages/`, so without the negation any new file placed there is invisible to `git status` and to `git add .` — it would be silently lost. Verified: with the rule alone, `git check-ignore --no-index -v core/src/packages/<new>.ts` matches; with the negation, `git status` reports the file and `git add -n` stages it.
 
-`core/package.json` declares `"type": "module"`, `"bin": { "unityci": "./dist/cli.js" }`, the three dev dependencies at their exact pinned versions (`typescript@5.9.3`, `vitest@5.0.5`, `@types/node@26.6.5`), the scripts `build` (`tsc -p tsconfig.json`), `typecheck` (`tsc -p tsconfig.test.json`) and `test` (`vitest run`), and `"engines": { "node": ">=22.4" }`.
+`core/package.json` declares `"type": "module"`, `"bin": { "unityci": "./dist/bin.js" }`, the three dev dependencies at their exact pinned versions (`typescript@5.9.3`, `vitest@5.0.5`, `@types/node@26.6.5`), the scripts `build` (`tsc -p tsconfig.json`), `typecheck` (`tsc -p tsconfig.test.json`) and `test` (`vitest run`), and `"engines": { "node": ">=22.4" }`.
 
 **The tests are typechecked too.** `core/tsconfig.json` is the *build* config — `include: ["src/**/*.ts"]`, `rootDir: "src"`, `outDir: "dist"` — so the test files are outside it. `core/tsconfig.test.json` extends it, sets `noEmit: true`, `rootDir: "."` and `include: ["src/**/*.ts", "test/**/*.ts"]`, and the `typecheck` script points at **that** file. A plain `tsc --noEmit` over the build config silently skips every test file, so a test that does not compile would pass the typecheck and fail only at runtime.
 
@@ -1239,7 +1239,7 @@ git commit -m "feat: add the CLI entrypoint and the fake unity binary"
 - Consumes: the `unityci` binary and the `summary.json` / `ci-output/` contract.
 - Produces:
   - `adapters/github/action.yml` — a composite action (`runs.using: composite`). Inputs: `command` (`test` | `build`), `project-path`, `config`, `output-dir`, `annotations`, `license-mode`, `accept-eula` (`false` | `true`), `unityci-version` (default `source`), `unity-version`, `build-target`, `shards`, `cache` (`true` | `false`). Steps, in order:
-    1. Install the `unityci` binary — when `unityci-version` is `source`, run `pnpm install --frozen-lockfile && pnpm --filter @unityci/core build` and use `core/dist/cli.js`; otherwise `npm install -g @unityci/core@<unityci-version>`.
+    1. Install the `unityci` binary — when `unityci-version` is `source`, run `pnpm install --frozen-lockfile && pnpm --filter @unityci/core build` and use `core/dist/bin.js`; otherwise `npm install -g @unityci/core@<unityci-version>`.
     2. Install the Unity CLI — `curl -fsSL https://unity.com/install.sh | bash` and add `$HOME/.local/bin` to `$GITHUB_PATH`. The installer takes the latest beta; the core warns when the running CLI is newer than tested and never fails on it (GC17).
     3. Install the Editor's runtime libraries — the exact `apt-get` list recorded in Spike 0 (S5), with a `t64`-suffix fallback for older images, plus `ulimit -n 4096`. The list is **inferred, not Unity-published**; the step's comment must say so.
     4. Restore the Editor **download** cache — `actions/cache` with `path: ~/.config/unityhub/downloads` and `key: unity-downloads-<editorVersion>`. Never cache or delete the Editor install directory: it is global and shared with the Hub and other projects.
@@ -1392,7 +1392,7 @@ Expected: PASS — all tests green.
 
 - [ ] **Step 5: Verify the example actually runs (manual, not part of the automated suite)**
 
-Run: `node core/dist/cli.js run test --project-path examples/minimal-project --output-dir examples/minimal-project/ci-output`
+Run: `node core/dist/bin.js run test --project-path examples/minimal-project --output-dir examples/minimal-project/ci-output`
 Expected: exit 0, `examples/minimal-project/ci-output/summary.json` written with `"status": "passed"`.
 
 - [ ] **Step 6: Commit**
