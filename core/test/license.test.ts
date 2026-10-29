@@ -550,22 +550,35 @@ describe('activateLicense', () => {
 });
 
 describe('returnLicense', () => {
-  it('is a no-op that spawns nothing when this process activated no seat', async () => {
-    const ctx = makeContext('none');
+  it('skips without spawning when this process activated no seat', async () => {
+    const ctx = makeContext('serial');
     ctx.licenseActivated = false;
 
     const result = await returnLicense(ctx);
 
     // GC9 enters the teardown on every path; the gate is what keeps a
     // developer's own personal licence from being returned locally.
-    expect(result).toEqual({ returned: false, code: 0, seatLeaked: false });
+    expect(result).toEqual({ returned: false, code: 0, skipped: true });
     expect(mocks.runUnity).not.toHaveBeenCalled();
     expect(lines.join('')).toContain('activated no license seat');
   });
 
-  it('returns the seat with force: true even when this process activated nothing', async () => {
-    // The standalone `unityci license return` command: the user explicitly asked
-    // for the seat back, so the gate must not swallow the call.
+  it('skips under license.mode: none even with force: true', async () => {
+    const ctx = makeContext('none');
+    ctx.licenseActivated = true;
+
+    const result = await returnLicense(ctx, { force: true });
+
+    // `none` is the user stating the toolkit does not manage licences: no
+    // caller's intent may return the machine's own personal licence.
+    expect(result).toEqual({ returned: false, code: 0, skipped: true });
+    expect(mocks.runUnity).not.toHaveBeenCalled();
+    expect(lines.join('')).toContain('license.mode is "none"');
+  });
+
+  it('returns the seat with force: true when this process activated nothing', async () => {
+    // The reclaim-a-dead-job workflow: a fresh process with no activation, but
+    // the user explicitly asked for the seat back.
     const ctx = makeContext('serial');
     ctx.licenseActivated = false;
 
@@ -587,7 +600,7 @@ describe('returnLicense', () => {
   });
 
   it('returns the license with --yes', async () => {
-    const result = await returnLicense(makeContext('none'));
+    const result = await returnLicense(makeContext('serial'));
 
     expect(result).toEqual({ returned: true, code: 0, seatLeaked: false });
     expect(calls).toHaveLength(1);
@@ -622,7 +635,7 @@ describe('returnLicense', () => {
   it('swallows a thrown return failure too', async () => {
     mocks.runUnity.mockRejectedValue(new Error('spawn exploded'));
 
-    const result = await returnLicense(makeContext('none'));
+    const result = await returnLicense(makeContext('serial'));
 
     expect(result).toMatchObject({ returned: false, code: 6, seatLeaked: false });
     expect(lines.join('')).toContain('spawn exploded');
@@ -727,7 +740,7 @@ describe('returnLicense', () => {
   it('exits 6 when the return call failed: the standalone command must be honest', async () => {
     mocks.runUnity.mockRejectedValue(new Error('boom'));
 
-    const code = await licenseReturnCommand(makeContext('none'));
+    const code = await licenseReturnCommand(makeContext('serial'));
 
     expect(code).toBe(6);
     expect(lines.join('')).toMatch(/could not return the Unity license/i);
@@ -738,13 +751,38 @@ describe('returnLicense', () => {
       record(options);
       return failed(7, 'the licensing service is unreachable');
     });
-    expect(await licenseReturnCommand(makeContext('none'))).toBe(6);
+    expect(await licenseReturnCommand(makeContext('serial'))).toBe(6);
 
     mocks.runUnity.mockImplementation(async (options: UnityCall) => {
       record(options);
       return ok({});
     });
-    expect(await licenseReturnCommand(makeContext('none'))).toBe(0);
+    expect(await licenseReturnCommand(makeContext('serial'))).toBe(0);
+  });
+
+  it('the standalone command returns a seat in a fresh process', async () => {
+    // Regression: the command must set force, or a process that inherited no
+    // activation (the reclaim-a-dead-job workflow) would never try.
+    const ctx = makeContext('serial');
+    ctx.licenseActivated = false;
+
+    const code = await licenseReturnCommand(ctx);
+
+    expect(code).toBe(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toEqual(['license', 'return', '--yes', '--format', 'json']);
+  });
+
+  it('the standalone command is a successful no-op under license.mode: none', async () => {
+    const ctx = makeContext('none');
+    ctx.licenseActivated = false;
+
+    const code = await licenseReturnCommand(ctx);
+
+    // Nothing to return and nothing destructive attempted: success, not 6.
+    expect(code).toBe(0);
+    expect(mocks.runUnity).not.toHaveBeenCalled();
+    expect(lines.join('')).toContain('license.mode is "none"');
   });
 });
 

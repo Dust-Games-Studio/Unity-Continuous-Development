@@ -33,6 +33,13 @@ export async function licenseActivateCommand(ctx: CoreContext): Promise<number> 
  * `unityci license return`: the teardown command adapters call from an
  * `always()` step.
  *
+ * It is the one caller that sets `force`, because the user explicitly asked for
+ * a seat back — typically after a job died before its own teardown, so there is
+ * no activation in *this* process to inherit. `force` overrides the activation
+ * gate only: under `license.mode: none` the toolkit does not manage seats, so
+ * `returnLicense` skips and this command exits 0 rather than returning whatever
+ * personal licence the machine holds.
+ *
  * A failed return — or a return that leaves a seat held (`seatLeaked`) — exits
  * **6**. This is deliberately different from the run lifecycle's teardown: that
  * teardown has a primary exit code to preserve and only logs the result (GC9),
@@ -46,7 +53,9 @@ export async function licenseActivateCommand(ctx: CoreContext): Promise<number> 
  * adapter conformance rule covers that, not this command.
  */
 export async function licenseReturnCommand(ctx: CoreContext): Promise<number> {
-  const result = await returnLicense(ctx);
+  const result = await returnLicense(ctx, { force: true });
+  // A skipped return is "there was nothing to return", not a failure.
+  if (result.skipped === true) return EXIT.SUCCESS;
   const freed = result.returned && result.seatLeaked !== true;
   return freed ? EXIT.SUCCESS : EXIT.COMMAND_FAILED;
 }

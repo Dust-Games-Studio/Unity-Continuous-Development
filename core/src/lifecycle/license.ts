@@ -47,6 +47,13 @@ export interface LicenseReturnResult {
   error?: string;
   /** `license.mode: offline-file`: the CLI leaves the licence in place. */
   seatLeaked?: boolean;
+  /**
+   * True when no return was attempted because there was nothing for this
+   * toolkit to return: `license.mode: none` always, or an unforced teardown in a
+   * process that activated no seat. A skipped return is **not** a failure — the
+   * standalone command exits 0 for it.
+   */
+  skipped?: boolean;
 }
 
 /**
@@ -457,7 +464,8 @@ export interface ReturnLicenseOptions {
   /**
    * Return a seat this process did not take. The standalone
    * `unityci license return` command sets it because the user explicitly asked
-   * for the seat back; a run lifecycle never does.
+   * for the seat back; a run lifecycle never does. It overrides the **activation
+   * gate only** — `license.mode: none` still skips.
    */
   force?: boolean;
 }
@@ -473,15 +481,26 @@ export interface ReturnLicenseOptions {
  * is bounded to 60 s.
  *
  * The teardown is **unconditional in the sense that it is always entered**, but
- * it returns a seat only if this process took one. A blanket
- * `unity license return` under `license.mode: none` would return the developer's
- * own personal licence as a side effect of running the toolkit locally. So unless
- * `ctx.licenseActivated` is true **or** `opts.force` is set, this is a
- * debug-logged no-op: `{ returned: false, code: 0 }`, spawning nothing.
+ * it returns a seat only when the toolkit has one to return. Two independent
+ * guards, either of which skips:
  *
- * `opts.force` is for a caller that represents an explicit user request, not a
- * run: the standalone `license return` command. A signal-driven teardown from a
- * run does **not** set it and inherits the same gate through this function.
+ * 1. `ctx.licenseActivated` is not true and `opts.force` is not set — this
+ *    process never took a seat, so an unforced teardown has nothing to return.
+ * 2. `license.mode: none` — **always**, even with `opts.force`. `none` is the
+ *    user stating that the toolkit does not manage licences; returning the
+ *    developer's own personal licence would be destructive, and no caller's
+ *    intent can override that statement.
+ *
+ * Checked in that order only so a local run under `mode: none` reports the
+ * accurate reason ("this process activated no seat") rather than a policy it
+ * happens to share. A skip is a debug-logged no-op:
+ * `{ returned: false, code: 0, skipped: true }`, spawning nothing. It is not a
+ * failure.
+ *
+ * `opts.force` overrides guard 1 only. Its real workflow: a CI job activated a
+ * seat under `license.mode: serial`, died before the teardown, and someone runs
+ * `unityci license return` in a fresh process to reclaim it. A signal-driven
+ * teardown from a run does **not** set it and inherits the same guards.
  */
 export async function returnLicense(
   ctx: CoreContext,
@@ -496,7 +515,15 @@ export async function returnLicense(
         'debug',
         'this process activated no license seat; not running `unity license return`.',
       );
-      return { returned: false, code: EXIT.SUCCESS, seatLeaked: false };
+      return { returned: false, code: EXIT.SUCCESS, skipped: true };
+    }
+    if (ctx.config.license.mode === 'none') {
+      safeLog(
+        ctx,
+        'debug',
+        'license.mode is "none": the toolkit does not manage license seats; not running `unity license return`.',
+      );
+      return { returned: false, code: EXIT.SUCCESS, skipped: true };
     }
 
     // An offline `--file` licence is left in place by `unity license return`,
