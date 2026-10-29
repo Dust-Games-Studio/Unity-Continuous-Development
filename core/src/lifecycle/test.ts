@@ -15,12 +15,17 @@
  * failed" without a report is not a result anyone can act on. Both are
  * `infra_failed` (exit 6). A report that exists but cannot be parsed is exit 65
  * (GC7), never a zero-count pass.
+ *
+ * D8: when Unity produced no JUnit file (missing **or** empty), the core
+ * converts the NUnit report and writes the `.junit.xml` through the redactor.
+ * Unity's own file wins whenever it is non-empty.
  */
-import { mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { doctorCommand } from '../commands/doctor.js';
 import type { CoreContext } from '../context.js';
 import { EXIT } from '../exit-codes.js';
+import { nunitToJUnit } from '../report/junit.js';
 import { ReportParseError, parseNUnit, type TestCounts } from '../report/nunit.js';
 import {
   buildSummary,
@@ -78,8 +83,13 @@ function addCounts(into: TestCounts, from: TestCounts): void {
   into.skipped += from.skipped;
 }
 
-/** True for an existing, non-empty regular file (R18). */
-function isNonEmptyFile(path: string): boolean {
+/**
+ * True for an existing, non-empty regular file (R18).
+ *
+ * Shared with `build.ts`: both lifecycles verify an artifact before believing
+ * Unity's exit code, so the rule lives in exactly one place.
+ */
+export function isNonEmptyFile(path: string): boolean {
   try {
     const stats = statSync(path);
     return stats.isFile() && stats.size > 0;
@@ -103,8 +113,13 @@ function removeReport(path: string): void {
   }
 }
 
-/** A report path relative to the output directory, with forward slashes. */
-function reportPath(outputDir: string, file: string): string {
+/**
+ * A path relative to the output directory, with forward slashes.
+ *
+ * Shared with `build.ts` for report, artifact and log paths, so every path
+ * published in `summary.json` has the same shape on every platform.
+ */
+export function reportPath(outputDir: string, file: string): string {
   const relativePath = relative(outputDir, file);
   const value =
     relativePath === '' || relativePath.startsWith('..') || isAbsolute(relativePath)
@@ -165,8 +180,12 @@ function testArguments(ctx: CoreContext, mode: string, outputDir: string): strin
   return args;
 }
 
-/** The summary with every free-form string masked before it is serialised (GC5). */
-function redactSummary(ctx: CoreContext, summary: Summary): Summary {
+/**
+ * The summary with every free-form string masked before it is serialised
+ * (GC5). Shared with `build.ts`, which additionally masks its provenance
+ * manifest before writing.
+ */
+export function redactSummary(ctx: CoreContext, summary: Summary): Summary {
   const redact = (value: string): string => ctx.redactor.redact(value);
   const optional = (value: string | null): string | null =>
     value === null ? null : redact(value);
@@ -237,8 +256,11 @@ async function runMode(
  * the same rule. Nothing activated (a failed doctor or setup, `license.mode:
  * none`) means nothing is returned — a developer's own personal licence must
  * never be returned as a side effect of running the toolkit locally.
+ *
+ * Shared with `build.ts`: both lifecycles enter the same teardown, and neither
+ * may decide on its own whether a seat is returnable.
  */
-async function teardownLicense(ctx: CoreContext): Promise<LicenseReturnResult> {
+export async function teardownLicense(ctx: CoreContext): Promise<LicenseReturnResult> {
   try {
     return await returnLicense(ctx);
   } catch (error) {
@@ -359,6 +381,24 @@ export async function runTest(ctx: CoreContext): Promise<TestRunResult> {
         }
 
         addCounts(tests, counts);
+
+        // D8: Unity's own JUnit file is authoritative only when it produced a
+        // non-empty one. A missing or empty sibling is "not produced" (R18), so
+        // the core converts its NUnit report. The write goes through the
+        // redactor because the JUnit file is an artifact CI uploads (GC5).
+        if (!hasJunit) {
+          try {
+            writeFileSync(outcome.junit, ctx.redactor.redact(nunitToJUnit(xml)), 'utf8');
+          } catch (error) {
+            ctx.logger.error(
+              `could not write the ${mode} JUnit report at ${outcome.junit}: ${describe(error)}`,
+            );
+            raise(EXIT.INTERNAL_ERROR, RANK.internal);
+          }
+          if (isNonEmptyFile(outcome.junit)) {
+            junitReports.push(reportPath(summaryDir, outcome.junit));
+          }
+        }
 
         if (outcome.code !== EXIT.SUCCESS && outcome.code !== EXIT.TESTS_FAILED) {
           // The invocation itself failed (11, 12, 14, …): infrastructure, even

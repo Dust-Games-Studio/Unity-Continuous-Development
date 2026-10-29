@@ -10,6 +10,7 @@ import { resolve } from 'node:path';
 import { validateConfig } from '../config/validate.js';
 import type { CoreContext } from '../context.js';
 import { EXIT } from '../exit-codes.js';
+import { runBuild } from '../lifecycle/build.js';
 import { runTest } from '../lifecycle/test.js';
 import { buildSummary, writeSummary } from '../report/summary.js';
 
@@ -61,8 +62,9 @@ function writeConfigErrorSummary(ctx: CoreContext, command: 'test' | 'build'): v
  * `unityci run test|build`.
  *
  * A configuration problem is exit 64 with nothing spawned; otherwise the
- * lifecycle's exit code is returned verbatim: 0 passed, 8 tests failed, and the
- * raw Unity code for any infrastructure failure (6, 11, 12, 14, 65 …).
+ * lifecycle's exit code is returned verbatim: 0 passed, 8 tests failed, 6 when
+ * nothing usable was produced, 65 for a malformed artifact, and the raw Unity
+ * code for any infrastructure failure (11, 12, 14 …).
  */
 export async function runCommand(
   ctx: CoreContext,
@@ -78,10 +80,8 @@ export async function runCommand(
   }
 
   if (sub === 'build') {
-    // Task 10 supplies the build lifecycle. Until then the command is a clear,
-    // controlled failure rather than a silent no-op.
-    ctx.logger.error('`unityci run build` is not implemented in this build of the toolkit.');
-    return EXIT.INTERNAL_ERROR;
+    const result = await runBuild(ctx);
+    return result.exitCode;
   }
 
   const result = await runTest(ctx);
