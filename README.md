@@ -53,11 +53,12 @@ node core/dist/bin.js run test --project-path /path/to/your/unity/project
 ```
 
 `doctor` is the preflight gate: it runs `unity doctor --ci`, checks the CLI
-version, glibc (on Linux), free disk space, the project's `.meta` files, the
-licence state and the reachability of git package dependencies. `run test`
-repeats the checks it needs, resolves the Editor from
-`ProjectSettings/ProjectVersion.txt`, runs one Editor per configured test mode,
-asserts the reports exist, and writes `ci-output/summary.json`.
+version, glibc (on Linux), free disk space, the project's `.meta` files and the
+licence state. `run test` repeats the checks it needs, resolves the Editor from
+`ProjectSettings/ProjectVersion.txt`, preflights the project's git package
+dependencies with `git ls-remote` (so a missing private-package credential fails
+before an Editor starts), runs one Editor per configured test mode, asserts the
+reports exist, and writes `ci-output/summary.json`.
 
 By default `license.mode: none` means an **active licence is a precondition** —
 the toolkit never activates one silently. Point it at one of the unattended
@@ -91,15 +92,22 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pnpm
+        run: npm install --global pnpm@12.15.0
       - name: Run the tests
         uses: your-org/unity-ci-kit/adapters/github@<commit-sha>
         with:
           command: test                 # test | build
+          unityci-version: source       # builds the binary from this checkout
           license-mode: serial
           accept-eula: true             # declared: installs a missing Editor
         env:
           UNITY_LICENSE_SERIAL: ${{ secrets.UNITY_LICENSE_SERIAL }}
 ```
+
+The `pnpm` step is required because the action's default
+`unityci-version: source` builds the binary from the checkout it lives in. If
+you pass a published `@unityci/core` version instead, you can omit it.
 
 The action installs the binary, restores the Editor download cache and the
 project `Library/`, calls `unityci`, uploads `ci-output/`, returns the licence

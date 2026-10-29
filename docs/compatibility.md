@@ -84,7 +84,8 @@ a generic crash.
 | Area | What is probed / called | What happens when it is missing |
 |---|---|---|
 | Identity | `unity version --format json` | Recorded in `summary.json`; an incomparable version is `info`, not a failure. |
-| Preflight | `unity doctor --ci --format json` | The core's own checks (CLI range, glibc, disk space, licence, git dependencies, `projects verify`) still run. |
+| Preflight | `unity doctor --ci --format json` | The core's own checks (CLI range, glibc, disk space, licence, `projects verify`) still run. |
+| Run preflight | `git ls-remote --exit-code <url>` in the setup step of `run` | A broken manifest is exit 64; an unreachable private dependency is exit 64 before an Editor starts. `doctor` does not run this check. |
 | Project integrity | `unity projects verify --strict --format json` | A missing/unparsable report is `info`; a non-zero exit or findings is a blocking failure. |
 | Editor | `unity editors --installed --format json`, `unity install-path` | An install happens only with `acceptEula: true`; otherwise exit 64 names the exact `unity install` command. Modules required by the invoked command are checked too. |
 | Terms | `unity terms accept <version> --yes` | A CLI without it is reported; the Editor may stop on the terms dialog. `unity.editor.terms: false` is the explicit opt-out. |

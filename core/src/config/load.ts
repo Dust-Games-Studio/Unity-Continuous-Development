@@ -22,6 +22,81 @@ const LICENSE_SECRET_KEYS: ReadonlySet<string> = new Set([
   'serviceaccountsecret',
 ]);
 
+/**
+ * The environment-only secret names (GC5). Matching is case-insensitive and
+ * tolerates `_`/`-` spelling variants, so a committed `unity-license-serial`
+ * key cannot slip past a camelCase-only check. `UNITYCI_SECRET_*` is a prefix,
+ * not one of the exact names.
+ */
+const SECRET_ENV_NAMES: ReadonlySet<string> = new Set([
+  'UNITY_LICENSE_SERIAL',
+  'UNITY_LICENSE_FILE_BASE64',
+  'UNITY_SERVICE_ACCOUNT_ID',
+  'UNITY_SERVICE_ACCOUNT_SECRET',
+]);
+
+/**
+ * The two settings whose *value* is legitimately an environment-variable name.
+ * `license.serialEnv` and `license.fileEnv` exist to say which variable to read;
+ * rejecting `UNITY_LICENSE_SERIAL` there would reject the documented config and
+ * the built-in default.
+ */
+const SECRET_ENV_NAME_SETTINGS: ReadonlySet<string> = new Set([
+  'license.serialEnv',
+  'license.fileEnv',
+]);
+
+function normaliseEnvName(name: string): string {
+  return name.trim().toUpperCase().replace(/-/g, '_');
+}
+
+/** Whether a key or string value names an environment-only secret channel. */
+function isSecretEnvName(name: string): boolean {
+  const normalised = normaliseEnvName(name);
+  return (
+    normalised.startsWith('UNITYCI_SECRET_') || SECRET_ENV_NAMES.has(normalised)
+  );
+}
+
+function childPath(parent: string, child: string | number): string {
+  if (typeof child === 'number') return `${parent}[${child}]`;
+  return parent === '' ? child : `${parent}.${child}`;
+}
+
+/** The environment-variable form of a name, for the message that tells the user what to set. */
+function canonicalSecretName(name: string): string {
+  return normaliseEnvName(name);
+}
+
+/**
+ * A secret name used as a **key**. The message names the variable to set in the
+ * environment and the offending path, never the value beside it.
+ */
+function secretKeyIssue(path: string, variable: string): ConfigIssue {
+  const canonical = canonicalSecretName(variable);
+  return {
+    path,
+    message:
+      `${path} is an environment variable name used as a config key. Secrets are ` +
+      `environment-only: set ${canonical} in the environment and remove this key from the file.`,
+  };
+}
+
+/**
+ * A secret name used as a **value** (for example `serial: UNITY_LICENSE_SERIAL`).
+ * The value is the channel name, not the secret itself, so naming it tells the
+ * reader exactly which variable to set.
+ */
+function secretValueIssue(path: string, variable: string): ConfigIssue {
+  const canonical = canonicalSecretName(variable);
+  return {
+    path,
+    message:
+      `${path} names the secret channel ${canonical}. The secret belongs in the ` +
+      `environment, not in a config file: set ${canonical} in the environment and remove it from the file.`,
+  };
+}
+
 export interface LoadConfigOptions {
   /** The already-resolved Unity project root; the config file is read from here. */
   projectPath: string;
@@ -153,6 +228,52 @@ function collectLicenseSecrets(
   }
 }
 
+/**
+ * Scans the **whole parsed document** — every object key and every string value,
+ * at any depth, including array entries — for a name that belongs in the
+ * environment. A secret committed to `unity-ci.yml` is the leak GC5 exists to
+ * prevent, and it is the one a user is most likely to create by accident; an
+ * unknown key would otherwise be dropped silently by {@link mergeDeep}.
+ *
+ * `license.serialEnv`/`license.fileEnv` are the documented exception: their
+ * value is *supposed* to be the variable name, so only keys are checked there.
+ */
+function collectSecretNames(
+  node: unknown,
+  path: string,
+  found: ConfigIssue[],
+): void {
+  if (Array.isArray(node)) {
+    node.forEach((entry, index) => {
+      const next = childPath(path, index);
+      if (typeof entry === 'string' && isSecretEnvName(entry)) {
+        found.push(secretValueIssue(next, entry));
+        return;
+      }
+      collectSecretNames(entry, next, found);
+    });
+    return;
+  }
+
+  if (!isPlainObject(node)) return;
+  for (const [key, value] of Object.entries(node)) {
+    const next = childPath(path, key);
+    if (isSecretEnvName(key)) {
+      found.push(secretKeyIssue(next, key));
+      continue;
+    }
+    if (
+      typeof value === 'string' &&
+      isSecretEnvName(value) &&
+      !SECRET_ENV_NAME_SETTINGS.has(next)
+    ) {
+      found.push(secretValueIssue(next, value));
+      continue;
+    }
+    collectSecretNames(value, next, found);
+  }
+}
+
 function readConfigFile(file: string, issues: ConfigIssue[]): DeepPartial<Config> {
   let text: string;
   try {
@@ -182,13 +303,20 @@ function readConfigFile(file: string, issues: ConfigIssue[]): DeepPartial<Config
     return {};
   }
 
-  const secrets: ConfigIssue[] = [];
-  collectLicenseSecrets(document['license'], 'license', secrets);
+  const licenseSecrets: ConfigIssue[] = [];
+  collectLicenseSecrets(document['license'], 'license', licenseSecrets);
+
+  // Whole-document scan: an environment-only name in *any* key or string value
+  // is a configuration error, not an unknown key to drop.
+  const secretNames: ConfigIssue[] = [];
+  collectSecretNames(document, '', secretNames);
+
+  const secrets = [...licenseSecrets, ...secretNames];
   issues.push(...secrets);
 
-  // A file that carries a secret is never honoured: only the non-secret keys
-  // survive, and the caller's exit 64 makes the omission irrelevant.
-  return secrets.length === 0 ? (document as DeepPartial<Config>) : withoutLicense(document);
+  // A license secret invalidates the license block; the other layers stay
+  // usable. Any secret makes the caller exit 64, so the merge cannot leak it.
+  return licenseSecrets.length === 0 ? (document as DeepPartial<Config>) : withoutLicense(document);
 }
 
 /** Drops `license` entirely when it contained a secret, keeping other layers usable. */

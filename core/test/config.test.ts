@@ -193,6 +193,121 @@ describe('secrets', () => {
     expect(issues.length).toBeGreaterThan(0);
     expect(config.license.mode).toBe('none');
   });
+
+  it('rejects every environment-only secret name as a key, at any depth', () => {
+    const names = [
+      'UNITY_LICENSE_SERIAL',
+      'UNITY_LICENSE_FILE_BASE64',
+      'UNITY_SERVICE_ACCOUNT_ID',
+      'UNITY_SERVICE_ACCOUNT_SECRET',
+      'UNITYCI_SECRET_MY_TOKEN',
+    ];
+
+    for (const name of names) {
+      for (const [body, expectedPath] of [
+        [`${name}: abc\n`, name],
+        [`unity:\n  cli:\n    ${name}: abc\n`, `unity.cli.${name}`],
+      ] as const) {
+        const tmp = workspace();
+        const configFile = write(tmp, 'unity-ci.yml', body);
+        const { issues } = loadIn(tmp, { configFile });
+
+        const hit = issues.find((issue) => issue.path === expectedPath);
+        expect(hit, `${name} at ${expectedPath}`).toBeDefined();
+        // The message names the variable to set, never the value beside it.
+        expect(hit?.message).toContain(name);
+        expect(hit?.message).toMatch(/environment/i);
+        expect(hit?.message).not.toContain('abc');
+      }
+    }
+  });
+
+  it('rejects case and separator variants of a secret key', () => {
+    for (const key of [
+      'unity_license_serial',
+      'unity-license-serial',
+      'Unity-License-Serial',
+      'unityci-secret-token',
+    ]) {
+      const tmp = workspace();
+      const configFile = write(tmp, 'unity-ci.yml', `${key}: abc\n`);
+      const { issues } = loadIn(tmp, { configFile });
+
+      expect(
+        issues.some((issue) => issue.path === key),
+        `expected ${key} to be rejected`,
+      ).toBe(true);
+
+      const hit = issues.find((issue) => issue.path === key);
+      // The remedy names the environment variable, not the misspelling.
+      expect(hit?.message).toContain(
+        key.toLowerCase().startsWith('unityci')
+          ? 'UNITYCI_SECRET_TOKEN'
+          : 'UNITY_LICENSE_SERIAL',
+      );
+    }
+  });
+
+  it('rejects a string value that names a secret channel', () => {
+    const tmp = workspace();
+    const configFile = write(
+      tmp,
+      'unity-ci.yml',
+      'test:\n  filter: UNITY_LICENSE_SERIAL\n',
+    );
+    const { issues } = loadIn(tmp, { configFile });
+
+    const hit = issues.find((issue) => issue.path === 'test.filter');
+    expect(hit).toBeDefined();
+    expect(hit?.message).toContain('UNITY_LICENSE_SERIAL');
+    expect(hit?.message).toMatch(/environment/i);
+  });
+
+  it('rejects a secret-channel string inside an array', () => {
+    const tmp = workspace();
+    const configFile = write(
+      tmp,
+      'unity-ci.yml',
+      'test:\n  modes:\n    - UNITYCI_SECRET_MODE\n',
+    );
+    const { issues } = loadIn(tmp, { configFile });
+
+    expect(
+      issues.some(
+        (issue) =>
+          issue.path === 'test.modes[0]' && /secret channel/.test(issue.message),
+      ),
+    ).toBe(true);
+  });
+
+  it('does not reject a legitimate key that merely contains a word', () => {
+    const tmp = workspace();
+    const configFile = write(
+      tmp,
+      'unity-ci.yml',
+      [
+        'output:',
+        '  ci: true',
+        '  dir: unity',
+        'unity:',
+        '  editor:',
+        '    version: from-project',
+        'test:',
+        '  modes: [EditMode]',
+        'license:',
+        '  mode: none',
+        '  # These two values are the variable *names* to read, not secrets.',
+        '  serialEnv: UNITY_LICENSE_SERIAL',
+        '  fileEnv: UNITY_LICENSE_FILE_BASE64',
+        '',
+      ].join('\n'),
+    );
+    const { config, issues } = loadIn(tmp, { configFile });
+
+    expect(issues).toEqual([]);
+    expect(config.license.serialEnv).toBe('UNITY_LICENSE_SERIAL');
+    expect(config.license.fileEnv).toBe('UNITY_LICENSE_FILE_BASE64');
+  });
 });
 
 describe('config file loading', () => {

@@ -36,9 +36,18 @@ These values are read **only** from the environment:
 | `UNITY_LICENSE_FILE_BASE64` (name configurable via `license.fileEnv`) | offline `.ulf` activation |
 | `UNITYCI_SECRET_*` | any extra value the provider wants redacted |
 
-The configuration loader **rejects** these in `unity-ci.yml` with exit 64. They
-are never accepted as CLI flags. The core has no flag that accepts a secret, and
-no code path builds a command string: every child is
+The configuration loader has a **secret-name guard** for `unity-ci.yml`. It
+scans the whole parsed document — every key and every string value, at any
+depth, including array entries — for these names, case-insensitively and
+tolerating `_`/`-` spelling variants, plus any `UNITYCI_SECRET_*` prefix. It also
+keeps rejecting the legacy `license.serial`, `license.fileBase64`,
+`license.serviceAccountId` and `license.serviceAccountSecret` keys. Any hit is a
+configuration issue and **exit 64**; the message gives the path and the variable
+to set in the environment, never the secret value. The one exception is
+`license.serialEnv`/`license.fileEnv`, whose values exist to name the variable
+to read and therefore legitimately contain one of these names. These values are
+never accepted as CLI flags. The core has no flag that accepts a secret, and no
+code path builds a command string: every child is
 `spawn(file, argvArray, { shell: false })`.
 
 The serial is passed to Unity through the environment, which is why it is not in

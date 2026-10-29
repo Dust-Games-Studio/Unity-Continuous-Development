@@ -29,12 +29,12 @@ it. The rewrite is applied by git at fetch time, after Unity has already written
 down the manifest's text.
 
 The core enforces the safe half of this. It reads the project's git
-dependencies, reports their hosts, and **refuses to run** (exit 64) when a
-manifest URL embeds credentials. It never reads or writes the credential itself.
+dependencies and **refuses to run** (exit 64) when a manifest URL embeds
+credentials. It never reads or writes the credential itself.
 
 ## Detection and preflight
 
-Before any Editor starts, `unityci`:
+Before any Editor starts, a `unityci run` performs the setup preflight. It:
 
 1. reads the git dependencies from `Packages/manifest.json`;
 2. refuses a credential-bearing URL;
@@ -42,15 +42,15 @@ Before any Editor starts, `unityci`:
    `git ls-remote --exit-code <url>`, using the same ambient git configuration
    the Package Manager will use.
 
-That turns "ten minutes into an Editor launch" into a failure in seconds. To
-reproduce it locally, with your credential in place:
+That turns "ten minutes into an Editor launch" into a failure in seconds. A
+successful preflight is silent; when a `git ls-remote` fails, the run names the
+dependency and its (redacted) URL in the error, so the log identifies the host
+that could not be reached. `unityci doctor` does **not** read the manifest or run
+this preflight. To reproduce it locally, with your credential in place:
 
 ```bash
 git ls-remote --exit-code https://github.com/owner/private-packages.git
 ```
-
-`unityci doctor` also reports the hosts it found, so a pipeline log says which
-private repositories it expected.
 
 ## The measured mechanisms
 

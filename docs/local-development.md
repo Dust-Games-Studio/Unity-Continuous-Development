@@ -110,8 +110,16 @@ be reclaimed by hand.
 
 Secrets never go in this file. `UNITY_SERVICE_ACCOUNT_ID`,
 `UNITY_SERVICE_ACCOUNT_SECRET`, `UNITY_LICENSE_SERIAL`,
-`UNITY_LICENSE_FILE_BASE64` and `UNITYCI_SECRET_*` are environment-only, and the
-loader rejects them in `unity-ci.yml` with exit 64.
+`UNITY_LICENSE_FILE_BASE64` and `UNITYCI_SECRET_*` are environment-only. The
+loader's secret-name guard scans the whole parsed file — every key and string
+value, at any depth, including array entries, case-insensitively and with
+`_`/`-` variants — and turns a hit into a configuration issue and **exit 64**.
+The message names the path and the variable to set in the environment, never the
+value. The only exception is `license.serialEnv`/`license.fileEnv`, which exist
+to name the environment variable and legitimately hold `UNITY_LICENSE_SERIAL`
+or `UNITY_LICENSE_FILE_BASE64`. The same guard still rejects the legacy
+`license.serial`, `license.fileBase64`, `license.serviceAccountId` and
+`license.serviceAccountSecret` keys.
 
 The Editor version comes from the project. If it is not installed, the core
 fails fast with the exact `unity install …` command rather than silently
