@@ -37,6 +37,35 @@ const ANDROID_EXPORT_TYPES: ReadonlySet<string> = new Set([
 /** A path separator on either platform; both are rejected in a plain name. */
 const PATH_SEPARATOR = /[\\/]/;
 
+/**
+ * `unity test --shard N/M`: both parts are 1-based and the shard index cannot
+ * exceed the total. The CLI receives the string verbatim, so anything else is a
+ * configuration error rather than an Editor-side surprise.
+ */
+const SHARD_SPEC = /^([0-9]+)\/([0-9]+)$/;
+
+function shardIssue(value: unknown): string | null {
+  const expected = 'test.shards must match N/M with 1 <= N <= M (for example 1/3)';
+  if (typeof value !== 'string') {
+    return `${expected}; got ${JSON.stringify(value)}`;
+  }
+  const match = SHARD_SPEC.exec(value);
+  if (match === null) return `${expected}; got ${JSON.stringify(value)}`;
+
+  const index = Number(match[1]);
+  const total = Number(match[2]);
+  if (
+    !Number.isSafeInteger(index) ||
+    !Number.isSafeInteger(total) ||
+    index < 1 ||
+    total < 1 ||
+    index > total
+  ) {
+    return `${expected}; got ${JSON.stringify(value)}`;
+  }
+  return null;
+}
+
 /** Control characters, including line breaks (YAML can smuggle either in). */
 const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
@@ -315,6 +344,16 @@ export function validateConfig(config: Config, projectRoot: string = process.cwd
           message: `test.modes entries must be EditMode or PlayMode; got ${JSON.stringify(mode)}`,
         });
       }
+    }
+  }
+
+  // `unity test --shard` takes `N/M` verbatim. Anything else reaches the Editor
+  // and fails there with an opaque error, so the shape is checked here — env,
+  // file and flag all pass through this validator.
+  if (config.test.shards !== null) {
+    const problem = shardIssue(config.test.shards);
+    if (problem !== null) {
+      issues.push({ path: 'test.shards', message: problem });
     }
   }
 

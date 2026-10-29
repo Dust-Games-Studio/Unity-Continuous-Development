@@ -97,6 +97,43 @@ jobs:
     expect(resultFor(results, 'has-teardown').ok).toBe(false);
   });
 
+  it('detects a license-return step that is not always()', async () => {
+    const dir = adapter({
+      'workflow.yml': `name: success-only-teardown
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Return the licence only on success
+        if: success()
+        run: unityci license return
+`,
+    });
+
+    const results = await checkAdapter(dir);
+    expect(resultFor(results, 'has-teardown').ok).toBe(false);
+  });
+
+  it('detects an upload step gated on the run result', async () => {
+    const dir = adapter({
+      'workflow.yml': `name: gated-upload
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upload the output only when the run passed
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ci-output
+`,
+    });
+
+    const results = await checkAdapter(dir);
+    expect(resultFor(results, 'publishes-on-zero-and-eight').ok).toBe(false);
+  });
+
   it('detects a teardown that would fail the job', async () => {
     const dir = adapter({
       'workflow.yml': `name: failing-teardown
@@ -211,6 +248,29 @@ jobs:
     const result = resultFor(results, 'masks-credentials');
     expect(result.ok).toBe(false);
     expect(result.detail).toContain('::add-mask::');
+  });
+
+  it('requires a mask for every credential, not just the first', async () => {
+    const dir = adapter({
+      'workflow.yml': `name: second-unmasked
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mask the package token
+        run: echo "::add-mask::\$UNITYCI_GIT_TOKEN"
+      - name: Use both credentials
+        run: |
+          curl -H "Authorization: token \$UNITYCI_GIT_TOKEN" https://example.test
+          curl -H "X-License: \$UNITY_LICENSE_SERIAL" https://example.test
+`,
+    });
+
+    const results = await checkAdapter(dir);
+    const result = resultFor(results, 'masks-credentials');
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain('UNITY_LICENSE_SERIAL');
   });
 
   it('ignores a bare unity mention inside a comment', async () => {

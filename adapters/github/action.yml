@@ -37,17 +37,21 @@ inputs:
     default: github
   license-mode:
     description: >-
-      License route (none, serial, floating, offline-file or personal). The
-      serial itself is read by the core from UNITY_LICENSE_SERIAL in the
-      environment and never appears on a command line.
+      License route (none, serial, floating, offline-file or personal). Empty
+      leaves the project's configured license.mode alone; set it explicitly to
+      override the file. The serial itself is read by the core from
+      UNITY_LICENSE_SERIAL in the environment and never appears on a command
+      line.
     required: false
-    default: none
+    default: ''
   accept-eula:
     description: >-
       Accept the Editor and module licence agreements during an explicit
-      install (false or true). This is a declared input, never a silent default.
+      install (false or true). Empty leaves the project's configured
+      unity.editor.acceptEula alone. This is a declared input, never a silent
+      default.
     required: false
-    default: 'false'
+    default: ''
   unityci-version:
     description: >-
       Version of @unityci/core to install, or "source" to build the checkout
@@ -57,14 +61,20 @@ inputs:
   unity-version:
     description: >-
       Editor version, or "from-project" to read ProjectSettings/ProjectVersion.txt.
+      Empty leaves the project's configured unity.editor.version alone.
     required: false
-    default: from-project
+    default: ''
   build-target:
-    description: Build target passed to the core as build.target.
+    description: >-
+      Build target passed to the core as build.target. Empty leaves the
+      project's configured build.target alone.
     required: false
-    default: StandaloneWindows64
+    default: ''
   shards:
-    description: Test shard specification N/M, or empty for no sharding.
+    description: >-
+      Test shard specification N/M, or empty for no sharding. Empty leaves the
+      project's configured test.shards alone; a malformed value is rejected
+      before the run.
     required: false
     default: ''
   cache:
@@ -167,20 +177,33 @@ runs:
       env:
         INPUT_PROJECT_PATH: ${{ inputs.project-path }}
         INPUT_CONFIG: ${{ inputs.config }}
-        UNITYCI_EDITOR_VERSION: ${{ inputs.unity-version }}
-        UNITYCI_BUILD_TARGET: ${{ inputs.build-target }}
+        INPUT_UNITY_VERSION: ${{ inputs.unity-version }}
+        INPUT_BUILD_TARGET: ${{ inputs.build-target }}
       run: |
         set -euo pipefail
-        # The core describes the keys and paths (D7); this adapter only performs
-        # the provider-specific restore. cache-info always exits 0 and falls back
-        # to a static key, so a cache hint can never fail the job.
+        echo "ok=false" >> "$GITHUB_OUTPUT"
+        # Export an override only when the caller set it: the core applies the
+        # environment after the config file, so an empty default would silently
+        # win over the project's unity-ci.yml.
+        if [ -n "$INPUT_UNITY_VERSION" ]; then export UNITYCI_EDITOR_VERSION="$INPUT_UNITY_VERSION"; fi
+        if [ -n "$INPUT_BUILD_TARGET" ]; then export UNITYCI_BUILD_TARGET="$INPUT_BUILD_TARGET"; fi
         args=(cache-info --json --project-path "$INPUT_PROJECT_PATH")
         if [ -n "$INPUT_CONFIG" ]; then args+=(--config "$INPUT_CONFIG"); fi
-        unityci "${args[@]}" > "$RUNNER_TEMP/unityci-cache-info.json"
-        node -e "const fs = require('node:fs'); const i = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + '/unityci-cache-info.json', 'utf8')); fs.appendFileSync(process.env.GITHUB_OUTPUT, 'editor-key=' + i.editor.key + '\nlibrary-key=' + i.library.key + '\n');"
+        # A descriptor is an optimisation, never a gate. A config problem here
+        # must not pre-empt the run step, which is the only step that decides
+        # anything and the only one that writes the config_error summary.
+        if ! unityci "${args[@]}" > "$RUNNER_TEMP/unityci-cache-info.json"; then
+          echo "::warning::could not read the cache descriptors; continuing without the Editor download and Library caches. The run step is unaffected."
+          exit 0
+        fi
+        if ! node -e "const fs = require('node:fs'); const i = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + '/unityci-cache-info.json', 'utf8')); fs.appendFileSync(process.env.GITHUB_OUTPUT, 'editor-key=' + i.editor.key + '\nlibrary-key=' + i.library.key + '\n');"; then
+          echo "::warning::could not read the cache descriptors; continuing without the Editor download and Library caches. The run step is unaffected."
+          exit 0
+        fi
+        echo "ok=true" >> "$GITHUB_OUTPUT"
 
     - name: Restore the Editor download cache
-      if: inputs.cache == 'true'
+      if: inputs.cache == 'true' && steps.cache-info.outputs.ok == 'true'
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         # Only the download cache. The Editor install directory is global and
@@ -190,13 +213,14 @@ runs:
         key: ${{ steps.cache-info.outputs.editor-key }}
 
     - name: Restore the project Library cache
-      if: inputs.cache == 'true'
+      if: inputs.cache == 'true' && steps.cache-info.outputs.ok == 'true'
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ inputs.project-path }}/Library
         key: ${{ steps.cache-info.outputs.library-key }}
 
     - name: Configure git credentials for private packages
+      id: git-credentials
       if: inputs.git-credentials == 'token'
       shell: bash
       env:
@@ -206,6 +230,7 @@ runs:
         set -euo pipefail
         echo "::add-mask::$UNITYCI_GIT_TOKEN"
         umask 077
+        echo "touched=false" >> "$GITHUB_OUTPUT"
         if [ -z "$UNITYCI_GIT_TOKEN" ]; then
           echo "::error::git-credentials is 'token' but git-token is empty. Pass the token through a repository secret."
           exit 64
@@ -231,6 +256,10 @@ runs:
             done
           fi
         } >> "$HOME/.gitconfig"
+        # Only now did this step write the file. A guard failure above leaves
+        # touched=false, so the teardown never removes a ~/.gitconfig it did not
+        # create (for example checkout's safe.directory entry).
+        echo "touched=true" >> "$GITHUB_OUTPUT"
 
     - name: Run unityci
       shell: bash
@@ -240,14 +269,37 @@ runs:
         INPUT_CONFIG: ${{ inputs.config }}
         INPUT_OUTPUT_DIR: ${{ inputs.output-dir }}
         INPUT_ANNOTATIONS: ${{ inputs.annotations }}
-        UNITYCI_LICENSE_MODE: ${{ inputs.license-mode }}
-        UNITYCI_EDITOR_ACCEPT_EULA: ${{ inputs.accept-eula }}
-        UNITYCI_EDITOR_VERSION: ${{ inputs.unity-version }}
-        UNITYCI_BUILD_TARGET: ${{ inputs.build-target }}
-        UNITYCI_TEST_SHARDS: ${{ inputs.shards }}
+        INPUT_LICENSE_MODE: ${{ inputs.license-mode }}
+        INPUT_ACCEPT_EULA: ${{ inputs.accept-eula }}
+        INPUT_UNITY_VERSION: ${{ inputs.unity-version }}
+        INPUT_BUILD_TARGET: ${{ inputs.build-target }}
+        INPUT_SHARDS: ${{ inputs.shards }}
       run: |
         set -euo pipefail
         ulimit -n 4096
+        # The core applies the environment after the config file. An input the
+        # caller did not set must therefore not be exported at all: an empty
+        # default would silently replace the project's unity-ci.yml value.
+        if [ -n "$INPUT_LICENSE_MODE" ]; then export UNITYCI_LICENSE_MODE="$INPUT_LICENSE_MODE"; fi
+        if [ -n "$INPUT_ACCEPT_EULA" ]; then export UNITYCI_EDITOR_ACCEPT_EULA="$INPUT_ACCEPT_EULA"; fi
+        if [ -n "$INPUT_UNITY_VERSION" ]; then export UNITYCI_EDITOR_VERSION="$INPUT_UNITY_VERSION"; fi
+        if [ -n "$INPUT_BUILD_TARGET" ]; then export UNITYCI_BUILD_TARGET="$INPUT_BUILD_TARGET"; fi
+        if [ -n "$INPUT_SHARDS" ]; then
+          # The core validates this too (exit 64 with the expected form); doing
+          # it here fails before any Editor work with the caller's exact value.
+          if [[ "$INPUT_SHARDS" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+            shard_index="${BASH_REMATCH[1]}"
+            shard_total="${BASH_REMATCH[2]}"
+            if (( 10#$shard_index < 1 || 10#$shard_total < 1 || 10#$shard_index > 10#$shard_total )); then
+              echo "::error::shards must be N/M with 1 <= N <= M (for example 1/3); got '$INPUT_SHARDS'"
+              exit 64
+            fi
+          else
+            echo "::error::shards must be N/M with 1 <= N <= M (for example 1/3); got '$INPUT_SHARDS'"
+            exit 64
+          fi
+          if [ -n "$INPUT_SHARDS" ]; then export UNITYCI_TEST_SHARDS="$INPUT_SHARDS"; fi
+        fi
         args=(
           run "$INPUT_COMMAND"
           --project-path "$INPUT_PROJECT_PATH"
@@ -272,7 +324,7 @@ runs:
         unityci license return || echo "::warning::unityci license return failed — the Unity seat may still be held on this runner"
 
     - name: Restore the git configuration
-      if: always() && inputs.git-credentials == 'token'
+      if: always() && inputs.git-credentials == 'token' && steps.git-credentials.outputs.touched == 'true'
       shell: bash
       run: |
         set -euo pipefail

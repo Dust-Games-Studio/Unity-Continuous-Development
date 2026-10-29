@@ -32,6 +32,11 @@ adapter's job.
 ## What an adapter must not do
 
 - No retries (`retry`, `attempt`, `max-attempts`). The core owns the retry set.
+- No override of a configured value with an input the caller did not set. The
+  core applies environment variables after the config file, so export an
+  override only when its input is non-empty and let `unity-ci.yml` win otherwise.
+- No auxiliary step that can pre-empt the verdict. Cache and descriptor steps are
+  best-effort: warn, record the degradation, exit 0, and let the run step decide.
 - No interpretation of a numeric Unity exit code. **0** passed, **8** means the
   tests ran and failed, **6** means there was no verdict. The core translates
   these into its own exit code and `summary.json`; the adapter must not second

@@ -336,20 +336,50 @@ function checkPinnedActions(lines: SourceLine[]): Check {
   };
 }
 
-const CREDENTIAL_VAR =
-  /\$(?:\{)?(?:UNITYCI_GIT_TOKEN|GIT_TOKEN|GITHUB_TOKEN|GH_TOKEN|TOKEN|UNITY_LICENSE_SERIAL|UNITY_LICENSE_FILE_BASE64)\b/;
-const CREDENTIAL_EXPR =
-  /\$\{\{\s*(?:inputs\.git-token|secrets\.[A-Za-z0-9_]+)\s*\}\}/;
+const CREDENTIAL_VAR_NAMES =
+  /\$(?:\{)?(UNITYCI_GIT_TOKEN|GIT_TOKEN|GITHUB_TOKEN|GH_TOKEN|TOKEN|UNITY_LICENSE_SERIAL|UNITY_LICENSE_FILE_BASE64)\b/g;
+const CREDENTIAL_EXPR_NAMES =
+  /\$\{\{\s*(inputs\.git-token|secrets\.[A-Za-z0-9_]+)\s*\}\}/g;
 /** An env mapping (`UNITYCI_GIT_TOKEN: …`) hands a value to the shell; it is not a log line. */
 const ENV_MAPPING = /^\s*[A-Z][A-Z0-9_]*\s*:/;
 
+/** Every distinct credential value referenced on one line. */
+function credentialNames(text: string): string[] {
+  const names = new Set<string>();
+  for (const match of text.matchAll(CREDENTIAL_VAR_NAMES)) {
+    if (match[1] !== undefined) names.add(match[1]);
+  }
+  for (const match of text.matchAll(CREDENTIAL_EXPR_NAMES)) {
+    if (match[1] !== undefined) names.add(match[1]);
+  }
+  return [...names];
+}
+
+/** Whether one `::add-mask::` line masks this exact credential value. */
+function maskCovers(mask: string, name: string): boolean {
+  if (name.startsWith('inputs.') || name.startsWith('secrets.')) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`\\$\\{\\{\\s*${escaped}\\s*\\}\\}`).test(mask);
+  }
+  return new RegExp(`\\$(?:\\{)?${name}\\b`).test(mask);
+}
+
+/**
+ * GC24 requires every credential value to be masked **before its own first
+ * use**. One `::add-mask::` for one token does not cover a second credential
+ * later in the same file, so this checks each name independently.
+ */
 function checkMasksCredentials(lines: SourceLine[]): Check {
-  const uses = lines.filter(
-    (line) =>
-      (CREDENTIAL_VAR.test(line.text) || CREDENTIAL_EXPR.test(line.text)) &&
-      !/::add-mask::/.test(line.text) &&
-      !ENV_MAPPING.test(line.text),
-  );
+  const masks = lines.filter((line) => /::add-mask::/.test(line.text));
+  const uses: Array<{ line: SourceLine; names: string[] }> = [];
+
+  for (const line of lines) {
+    if (/::add-mask::/.test(line.text)) continue;
+    if (ENV_MAPPING.test(line.text)) continue;
+    const names = credentialNames(line.text);
+    if (names.length > 0) uses.push({ line, names });
+  }
+
   if (uses.length === 0) {
     return {
       ok: true,
@@ -358,25 +388,39 @@ function checkMasksCredentials(lines: SourceLine[]): Check {
     };
   }
 
-  const firstUse = uses[0];
-  const firstMask = lines.find((line) => /::add-mask::/.test(line.text));
-  if (
-    firstMask === undefined ||
-    firstUse === undefined ||
-    firstMask.number > firstUse.number
-  ) {
+  const firstUse = new Map<string, SourceLine>();
+  for (const use of uses) {
+    for (const name of use.names) {
+      if (!firstUse.has(name)) firstUse.set(name, use.line);
+    }
+  }
+
+  const unmasked: Array<{ name: string; line: SourceLine }> = [];
+  for (const [name, useLine] of firstUse) {
+    const covered = masks.some(
+      (mask) => mask.number < useLine.number && maskCovers(mask.text, name),
+    );
+    if (!covered) unmasked.push({ name, line: useLine });
+  }
+
+  if (unmasked.length > 0) {
+    const first = unmasked[0];
+    if (first === undefined) {
+      return { ok: false, detail: 'credential use found without a mask' };
+    }
+    const more =
+      unmasked.length > 1
+        ? ` (and ${unmasked.length - 1} more unmasked credential(s))`
+        : '';
     return {
       ok: false,
-      detail:
-        firstUse === undefined
-          ? 'credential use found but no `::add-mask::`'
-          : `line ${firstUse.number}: credential used before any \`::add-mask::\` (${excerpt(firstUse.text)}); it must be masked before its first use (GC24)`,
+      detail: `line ${first.line.number}: \`${first.name}\` is used without an earlier \`::add-mask::\` for that value${more} (${excerpt(first.line.text)}); every credential must be masked before its first use (GC24)`,
     };
   }
 
   return {
     ok: true,
-    detail: `line ${firstMask.number}: \`::add-mask::\` precedes the first credential use at line ${firstUse.number}`,
+    detail: `::add-mask:: precedes every credential use (${firstUse.size} value(s))`,
   };
 }
 

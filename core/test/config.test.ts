@@ -447,6 +447,31 @@ describe('config validation', () => {
     expect(issues).toEqual([]);
   });
 
+  it('accepts a shard specification in N/M form', () => {
+    const tmp = workspace();
+    const { config, issues } = loadIn(tmp, { env: { UNITYCI_TEST_SHARDS: '1/3' } });
+    expect(config.test.shards).toBe('1/3');
+    expect(issues).toEqual([]);
+  });
+
+  it('rejects a malformed or impossible shard specification', () => {
+    for (const value of ['2', '1/', '0/3', '4/3', '1 / 3']) {
+      const tmp = workspace();
+      const { issues } = loadIn(tmp, { env: { UNITYCI_TEST_SHARDS: value } });
+      const issue = issues.find((entry) => entry.path === 'test.shards');
+      expect(issue, `expected test.shards to reject ${JSON.stringify(value)}`).toBeDefined();
+      expect(issue?.message).toContain('N/M');
+      expect(issue?.message).toContain('1 <= N <= M');
+    }
+  });
+
+  it('rejects a numeric shards value from a config file', () => {
+    const tmp = workspace();
+    const configFile = write(tmp, 'unity-ci.yml', 'test:\n  shards: 2\n');
+    const { issues } = loadIn(tmp, { configFile });
+    expect(issues.some((issue) => issue.path === 'test.shards')).toBe(true);
+  });
+
   it('accepts a build output path that is an existing directory', () => {
     const tmp = workspace();
     // `unity build --output-path ./Build/WebGL` is documented as a directory

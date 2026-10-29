@@ -31,9 +31,14 @@ jobs:
         with:
           command: test
           unityci-version: '<published-version>'
+          license-mode: serial
         env:
           UNITY_LICENSE_SERIAL: ${{ secrets.UNITY_LICENSE_SERIAL }}
 ```
+
+`license-mode` is an explicit input, not an environment variable the action
+happens to read: the adapter exports it only when you set it, so the project's
+own `unity-ci.yml` remains authoritative otherwise.
 
 Inside this repository, use the action by path and leave `unityci-version` at its
 `source` default, which builds `core/dist/bin.js` from the checked-out workspace:
@@ -43,9 +48,15 @@ Inside this repository, use the action by path and leave `unityci-version` at it
       - uses: ./adapters/github
         with:
           command: test
+          license-mode: serial
         env:
           UNITY_LICENSE_SERIAL: ${{ secrets.UNITY_LICENSE_SERIAL }}
 ```
+
+On a clean runner the Editor is not installed. Either pre-install the version in
+`ProjectSettings/ProjectVersion.txt`, or add `accept-eula: true` to the `with:`
+block — a declared acceptance of Unity's and every module's licence agreements,
+which is why the action never assumes it.
 
 ## Inputs
 
@@ -56,16 +67,24 @@ Inside this repository, use the action by path and leave `unityci-version` at it
 | `config` | empty | explicit `unity-ci.yml`; empty discovers the project's own |
 | `output-dir` | `ci-output` | receives `summary.json`, reports and build output |
 | `annotations` | `github` | annotation format passed to the core |
-| `license-mode` | `none` | `none`, `serial`, `floating`, `offline-file`, `personal` |
-| `accept-eula` | `false` | declared EULA acceptance for an explicit Editor install |
+| `license-mode` | empty | `none`, `serial`, `floating`, `offline-file`, `personal`; empty leaves the project's `license.mode` |
+| `accept-eula` | empty | declared EULA acceptance for an explicit Editor install; empty leaves the project's `unity.editor.acceptEula` |
 | `unityci-version` | `source` | `@unityci/core` version, or `source` to build the checkout |
-| `unity-version` | `from-project` | Editor version, or read `ProjectSettings/ProjectVersion.txt` |
-| `build-target` | `StandaloneWindows64` | `build.target` |
-| `shards` | empty | `N/M` for `unity test --shard` |
+| `unity-version` | empty | Editor version, or `from-project`; empty leaves the project's `unity.editor.version` |
+| `build-target` | empty | `build.target`; empty leaves the project's value |
+| `shards` | empty | `N/M` for `unity test --shard`; empty leaves the project's `test.shards` |
 | `cache` | `true` | restore the Editor download cache and the project `Library` |
 | `git-credentials` | `none` | `none` or `token` for private git packages |
 | `git-token` | empty | the private-package token (from a repository secret) |
 | `git-token-repos` | empty | comma-separated `owner/repo` entries, or `all` |
+
+The five override inputs (`license-mode`, `accept-eula`, `unity-version`,
+`build-target`, `shards`) default to empty and are exported only when set. The
+core applies environment variables **after** the config file, so an exported
+empty default would silently replace the project's `unity-ci.yml` value — for
+example `license-mode: none` would disable a configured `license.mode`, and
+`shards: ''` would clear a configured `test.shards`. Leaving them empty lets the
+file win.
 
 The action never passes `--allow-install`. The core fails fast with the exact
 `unity install` command when the Editor version is missing; installing an Editor
@@ -85,10 +104,10 @@ env:
 
 The other unattended routes are documented in the design and the core's README:
 
-- **Floating**: `UNITYCI_LICENSE_MODE: floating`; the licensing server endpoint
-  comes from the machine's `licensingServiceBaseUrl` setting. Check it with
-  `unity license server list --format json` before the run.
-- **Offline file**: `UNITYCI_LICENSE_MODE: offline-file` with
+- **Floating**: set the action input `license-mode: floating`; the licensing
+  server endpoint comes from the machine's `licensingServiceBaseUrl` setting.
+  Check it with `unity license server list --format json` before the run.
+- **Offline file**: set the action input `license-mode: offline-file` and provide
   `UNITY_LICENSE_FILE_BASE64`. An offline licence **cannot be returned**;
   `unity license return` leaves it in place, so those runners must be counted by
   hand. The adapter's teardown downgrades the resulting exit 6 to a warning so a
@@ -141,7 +160,10 @@ What the step does, and why:
   measured in `docs/decisions/upm-git-auth-probe.md`; `~/.gitconfig` is measured
   to work.
 - The teardown restores the previous `~/.gitconfig` from a snapshot, or removes
-  the file when there was none.
+  the file when there was none — but only when the step reports `touched=true`.
+  A guard failure (missing `git-token` or `git-token-repos`) exits 64 before the
+  rewrite, and the teardown then leaves the existing file alone (for example
+  checkout's `safe.directory` entry). GC24: remove only what you wrote.
 
 ### No file on disk: `GIT_CONFIG_*`
 
@@ -167,6 +189,16 @@ performed by `actions/cache`:
   Editor version;
 - the project's `Library/` folder, keyed by `unity cache key` (Editor version,
   resolved package set and target — script content is excluded by design).
+
+The descriptor step is best-effort. If `unityci cache-info` cannot read the
+configuration (for example a missing `--config` file), the step warns, records
+`ok=false` and exits 0; both restores are skipped, and the run step still
+executes and writes the real `config_error` summary. A cache hint must never
+pre-empt the verdict.
+
+Consumers must not override a configured cache key with an empty default: the
+adapter passes `unity-version` and `build-target` only when they are non-empty,
+so the project's own settings decide the key otherwise.
 
 The Editor **install** directory is never cached or deleted. It is global and
 shared with the Unity Hub and with other projects on the machine. Restoring or
