@@ -1049,21 +1049,24 @@ git commit -m "feat: add the run build lifecycle and JUnit fallback"
 
 **Files:**
 - Create: `core/src/lifecycle/signals.ts`
-- Test: `core/test/signals.test.ts`
+- Modify: `core/src/exec.ts` (a registry of live children and `killAllChildren()`)
+- Test: `core/test/signals.test.ts`, `core/test/exec.test.ts`
 
 **Interfaces:**
 - Consumes: `CoreContext`; `returnLicense` from `core/src/lifecycle/license.ts`.
-- Produces: `core/src/lifecycle/signals.ts` → `export interface SignalHandlers { dispose(): void }`, `export function installSignalHandlers(ctx: CoreContext, onSignal: (code: number) => Promise<void>): SignalHandlers`.
+- Produces: `core/src/lifecycle/signals.ts` → `export interface SignalHandlers { dispose(): void }`, `export function installSignalHandlers(ctx: CoreContext, onSignal: (code: number) => Promise<void>, options?: { exit?: (code: number) => void; timeoutMs?: number }): SignalHandlers`; and `core/src/exec.ts` → `export function killAllChildren(): void`, plus the registry that makes it work.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```ts
 it('returns the license on SIGINT', () => { /* emit SIGINT */ });
 it('returns the license on SIGTERM', () => { /* emit SIGTERM */ });
-it('exits 130 on SIGINT and 143 on SIGTERM', () => { /* exit codes */ });
-it('writes summary.json before exiting on a signal', () => { /* file exists */ });
+it('exits 130 on SIGINT and 143 on SIGTERM', () => { /* injectable exit spy */ });
+it('kills the in-flight unity child before returning the license', () => { /* child tree dead first */ });
+it('writes summary.json before exiting on a signal', () => { /* awaited file, status infra_failed */ });
 it('does not return the license twice when two signals arrive', () => { /* one call */ });
 it('bounds the teardown with a timeout so a hung return cannot block the exit', () => { /* fake timers */ });
+it('removes its listeners on dispose', () => { /* no leak across runs */ });
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1073,7 +1076,18 @@ Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement**
 
-`installSignalHandlers` registers `process.on('SIGINT', handler)` and `process.on('SIGTERM', handler)`. The handler sets a `handled` flag (so a second signal is ignored), awaits `onSignal(code)` — which runs `returnLicense` under a 60 s `Promise.race` timeout and writes `summary.json` — then calls `process.exit(code)` with `130` for SIGINT and `143` for SIGTERM. `dispose()` removes the listeners.
+`installSignalHandlers` registers `process.on('SIGINT', handler)` and `process.on('SIGTERM', handler)`. The handler:
+
+1. **Sets a `handled` flag first**, so a second signal is ignored. Two Ctrl-C presses must not run the teardown twice — `unity license return` on an already-returned seat fails, and the second exit would race the first.
+2. **Kills the in-flight Unity child tree.** Returning the licence while an Editor is still running is worse than not returning it: the CLI would return a seat the running process still holds. `core/src/exec.ts` therefore keeps a module-level registry of live children, and the handler kills them all before anything else. (Task 4 already knows how to kill a whole tree for a timeout; this exposes the same operation on demand.)
+3. **Awaits `onSignal(code)`** — which runs `returnLicense(ctx)` and writes `summary.json` — under a **60 s** `Promise.race` timeout, so a hung `unity license return` cannot block the exit forever. The timer is cleared on the normal path.
+4. **Exits with `130` for SIGINT and `143` for SIGTERM**, after the summary was written and awaited. `summary.json` must never be lost to an interrupt: it is a file write that the handler awaits, not a stdout write that `process.exit` may truncate. A lost trailing log line is acceptable; a lost `summary.json` is not.
+
+`dispose()` removes the listeners.
+
+**The exit must be injectable, or the tests kill their own worker.** `process.exit(130)` inside a vitest process terminates the worker, so the signature is `installSignalHandlers(ctx, onSignal, options?: { exit?: (code: number) => void; timeoutMs?: number })` — defaulting to `process.exit` and `60_000`. Tests pass a spy. This is additive; no caller is required to pass it.
+
+**A signal is `infra_failed`, not a special status.** `summary.json`'s `status` stays within its documented set, with `exitCode` `130` or `143` — the interrupt is reported as what it is, an infrastructure failure, and the exit code carries the detail. `SIGKILL` cannot be caught, so nothing here applies to it; the adapter's `always()` step covers that case by running `unityci license return` separately (Task 14).
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1083,7 +1097,7 @@ Expected: PASS — all tests green.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add core/src/lifecycle/signals.ts core/test/signals.test.ts
+git add core/src/lifecycle/signals.ts core/src/exec.ts core/test/signals.test.ts core/test/exec.test.ts
 git commit -m "feat: return the license on SIGINT and SIGTERM"
 ```
 
