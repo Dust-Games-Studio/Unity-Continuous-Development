@@ -114,6 +114,8 @@ test:
 build:
   target: Android
   executeMethod: Builder.PerformBuild
+  androidExportType: aab         # apk | aab | android-studio-project (Android only)
+  androidTargetSdkVersion: 34     # Android only
   outputPath: ci-output/build/app.aab
 retry:
   onExitCodes: [7, 9, 12, 14]    # see 4.4

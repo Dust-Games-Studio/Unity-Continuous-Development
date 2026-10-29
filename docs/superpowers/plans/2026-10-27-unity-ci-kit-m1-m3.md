@@ -369,7 +369,7 @@ export interface Config {
   license: { mode: 'none' | 'serial' | 'floating' | 'offline-file' | 'personal'; serialEnv: string; fileEnv: string };
   packages: { preflight: boolean };
   test: { modes: string[]; outputDir: string; filter: string | null; coverage: boolean; shards: string | null; retries: number; nographics: boolean };
-  build: { target: string; profile: string | null; executeMethod: string | null; outputPath: string; versioningStrategy: 'none' | 'semantic' | 'tag' | 'custom'; buildVersion: string | null; androidVersionCode: number | null; allowDirtyBuild: boolean };
+  build: { target: string | null; profile: string | null; executeMethod: string | null; outputPath: string; versioningStrategy: 'none' | 'semantic' | 'tag' | 'custom'; buildVersion: string | null; androidExportType: 'apk' | 'aab' | 'android-studio-project' | null; androidTargetSdkVersion: number | null; androidVersionCode: number | null; allowDirtyBuild: boolean };
   retry: { onExitCodes: number[]; maxAttempts: number; backoffMs: number };
   output: { dir: string; annotations: 'none' | 'github'; ci: boolean };
 }
@@ -431,7 +431,8 @@ license: { mode: 'none', serialEnv: 'UNITY_LICENSE_SERIAL', fileEnv: 'UNITY_LICE
 packages: { preflight: true },
 test: { modes: ['EditMode'], outputDir: 'ci-output/tests', filter: null, coverage: false, shards: null, retries: 0, nographics: true },
 build: { target: 'StandaloneWindows64', profile: null, executeMethod: null, outputPath: 'ci-output/build/game',
-         versioningStrategy: 'none', buildVersion: null, androidVersionCode: null, allowDirtyBuild: false },
+         versioningStrategy: 'none', buildVersion: null, androidExportType: null,
+         androidTargetSdkVersion: null, androidVersionCode: null, allowDirtyBuild: false },
 retry: { onExitCodes: [7, 9, 12, 14], maxAttempts: 2, backoffMs: 5000 },
 output: { dir: 'ci-output', annotations: 'none', ci: true }
 ```
@@ -1000,11 +1001,25 @@ Expected: FAIL — module not found.
 - [ ] **Step 3: Implement**
 
 `runBuild` mirrors `runTest`'s lifecycle — **`doctor` → `setup` → activate → build → report → `finally` return** — and builds argv:
-`['build', projectPath, '--target', <target>, '--output-path', <outputPath>, '--log-file', <outputDir>/logs/editor.log, '--provenance-path', <outputDir>/build/provenance.json]` with `--format json` inserted **before any `--` separator** (the wrapper owns that placement, see Task 4 — do not append it to the end of the list).
+`['build', projectPath, '--target', <target>, '--output-path', <outputPath>, '--log-file', <outputDir>/logs/editor.log, '--provenance-path', <outputDir>/build/provenance.json, '--no-tail', '--args', '-nographics']` with `--format json` inserted **before any `--` separator** (the wrapper owns that placement, see Task 4 — do not append it to the end of the list).
+
+**`--no-tail` is not optional.** `unity build --help` says "The log also streams to the console by default; `--no-tail` disables it", and only `--quiet` and `--format ndjson` also disable it — `--format json` does **not**. With the tail on, the Editor log is interleaved into stdout and the core's JSON reader breaks (GC12). The log still lands in `--log-file`, which is exactly where GC10 wants it, so nothing is lost.
+
+**`-nographics` goes through `--args`, not `--`.** R14 requires it for batch builds, and `unity build` takes extra Editor arguments via `--args <string>` (shell-split) — there is no `--` separator on this verb. A batch build never renders, so it is passed unconditionally rather than behind a config flag.
+
+**`--target` is required unless `--profile` is used**, so exactly one of the two must be present: a config with neither is exit **64**, before anything is spawned.
+
+**(`--android-keystore-base64`, `--android-keystore-password` and `--android-key-alias-password` are deliberately out of scope for M1–M3.)** They are secrets on a command line, which GC5 forbids, and the CLI itself warns that they appear in shell history and CI logs. Android signing needs a file- or environment-based channel before the toolkit supports it.
 (`unity build` is the only one of the two that accepts `--log-file`; `unity test` does not, so a test run leaves `logs.editor` null — GC10.)
 plus, when set: `--profile <profile>`, `--execute-method <method>`, `--versioning-strategy <strategy>`, `--build-version <version>` (only when strategy is `custom`), `--android-export-type <type>`, `--android-version-code <n>`, `--android-target-sdk-version <n>`, `--allow-dirty-build`.
 
 `--allow-install` is **never** sent (Task 5).
+
+**`build.profile` accepts a path to a `.asset` file *or* a profile name.** `unity build --help` is explicit: "Build profile to build with: a path to a `.asset` file, or a profile name in Assets/Settings/Build Profiles". The existing validator rejects anything shaped like a version string, which would reject Unity's own documented example (`Assets/Settings/Build Profiles/Windows Release.asset`) with exit 64. Validate it as a non-empty string that is either an existing-looking relative path ending in `.asset` or a plain name — no version-shape check.
+
+**`build.androidExportType` is one of `apk`, `aab`, `android-studio-project`** (the CLI's own choices, default `apk`), and **`build.androidTargetSdkVersion`** is a positive integer; both are validated at load time so a typo is exit 64 instead of a usage error mid-build.
+
+**A retried build must not be satisfied by the artifact of the attempt that failed.** If Unity exits 0 on a retry while the output path still holds the previous attempt's files, verifying "the output path is non-empty" passes on a stale artifact — a build-side false green. Deleting a user-configured `outputPath` is not acceptable (it may point somewhere meaningful), so instead **record the attempt's start time and require the artifact to have been modified at or after it** for every attempt after the first. The first attempt needs no such check: nothing our run produced can predate it.
 
 Before building, the target is validated against `unity build --list-targets --format json`, whose rows carry a machine-readable `zeroCode` boolean and a `requirement` string: `StandaloneWindows64`, `StandaloneLinux64` and `StandaloneOSX` are zero-code (no `--execute-method` needed, `--output-path` still required), while `Android`, `WebGL`, `iOS` and the rest require either `--execute-method` or a Unity 6+ build profile. If the configured target needs `--execute-method` and none is configured, the core fails with exit **64** naming both options, rather than letting the build start and fail. If no build profile exists in the project, `unity build --profile` exits **6** with an actionable message — the core surfaces that as a configuration problem, not a generic build failure. The human-formatted `--list-targets` output is a tab-separated table and is never parsed.
 
