@@ -973,7 +973,7 @@ git commit -m "feat: add the run test lifecycle"
 - [ ] **Step 1: Write the failing tests**
 
 ```ts
-it('runs setup, activates, builds and returns the license', () => { /* call order */ });
+it('runs doctor, then setup, activates, builds and returns the license', () => { /* call order: doctor → setup → activate → build → teardown */ });
 it('passes --target and --output-path to unity build', () => { /* argv */ });
 it('passes --log-file so the Editor log lands in ci-output/logs/editor.log', () => { /* argv */ });
 it('passes --execute-method only when configured', () => { /* absent otherwise */ });
@@ -1008,7 +1008,7 @@ plus, when set: `--profile <profile>`, `--execute-method <method>`, `--versionin
 
 Before building, the target is validated against `unity build --list-targets --format json`, whose rows carry a machine-readable `zeroCode` boolean and a `requirement` string: `StandaloneWindows64`, `StandaloneLinux64` and `StandaloneOSX` are zero-code (no `--execute-method` needed, `--output-path` still required), while `Android`, `WebGL`, `iOS` and the rest require either `--execute-method` or a Unity 6+ build profile. If the configured target needs `--execute-method` and none is configured, the core fails with exit **64** naming both options, rather than letting the build start and fail. If no build profile exists in the project, `unity build --profile` exits **6** with an actionable message — the core surfaces that as a configuration problem, not a generic build failure. The human-formatted `--list-targets` output is a tab-separated table and is never parsed.
 
-The JUnit fallback lives in the shared report step: after a test run, for each mode, if the JUnit file is **missing** and the NUnit file **exists**, convert it with `nunitToJUnit` and write the `.junit.xml` (Review Focus #2). If neither exists, the run is `infra_failed`.
+The JUnit fallback lives in the shared report step: after a test run, for each mode, if the JUnit file is **missing or empty** and the NUnit file **exists and is non-empty**, convert it with `nunitToJUnit` and write the `.junit.xml` (Review Focus #2) — through `ctx.redactor`, because the JUnit file is an artifact CI uploads (Task 8's rule). An empty JUnit file does not count as produced (R18: an artifact must exist **and be non-empty**); Unity is authoritative only when it actually wrote something. If neither file is usable, the run is `infra_failed`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
