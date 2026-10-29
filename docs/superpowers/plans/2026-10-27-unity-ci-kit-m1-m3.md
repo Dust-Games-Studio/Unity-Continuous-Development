@@ -1001,11 +1001,13 @@ Expected: FAIL — module not found.
 - [ ] **Step 3: Implement**
 
 `runBuild` mirrors `runTest`'s lifecycle — **`doctor` → `setup` → activate → build → report → `finally` return** — and builds argv:
-`['build', projectPath, '--target', <target>, '--output-path', <outputPath>, '--log-file', <outputDir>/logs/editor.log, '--provenance-path', <outputDir>/build/provenance.json, '--no-tail', '--args', '-nographics']` with `--format json` inserted **before any `--` separator** (the wrapper owns that placement, see Task 4 — do not append it to the end of the list).
+`['build', projectPath, '--target', <target>, '--output-path', <outputPath>, '--log-file', <outputDir>/logs/editor.log, '--provenance-path', <outputDir>/build/provenance.json, '--no-tail']` with `--format json` inserted **before any `--` separator** (the wrapper owns that placement, see Task 4 — do not append it to the end of the list).
+
+**`-nographics` is NOT sent to `unity build`.** R14's goal is that a machine without a GPU can build, and `unity build` already spawns the Editor in batch mode, which needs no graphics device. Passing it explicitly is not merely redundant — it **fails**: measured on a real build, `unity build … --args -nographics` exits **6** with `Forwarded argument '-nographics' conflicts with a reserved Unity flag`. The CLI's `--args` channel rejects Unity's own reserved flags, so the flag can never arrive that way. `-nographics` belongs to `unity test` only, where it goes after the `--` separator as an Editor argument.
 
 **`--no-tail` is not optional.** `unity build --help` says "The log also streams to the console by default; `--no-tail` disables it", and only `--quiet` and `--format ndjson` also disable it — `--format json` does **not**. With the tail on, the Editor log is interleaved into stdout and the core's JSON reader breaks (GC12). The log still lands in `--log-file`, which is exactly where GC10 wants it, so nothing is lost.
 
-**`-nographics` goes through `--args`, not `--`.** R14 requires it for batch builds, and `unity build` takes extra Editor arguments via `--args <string>` (shell-split) — there is no `--` separator on this verb. A batch build never renders, so it is passed unconditionally rather than behind a config flag.
+**`-nographics` goes through `--args`, not `--`. — WITHDRAWN.** This was wrong and the real run proved it: `unity build --args -nographics` exits **6** with `Forwarded argument '-nographics' conflicts with a reserved Unity flag`. `--args` rejects Unity's own reserved flags, so the core must not send it. A batch build needs no graphics device anyway; `-nographics` is a `unity test` concern only.
 
 **`--target` is required unless `--profile` is used**, so exactly one of the two must be present: a config with neither is exit **64**, before anything is spawned.
 
@@ -1396,7 +1398,7 @@ Expected: PASS — all tests green.
 
 - [ ] **Step 5: Verify the example actually runs (manual, not part of the automated suite)**
 
-Run: `node core/dist/bin.js run test --project-path examples/minimal-project --output-dir examples/minimal-project/ci-output`
+Run: `node core/dist/bin.js run test --project-path examples/minimal-project`
 Expected: exit 0, `examples/minimal-project/ci-output/summary.json` written with `"status": "passed"`.
 
 - [ ] **Step 6: Commit**
