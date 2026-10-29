@@ -521,11 +521,70 @@ describe('config validation', () => {
     expect(config.build.profile).toBe('Windows Release');
   });
 
+  it('accepts an absolute .asset profile path', () => {
+    for (const profile of [
+      'C:\\Build Profiles\\Windows Release.asset',
+      '/opt/profiles/Linux.asset',
+    ]) {
+      const tmp = workspace();
+      const configFile = write(tmp, 'unity-ci.yml', `build:\n  profile: "${profile.replace(/\\/g, '\\\\')}"\n`);
+      const { config, issues } = loadIn(tmp, { configFile });
+      expect(issues).toEqual([]);
+      expect(config.build.profile).toBe(profile);
+    }
+  });
+
   it('rejects an empty build profile', () => {
     const tmp = workspace();
     const configFile = write(tmp, 'unity-ci.yml', 'build:\n  profile: ""\n');
     const { issues } = loadIn(tmp, { configFile });
     expect(issues.some((i) => i.path === 'build.profile')).toBe(true);
+  });
+
+  it('rejects a profile that starts with - as an argv injection', () => {
+    const tmp = workspace();
+    const configFile = write(tmp, 'unity-ci.yml', 'build:\n  profile: --output-path\n');
+    const { issues } = loadIn(tmp, { configFile });
+    const issue = issues.find((i) => i.path === 'build.profile');
+    expect(issue).toBeDefined();
+    expect(issue?.message).toContain('must not start with "-"');
+  });
+
+  it('rejects a profile containing a line break or control character', () => {
+    const tmp = workspace();
+    const configFile = write(
+      tmp,
+      'unity-ci.yml',
+      'build:\n  profile: "Assets/Settings\\nWindows.asset"\n',
+    );
+    const { issues } = loadIn(tmp, { configFile });
+    expect(issues.some((i) => i.path === 'build.profile')).toBe(true);
+  });
+
+  it('rejects a profile containing a .. segment', () => {
+    for (const profile of [
+      '../outside/Windows.asset',
+      'Assets/../Windows.asset',
+      'Assets\\..\\Windows.asset',
+    ]) {
+      const tmp = workspace();
+      const configFile = write(tmp, 'unity-ci.yml', `build:\n  profile: "${profile.replace(/\\/g, '\\\\')}"\n`);
+      const { issues } = loadIn(tmp, { configFile });
+      const issue = issues.find((i) => i.path === 'build.profile');
+      expect(issue).toBeDefined();
+      expect(issue?.message).toContain('".." segment');
+    }
+  });
+
+  it('rejects a path that does not end in .asset', () => {
+    for (const profile of ['Assets/Settings/Windows', 'Assets/Settings/Windows.txt']) {
+      const tmp = workspace();
+      const configFile = write(tmp, 'unity-ci.yml', `build:\n  profile: ${profile}\n`);
+      const { issues } = loadIn(tmp, { configFile });
+      const issue = issues.find((i) => i.path === 'build.profile');
+      expect(issue).toBeDefined();
+      expect(issue?.message).toContain('path ending in .asset');
+    }
   });
 
   it('requires a build target unless a profile is configured', () => {

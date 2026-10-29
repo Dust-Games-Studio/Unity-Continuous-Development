@@ -1,14 +1,16 @@
 /**
- * The build lifecycle: `doctor` → `setup` → activate → validate the target →
- * `unity build` → verify the artifact and provenance → `summary.json`, with an
- * unconditional licence teardown.
+ * `run build`: the build-side hooks of the shared lifecycle.
  *
- * It mirrors `runTest` deliberately, not by accident: the preflight comes
- * first, `setup` verifies or installs the Editor for the command's module
- * requirement, the licence is activated, and the teardown is entered on every
- * path. The difference is the artifact: a build produces a player (a file or a
- * directory), and an exit 0 with nothing at `--output-path` is the build-side
- * false green (R18), exactly like a test run with no NUnit report.
+ * The sequence — `doctor` → `setup` → activate → execute → verify → `finally`
+ * teardown — lives in `run-lifecycle.ts`. This module owns what is specific to
+ * a build: the `unity build` invocation and its retry, the target preflight,
+ * and the artifact/provenance verification.
+ *
+ * A build produces a player (a file or a directory), and an exit 0 with nothing
+ * at `--output-path` is the build-side false green (R18), exactly like a test
+ * run with no NUnit report. "Nothing" excludes every file the toolkit writes
+ * itself: the provenance manifest it asks Unity to write is a sibling of the
+ * default output directory and must not satisfy the check.
  *
  * `unity build --list-targets --format json` is consulted once before the
  * build. Its rows are the authority for whether a target needs
@@ -21,32 +23,19 @@ import {
   rmSync,
   statSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import { doctorCommand } from '../commands/doctor.js';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { DEFAULT_CONFIG } from '../config/schema.js';
 import type { CoreContext } from '../context.js';
 import { EXIT } from '../exit-codes.js';
-import {
-  buildSummary,
-  deriveStatus,
-  writeSummary,
-  type Summary,
-} from '../report/summary.js';
 import { isUnsupportedCommand, unityBuild } from '../unity/cli.js';
 import type { UnityResult } from '../unity/exec.js';
 import {
-  LicenseError,
-  activateLicense,
-  type LicenseActivation,
-  type LicenseReturnResult,
-} from './license.js';
-import { withRetry } from './retry.js';
-import { SetupError, setup, unityBaseOptions, type SetupResult } from './setup.js';
-import {
   isNonEmptyFile,
-  redactSummary,
   reportPath,
-  teardownLicense,
-} from './test.js';
+  runLifecycle,
+  runWithRetry,
+} from './run-lifecycle.js';
+import { unityBaseOptions } from './setup.js';
 
 /** The verdict of one `run build`. A build is either usable or it is not. */
 export interface BuildRunResult {
@@ -80,27 +69,48 @@ function asObject(value: unknown): JsonObject | null {
     : null;
 }
 
-function describe(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+/**
+ * Paths the toolkit itself writes into `output.dir`. They are sibling to (or,
+ * with a broad `build.outputPath`, inside) the build output, so they must never
+ * satisfy the artifact check: the provenance manifest the core asks Unity to
+ * write could otherwise be the only thing "produced".
+ */
+interface ToolkitPaths {
+  /** Exact files, resolved absolute. */
+  files: ReadonlySet<string>;
+  /** Entire trees the toolkit owns, resolved absolute. */
+  roots: readonly string[];
 }
 
-function configuredEditorVersion(ctx: CoreContext): string {
-  const configured = ctx.config.unity.editor.version;
-  return configured === 'from-project' ? '' : configured;
+/** True when `path` is `root` or sits below it, on resolved paths. */
+function isInside(root: string, path: string): boolean {
+  const rel = relative(root, path);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+/** Resolved-path membership, never a string-prefix comparison. */
+function isToolkitPath(path: string, toolkit: ToolkitPaths): boolean {
+  const absolute = resolve(path);
+  if (toolkit.files.has(absolute)) return true;
+  return toolkit.roots.some((root) => isInside(root, absolute));
 }
 
 /**
- * True for a non-empty file or a non-empty directory (R18).
+ * True when the output path holds something the build produced (R18).
  *
- * `build.outputPath` may be either: a desktop build writes a directory of
- * player files, while some targets write a single package. An empty directory
- * is not a produced artifact.
+ * `build.outputPath` may be either a file or a directory. An empty directory,
+ * or one holding only the toolkit's own files, is not a produced artifact.
  */
-function isNonEmptyArtifact(path: string): boolean {
+function artifactHasContent(path: string, toolkit: ToolkitPaths): boolean {
+  const absolute = resolve(path);
+  if (isToolkitPath(absolute, toolkit)) return false;
   try {
-    const stats = statSync(path);
+    const stats = statSync(absolute);
     if (stats.isFile()) return stats.size > 0;
-    if (stats.isDirectory()) return readdirSync(path).length > 0;
+    if (!stats.isDirectory()) return false;
+    for (const entry of readdirSync(absolute, { withFileTypes: true })) {
+      if (artifactHasContent(join(absolute, entry.name), toolkit)) return true;
+    }
     return false;
   } catch {
     return false;
@@ -108,23 +118,28 @@ function isNonEmptyArtifact(path: string): boolean {
 }
 
 /**
- * The newest modification time anywhere in the artifact tree, or `-Infinity`
- * when it is absent.
+ * The newest modification time of anything the build produced, or `-Infinity`
+ * when nothing is left after ignoring the toolkit's files.
  *
  * A retry that exits 0 must have written something itself; a file's own mtime
  * says so directly, but a build directory's own mtime does not change when a
  * contained file is overwritten, so every entry is considered. A build never
  * renders, so the tree is finite and walking it is cheap relative to a build.
  */
-function artifactModifiedAt(path: string): number {
+function artifactModifiedAt(path: string, toolkit: ToolkitPaths): number {
+  const absolute = resolve(path);
+  if (isToolkitPath(absolute, toolkit)) return Number.NEGATIVE_INFINITY;
   try {
-    const stats = statSync(path);
+    const stats = statSync(absolute);
     if (stats.isFile()) return stats.mtimeMs;
     if (!stats.isDirectory()) return Number.NEGATIVE_INFINITY;
 
-    let newest = stats.mtimeMs;
-    for (const entry of readdirSync(path, { withFileTypes: true })) {
-      const child = artifactModifiedAt(join(path, entry.name));
+    // A directory's own mtime is not the build's: creating the toolkit's
+    // provenance manifest inside it would make the directory look fresh even
+    // when every produced file is old. Only the non-ignored files count.
+    let newest = Number.NEGATIVE_INFINITY;
+    for (const entry of readdirSync(absolute, { withFileTypes: true })) {
+      const child = artifactModifiedAt(join(absolute, entry.name), toolkit);
       if (child > newest) newest = child;
     }
     return newest;
@@ -142,6 +157,29 @@ function configuredTarget(ctx: CoreContext): string {
 function hasBuildProfile(ctx: CoreContext): boolean {
   const profile = ctx.config.build.profile;
   return typeof profile === 'string' && profile.trim() !== '';
+}
+
+/**
+ * The target `setup` must derive its module requirement from.
+ *
+ * - No profile: the configured target.
+ * - Profile only, with no target or the documented default target: `null`. The
+ *   profile defines what is built, so deriving modules from the default would
+ *   demand the wrong module (a Linux runner building a Linux profile asked for
+ *   `windows-il2cpp`), and `''` used to skip the check without a word.
+ * - Profile plus a target that differs from the documented default: that
+ *   target, so its modules are still verified.
+ *
+ * The merged `Config` does not record which layer set a value, so an explicitly
+ * configured target equal to the default is indistinguishable from the default
+ * and is treated as implicit; that is harmless because the profile defines the
+ * target anyway.
+ */
+function setupTarget(ctx: CoreContext): string | null {
+  const target = configuredTarget(ctx);
+  if (!hasBuildProfile(ctx)) return target === '' ? null : target;
+  if (target === '' || target === DEFAULT_CONFIG.build.target) return null;
+  return target;
 }
 
 /**
@@ -361,6 +399,18 @@ function redactProvenance(
   return walk(provenance) as Record<string, unknown>;
 }
 
+/** One successful invocation, as the verify step needs it. */
+interface BuildRunSummary {
+  code: number;
+  attempts: number;
+  lastAttemptStartedAt: number;
+}
+
+/** The payload one build's execute hands to its verify step. */
+type BuildExecution =
+  | { problem: TargetProblem; run: null }
+  | { problem: null; run: BuildRunSummary };
+
 /**
  * `run build`: the core run loop.
  *
@@ -376,178 +426,156 @@ export async function runBuild(ctx: CoreContext): Promise<BuildRunResult> {
   const outputPath = resolve(ctx.projectPath, ctx.config.build.outputPath);
   const logFile = join(summaryDir, 'logs', 'editor.log');
   const provenanceFile = join(summaryDir, 'build', 'provenance.json');
-
-  let setupResult: SetupResult | null = null;
-  let activation: LicenseActivation | null = null;
-  let teardown: LicenseReturnResult | null = null;
+  // Everything under output.dir that the toolkit writes itself. The test
+  // reports live under their own configured directory, so the whole tree is
+  // ignored rather than a guessed set of file names.
+  const testDir = resolve(ctx.projectPath, ctx.config.test.outputDir);
+  const toolkit: ToolkitPaths = {
+    files: new Set(
+      [
+        provenanceFile,
+        logFile,
+        join(summaryDir, 'logs', 'doctor.json'),
+        join(summaryDir, 'summary.json'),
+      ].map((path) => resolve(path)),
+    ),
+    // Never ignore a tree that contains the build output itself (a broad
+    // `test.outputDir` must not turn every build into "produced nothing").
+    roots: isInside(testDir, outputPath) ? [] : [testDir],
+  };
 
   const artifacts: string[] = [];
   let provenance: Record<string, unknown> | null = null;
 
-  let exitCode: number = EXIT.SUCCESS;
-  let unityExitCode: number = EXIT.SUCCESS;
-  let attempts = 1;
-  /** When the last attempt began; a retry must have written after this. */
-  let lastAttemptStartedAt = 0;
-
-  try {
-    // The preflight gate (R11) comes first, as the spec's Section 4.5 orders it.
-    const doctorCode = await doctorCommand(ctx);
-    if (doctorCode !== EXIT.SUCCESS) {
-      ctx.logger.error(
-        `the doctor preflight failed with exit ${doctorCode}; refusing to run the build.`,
-      );
-      exitCode = doctorCode;
-    } else {
-      setupResult = await setup(ctx, { command: 'build' });
-      activation = await activateLicense(ctx);
-      // The gate every later teardown reads, including a signal-driven one that
-      // cannot see this function's locals (Task 11).
-      if (activation.activated) ctx.licenseActivated = true;
-
+  const execution = await runLifecycle<BuildExecution>(ctx, {
+    command: 'build',
+    setupOptions: { command: 'build', target: setupTarget(ctx) },
+    doctorSubject: 'build',
+    execute: async (ctx) => {
       const problem = await validateTarget(ctx);
       if (problem !== null) {
-        exitCode = problem.code;
-        unityExitCode = problem.unityExitCode;
-      } else {
-        mkdirSync(dirname(logFile), { recursive: true });
-        mkdirSync(dirname(provenanceFile), { recursive: true });
-        removeStaleFile(logFile);
-        removeStaleFile(provenanceFile);
-
-        const args = buildArguments(ctx, outputPath, logFile, provenanceFile);
-        const run = await withRetry<number>(
-          async () => {
-            removeStaleFile(logFile);
-            removeStaleFile(provenanceFile);
-            lastAttemptStartedAt = Date.now();
-            const result = await unityBuild(unityBaseOptions(ctx), args);
-            return { value: result.code, code: result.code };
-          },
-          ctx.config.retry,
-          (info) => {
-            ctx.logger.warn(
-              `unity build exited ${info.code} on attempt ${info.attempt}; retrying in ${info.waitMs}ms.`,
-            );
-          },
-        );
-
-        attempts = run.attempts;
-        unityExitCode = run.code;
-
-        const manifest = readProvenance(provenanceFile);
-        provenance = manifest.provenance;
-        if (manifest.malformed) {
-          ctx.logger.error(
-            `the build provenance manifest at ${provenanceFile} is not a JSON object; it cannot be published.`,
-          );
-        } else if (provenance === null) {
-          // Not a failure on its own, but an absent manifest is worth saying:
-          // the build is still traceable through the CLI identity in the summary.
-          ctx.logger.warn(
-            `unity build wrote no provenance manifest at ${provenanceFile}; summary.json has no provenance.`,
-          );
-        }
-
-        const artifactProduced = isNonEmptyArtifact(outputPath);
-        if (unityExitCode !== EXIT.SUCCESS) {
-          // The invocation itself failed: Unity's code is the primary verdict,
-          // even if an earlier or partial artifact happens to exist.
-          exitCode = unityExitCode;
-          if (ctx.config.build.profile !== null && unityExitCode === EXIT.COMMAND_FAILED) {
-            ctx.logger.error(
-              `the build exited 6 with a configured --profile: the project may have no build profile at ${ctx.config.build.profile}.`,
-            );
-          }
-        } else if (!artifactProduced) {
-          // The build-side false green: Unity said success and wrote nothing
-          // usable (R18).
-          ctx.logger.error(
-            `unity build exited 0 but produced no non-empty artifact at ${outputPath}; the build has no verdict.`,
-          );
-          exitCode = EXIT.COMMAND_FAILED;
-        } else if (
-          run.attempts > 1 &&
-          artifactModifiedAt(outputPath) < lastAttemptStartedAt
-        ) {
-          // The retry exited 0 but touched nothing: the non-empty output is the
-          // previous attempt's artifact, which is not this run's verdict (R18).
-          // Deleting a user-configured output path is not acceptable, so the
-          // freshness check is the guard instead.
-          ctx.logger.error(
-            `unity build exited 0 on attempt ${run.attempts} but nothing at ${outputPath} was modified by that attempt; the artifact belongs to an earlier attempt and the build has no verdict.`,
-          );
-          exitCode = EXIT.COMMAND_FAILED;
-        } else {
-          artifacts.push(reportPath(summaryDir, outputPath));
-          if (manifest.malformed) {
-            // A produced artifact that cannot be read is a malformed artifact
-            // (GC7), not a green build with a missing key.
-            exitCode = EXIT.INTERNAL_ERROR;
-          }
-        }
+        return {
+          data: { problem, run: null },
+          unityExitCode: problem.unityExitCode,
+          attempts: 1,
+        };
       }
-    }
-  } catch (error) {
-    if (error instanceof SetupError || error instanceof LicenseError) {
-      ctx.logger.error(error.message);
-      exitCode = error.exitCode;
-    } else {
-      ctx.logger.error(`the build run failed unexpectedly: ${describe(error)}`);
-      exitCode = EXIT.INTERNAL_ERROR;
-    }
-  } finally {
-    // GC9: the teardown is entered on every path, and its seat gate — not this
-    // function's locals — decides whether anything is returned.
-    teardown = await teardownLicense(ctx);
 
-    const editorLog = isNonEmptyFile(logFile) ? reportPath(summaryDir, logFile) : null;
-    const summary = buildSummary({
-      command: 'build',
-      status: deriveStatus(exitCode),
-      exitCode,
-      unityExitCode,
-      attempts,
-      cliVersion: ctx.cliVersion ?? '',
-      cliChannel: ctx.cliChannel,
-      cliCommit: ctx.cliCommit,
-      editorVersion: setupResult?.editorVersion ?? configuredEditorVersion(ctx),
-      durationMs: Math.max(0, Date.now() - ctx.startedAt),
-      license: {
-        mode: activation?.mode ?? ctx.config.license.mode,
-        activated: activation?.activated === true,
-        returned: teardown?.returned === true,
-        seatLeaked: teardown?.seatLeaked === true,
-      },
-      artifacts,
-      // GC10: `unity build` takes --log-file. Publish the path only when the
-      // Editor actually wrote a non-empty log; `unity test` has no such flag.
-      logs: { editor: editorLog, cli: null },
-    });
+      mkdirSync(dirname(logFile), { recursive: true });
+      mkdirSync(dirname(provenanceFile), { recursive: true });
+      removeStaleFile(logFile);
+      removeStaleFile(provenanceFile);
 
-    // The provenance manifest is a build-only key. `writeSummary` takes the
-    // documented `Summary`; the intersection keeps the extra key honest.
-    const published: Summary & { provenance: Record<string, unknown> | null } = {
-      ...redactSummary(ctx, summary),
-      provenance: provenance === null ? null : redactProvenance(ctx, provenance),
-    };
-
-    try {
-      writeSummary(summaryDir, published);
-      ctx.logger.info(
-        `build status ${summary.status} (exit ${exitCode}); summary at ${join(summaryDir, 'summary.json')}.`,
+      let lastAttemptStartedAt = 0;
+      const args = buildArguments(ctx, outputPath, logFile, provenanceFile);
+      const run = await runWithRetry<number>(
+        ctx,
+        'unity build',
+        async () => {
+          const result = await unityBuild(unityBaseOptions(ctx), args);
+          return { value: result.code, code: result.code };
+        },
+        () => {
+          removeStaleFile(logFile);
+          removeStaleFile(provenanceFile);
+          lastAttemptStartedAt = Date.now();
+        },
       );
-    } catch (error) {
-      ctx.logger.error(`could not write summary.json under ${summaryDir}: ${describe(error)}`);
-      exitCode = EXIT.INTERNAL_ERROR;
-    }
-  }
+
+      return {
+        data: {
+          problem: null,
+          run: {
+            code: run.code,
+            attempts: run.attempts,
+            lastAttemptStartedAt,
+          },
+        },
+        unityExitCode: run.code,
+        attempts: run.attempts,
+      };
+    },
+    verify: async (ctx, result) => {
+      if (result.data.problem !== null) return { exitCode: result.data.problem.code };
+      const run = result.data.run;
+
+      const manifest = readProvenance(provenanceFile);
+      provenance = manifest.provenance;
+      if (manifest.malformed) {
+        ctx.logger.error(
+          `the build provenance manifest at ${provenanceFile} is not a JSON object; it cannot be published.`,
+        );
+      } else if (provenance === null) {
+        // Not a failure on its own, but an absent manifest is worth saying:
+        // the build is still traceable through the CLI identity in the summary.
+        ctx.logger.warn(
+          `unity build wrote no provenance manifest at ${provenanceFile}; summary.json has no provenance.`,
+        );
+      }
+
+      const artifactProduced = artifactHasContent(outputPath, toolkit);
+      if (run.code !== EXIT.SUCCESS) {
+        // The invocation itself failed: Unity's code is the primary verdict,
+        // even if an earlier or partial artifact happens to exist.
+        if (ctx.config.build.profile !== null && run.code === EXIT.COMMAND_FAILED) {
+          ctx.logger.error(
+            `the build exited 6 with a configured --profile: the project may have no build profile at ${ctx.config.build.profile}.`,
+          );
+        }
+        return { exitCode: run.code };
+      }
+
+      if (!artifactProduced) {
+        // The build-side false green: Unity said success and wrote nothing
+        // usable (R18).
+        ctx.logger.error(
+          `unity build exited 0 but produced no non-empty artifact at ${outputPath}; the build has no verdict.`,
+        );
+        return { exitCode: EXIT.COMMAND_FAILED };
+      }
+
+      if (
+        run.attempts > 1 &&
+        artifactModifiedAt(outputPath, toolkit) < run.lastAttemptStartedAt
+      ) {
+        // The retry exited 0 but touched nothing: the non-empty output is the
+        // previous attempt's artifact, which is not this run's verdict (R18).
+        // Deleting a user-configured output path is not acceptable, so the
+        // freshness check is the guard instead.
+        ctx.logger.error(
+          `unity build exited 0 on attempt ${run.attempts} but nothing at ${outputPath} was modified by that attempt; the artifact belongs to an earlier attempt and the build has no verdict.`,
+        );
+        return { exitCode: EXIT.COMMAND_FAILED };
+      }
+
+      artifacts.push(reportPath(summaryDir, outputPath));
+      // A produced artifact that cannot be read is a malformed artifact (GC7),
+      // not a green build with a missing key.
+      return { exitCode: manifest.malformed ? EXIT.INTERNAL_ERROR : EXIT.SUCCESS };
+    },
+    summary: (ctx) => ({
+      fields: {
+        artifacts,
+        // GC10: `unity build` takes --log-file. Publish the path only when the
+        // Editor actually wrote a non-empty log; `unity test` has no such flag.
+        logs: {
+          editor: isNonEmptyFile(logFile) ? reportPath(summaryDir, logFile) : null,
+          cli: null,
+        },
+      },
+      extras: {
+        // The provenance manifest is a build-only key; `Summary` stays the
+        // documented shape and this intersection keeps the extra key honest.
+        provenance: provenance === null ? null : redactProvenance(ctx, provenance),
+      },
+    }),
+  });
 
   return {
-    status: exitCode === EXIT.SUCCESS ? 'passed' : 'infra_failed',
-    exitCode,
-    unityExitCode,
-    attempts,
+    status: execution.exitCode === EXIT.SUCCESS ? 'passed' : 'infra_failed',
+    exitCode: execution.exitCode,
+    unityExitCode: execution.unityExitCode,
+    attempts: execution.attempts,
     artifacts,
     provenance,
   };

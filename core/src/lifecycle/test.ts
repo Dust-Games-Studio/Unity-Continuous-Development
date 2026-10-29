@@ -1,12 +1,10 @@
 /**
- * The test run lifecycle: `doctor` → `setup` → activate → run each configured
- * mode → verify the artifacts → `summary.json`, with an unconditional licence
- * teardown.
+ * `run test`: the test-side hooks of the shared lifecycle.
  *
- * The preflight comes first, as the spec's Section 4.5 orders it; `setup` then
- * verifies or installs the Editor and accepts its terms. The teardown is entered
- * on every path, including a doctor or setup failure, where it is a no-op
- * because nothing was activated.
+ * The sequence — `doctor` → `setup` → activate → execute → verify → `finally`
+ * teardown — lives in `run-lifecycle.ts`. This module owns what is specific to
+ * a test run: one `unity test` per configured mode, the retry around each
+ * invocation, and the report verification.
  *
  * The artifact check is the core of the module (R18). A run that exits 0 but
  * leaves no NUnit report is **not** a green suite: `unity test --output
@@ -21,28 +19,19 @@
  * Unity's own file wins whenever it is non-empty.
  */
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { doctorCommand } from '../commands/doctor.js';
+import { join, resolve } from 'node:path';
 import type { CoreContext } from '../context.js';
 import { EXIT } from '../exit-codes.js';
 import { nunitToJUnit } from '../report/junit.js';
 import { ReportParseError, parseNUnit, type TestCounts } from '../report/nunit.js';
-import {
-  buildSummary,
-  deriveStatus,
-  writeSummary,
-  type Summary,
-} from '../report/summary.js';
 import { unityTest } from '../unity/cli.js';
 import {
-  LicenseError,
-  activateLicense,
-  returnLicense,
-  type LicenseActivation,
-  type LicenseReturnResult,
-} from './license.js';
-import { withRetry } from './retry.js';
-import { SetupError, setup, unityBaseOptions, type SetupResult } from './setup.js';
+  isNonEmptyFile,
+  reportPath,
+  runLifecycle,
+  runWithRetry,
+} from './run-lifecycle.js';
+import { unityBaseOptions } from './setup.js';
 
 /**
  * The verdict of one `run test`.
@@ -84,21 +73,6 @@ function addCounts(into: TestCounts, from: TestCounts): void {
 }
 
 /**
- * True for an existing, non-empty regular file (R18).
- *
- * Shared with `build.ts`: both lifecycles verify an artifact before believing
- * Unity's exit code, so the rule lives in exactly one place.
- */
-export function isNonEmptyFile(path: string): boolean {
-  try {
-    const stats = statSync(path);
-    return stats.isFile() && stats.size > 0;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * Removes the report a previous attempt left behind, so the artifacts verified
  * after a retry belong to the last attempt — not to an earlier one that wrote a
  * green report and then failed the invocation. A directory is never deleted:
@@ -111,21 +85,6 @@ function removeReport(path: string): void {
   } catch {
     // Missing (or unreadable) is the normal state before the first attempt.
   }
-}
-
-/**
- * A path relative to the output directory, with forward slashes.
- *
- * Shared with `build.ts` for report, artifact and log paths, so every path
- * published in `summary.json` has the same shape on every platform.
- */
-export function reportPath(outputDir: string, file: string): string {
-  const relativePath = relative(outputDir, file);
-  const value =
-    relativePath === '' || relativePath.startsWith('..') || isAbsolute(relativePath)
-      ? file
-      : relativePath;
-  return value.split(sep).join('/');
 }
 
 function describe(error: unknown): string {
@@ -180,35 +139,6 @@ function testArguments(ctx: CoreContext, mode: string, outputDir: string): strin
   return args;
 }
 
-/**
- * The summary with every free-form string masked before it is serialised
- * (GC5). Shared with `build.ts`, which additionally masks its provenance
- * manifest before writing.
- */
-export function redactSummary(ctx: CoreContext, summary: Summary): Summary {
-  const redact = (value: string): string => ctx.redactor.redact(value);
-  const optional = (value: string | null): string | null =>
-    value === null ? null : redact(value);
-  return {
-    ...summary,
-    cliVersion: redact(summary.cliVersion),
-    cliChannel: optional(summary.cliChannel),
-    cliCommit: optional(summary.cliCommit),
-    editorVersion: redact(summary.editorVersion),
-    tests: { ...summary.tests },
-    reports: {
-      nunit: summary.reports.nunit.map(redact),
-      junit: summary.reports.junit.map(redact),
-    },
-    license: { ...summary.license, mode: redact(summary.license.mode) },
-    artifacts: summary.artifacts.map(redact),
-    logs: {
-      editor: optional(summary.logs.editor),
-      cli: optional(summary.logs.cli),
-    },
-  };
-}
-
 interface ModeOutcome {
   mode: string;
   code: number;
@@ -219,8 +149,8 @@ interface ModeOutcome {
 
 /**
  * Runs one mode through the retry policy and returns the last attempt's exit
- * code. `withRetry` resolves `{ value, code }`; a Unity failure is an outcome,
- * not a rejection (the caller needs the number).
+ * code. A Unity failure is an outcome, not a rejection (the caller needs the
+ * number).
  */
 async function runMode(
   ctx: CoreContext,
@@ -231,113 +161,88 @@ async function runMode(
   const junit = join(outputDir, `${mode}.junit.xml`);
   const args = testArguments(ctx, mode, outputDir);
 
-  const run = await withRetry<number>(
+  const run = await runWithRetry<number>(
+    ctx,
+    `unity test (${mode})`,
     async () => {
-      removeReport(nunit);
-      removeReport(junit);
       const result = await unityTest(unityBaseOptions(ctx), args);
       return { value: result.code, code: result.code };
     },
-    ctx.config.retry,
-    (info) => {
-      ctx.logger.warn(
-        `unity test (${mode}) exited ${info.code} on attempt ${info.attempt}; retrying in ${info.waitMs}ms.`,
-      );
+    () => {
+      removeReport(nunit);
+      removeReport(junit);
     },
   );
 
   return { mode, code: run.code, attempts: run.attempts, nunit, junit };
 }
 
-/**
- * GC9's teardown, called from the `finally` on **every** path. The seat gate
- * lives in `returnLicense` and reads `ctx.licenseActivated`, so a signal-driven
- * teardown (Task 11), which cannot see this function's locals, inherits exactly
- * the same rule. Nothing activated (a failed doctor or setup, `license.mode:
- * none`) means nothing is returned — a developer's own personal licence must
- * never be returned as a side effect of running the toolkit locally.
- *
- * Shared with `build.ts`: both lifecycles enter the same teardown, and neither
- * may decide on its own whether a seat is returnable.
- */
-export async function teardownLicense(ctx: CoreContext): Promise<LicenseReturnResult> {
-  try {
-    return await returnLicense(ctx);
-  } catch (error) {
-    // `returnLicense` does not throw today; a regression here must still not
-    // mask the primary exit code or stop `summary.json` from being written.
-    ctx.logger.error(
-      `the license teardown failed: ${describe(error)}. The seat may still be held.`,
-    );
-    return { returned: false, code: EXIT.COMMAND_FAILED };
-  }
+/** The payload one test run's execute hands to its verify step. */
+interface TestExecution {
+  modes: string[];
+  outcomes: ModeOutcome[];
 }
 
 /**
  * `run test`: the core run loop.
  *
  * It never throws for an expected failure: every path writes `summary.json` and
- * returns a verdict, so a stale green summary cannot survive a failed run
- * (decision 6). An unexpected exception is a bug and becomes exit 65 after the
- * teardown and the summary still run.
+ * returns a verdict, so a stale green summary cannot survive a failed run.
  */
 export async function runTest(ctx: CoreContext): Promise<TestRunResult> {
+  // A repeated mode would run (and count) the same report twice.
   const modes = [...new Set(ctx.config.test.modes)];
   const outputDir = resolve(ctx.projectPath, ctx.config.test.outputDir);
   const summaryDir = resolve(ctx.projectPath, ctx.config.output.dir);
-
-  let setupResult: SetupResult | null = null;
-  let activation: LicenseActivation | null = null;
-  let teardown: LicenseReturnResult | null = null;
 
   const tests = zeroCounts();
   const nunitReports: string[] = [];
   const junitReports: string[] = [];
 
-  let exitCode: number = EXIT.SUCCESS;
-  let rank: number = RANK.passed;
-  let unityExitCode: number = EXIT.SUCCESS;
-  let attempts = 1;
-
-  const raise = (code: number, next: number): void => {
-    if (next > rank) {
-      rank = next;
-      exitCode = code;
-    }
-  };
-
-  try {
-    // The preflight gate (R11) comes first, as the spec's Section 4.5 orders it
-    // (`doctor → setup → … → license step`). `setup` deliberately does not run
-    // `unity doctor --ci`; without this call the run path would never execute
-    // the preflight at all.
-    const doctorCode = await doctorCommand(ctx);
-    if (doctorCode !== EXIT.SUCCESS) {
-      ctx.logger.error(`the doctor preflight failed with exit ${doctorCode}; refusing to run the tests.`);
-      exitCode = doctorCode;
-    } else {
-      setupResult = await setup(ctx, { command: 'test' });
-      activation = await activateLicense(ctx);
-      // The gate every later teardown reads — including a signal-driven one that
-      // cannot see this function's locals (Task 11).
-      if (activation.activated) ctx.licenseActivated = true;
-
+  const execution = await runLifecycle<TestExecution>(ctx, {
+    command: 'test',
+    setupOptions: { command: 'test' },
+    doctorSubject: 'tests',
+    execute: async (ctx) => {
       // Unity's --output is a FILE. Make sure the directory exists before the
       // first invocation; a missing report is still verified below, not assumed.
       mkdirSync(outputDir, { recursive: true });
 
-      if (modes.length === 0) {
+      const outcomes: ModeOutcome[] = [];
+      let unityExitCode: number = EXIT.SUCCESS;
+      let attempts = 1;
+      for (const mode of modes) {
+        const outcome = await runMode(ctx, mode, outputDir);
+        outcomes.push(outcome);
+        unityExitCode = outcome.code;
+        attempts = Math.max(attempts, outcome.attempts);
+      }
+
+      return {
+        data: { modes, outcomes },
+        unityExitCode,
+        attempts,
+      };
+    },
+    verify: async (ctx, result) => {
+      if (result.data.modes.length === 0) {
         // `validateConfig` rejects an empty list; this guards a hand-built
         // context and a zero-count "pass" that no test ever produced.
         ctx.logger.error('test.modes is empty; no test invocation can run.');
-        raise(EXIT.COMMAND_FAILED, RANK.infra);
+        return { exitCode: EXIT.COMMAND_FAILED };
       }
 
-      for (const mode of modes) {
-        const outcome = await runMode(ctx, mode, outputDir);
-        unityExitCode = outcome.code;
-        attempts = Math.max(attempts, outcome.attempts);
+      let exitCode: number = EXIT.SUCCESS;
+      let rank: number = RANK.passed;
+      const raise = (code: number, next: number): void => {
+        if (next > rank) {
+          rank = next;
+          exitCode = code;
+        }
+      };
 
+      for (const outcome of result.data.outcomes) {
+        const { mode } = outcome;
         const hasNunit = isNonEmptyFile(outcome.nunit);
         const hasJunit = isNonEmptyFile(outcome.junit);
         if (hasNunit) nunitReports.push(reportPath(summaryDir, outcome.nunit));
@@ -408,74 +313,33 @@ export async function runTest(ctx: CoreContext): Promise<TestRunResult> {
           raise(EXIT.TESTS_FAILED, RANK.testsFailed);
         }
       }
-    }
-  } catch (error) {
-    if (error instanceof SetupError || error instanceof LicenseError) {
-      ctx.logger.error(error.message);
-      exitCode = error.exitCode;
-    } else {
-      ctx.logger.error(`the test run failed unexpectedly: ${describe(error)}`);
-      exitCode = EXIT.INTERNAL_ERROR;
-    }
-  } finally {
-    // GC9: the teardown is entered on every path, and its seat gate — not this
-    // function's locals — decides whether anything is returned.
-    teardown = await teardownLicense(ctx);
 
-    const summary = buildSummary({
-      command: 'test',
-      status: deriveStatus(exitCode),
-      exitCode,
-      // Decision 5: the real Unity exit code of the last attempt, never a
-      // second, more flattering number.
-      unityExitCode,
-      attempts,
-      cliVersion: ctx.cliVersion ?? '',
-      cliChannel: ctx.cliChannel,
-      cliCommit: ctx.cliCommit,
-      editorVersion:
-        setupResult?.editorVersion ??
-        (ctx.config.unity.editor.version === 'from-project'
-          ? ''
-          : ctx.config.unity.editor.version),
-      durationMs: Math.max(0, Date.now() - ctx.startedAt),
-      tests,
-      reports: { nunit: nunitReports, junit: junitReports },
-      license: {
-        mode: activation?.mode ?? ctx.config.license.mode,
-        activated: activation?.activated === true,
-        returned: teardown?.returned === true,
-        seatLeaked: teardown?.seatLeaked === true,
+      return { exitCode };
+    },
+    summary: () => ({
+      fields: {
+        tests,
+        reports: { nunit: nunitReports, junit: junitReports },
+        artifacts: [],
+        // `unity test` has no `--log-file`; pretending otherwise would publish
+        // a path that was never written (GC10).
+        logs: { editor: null, cli: null },
       },
-      artifacts: [],
-      // `unity test` has no `--log-file`; pretending otherwise would publish a
-      // path that was never written.
-      logs: { editor: null, cli: null },
-    });
-
-    try {
-      writeSummary(summaryDir, redactSummary(ctx, summary));
-      ctx.logger.info(
-        `test status ${summary.status} (exit ${exitCode}); summary at ${join(summaryDir, 'summary.json')}.`,
-      );
-    } catch (error) {
-      ctx.logger.error(`could not write summary.json under ${summaryDir}: ${describe(error)}`);
-      exitCode = EXIT.INTERNAL_ERROR;
-    }
-  }
+    }),
+  });
 
   const status: TestRunResult['status'] =
-    exitCode === EXIT.SUCCESS
+    execution.exitCode === EXIT.SUCCESS
       ? 'passed'
-      : exitCode === EXIT.TESTS_FAILED
+      : execution.exitCode === EXIT.TESTS_FAILED
         ? 'tests_failed'
         : 'infra_failed';
 
   return {
     status,
-    exitCode,
-    unityExitCode,
-    attempts,
+    exitCode: execution.exitCode,
+    unityExitCode: execution.unityExitCode,
+    attempts: execution.attempts,
     reports: { nunit: nunitReports, junit: junitReports },
     tests,
   };

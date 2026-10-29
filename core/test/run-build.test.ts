@@ -163,6 +163,15 @@ function provenancePath(root: string): string {
   return join(root, 'ci-output', 'build', 'provenance.json');
 }
 
+function envelope(data: unknown): {
+  code: number;
+  stdout: string;
+  stderr: string;
+  json: unknown;
+} {
+  return { code: 0, stdout: '', stderr: '', json: { success: true, data } };
+}
+
 function renderProvenance(value: Record<string, unknown> | string): string {
   return typeof value === 'string' ? value : `${JSON.stringify(value, null, 2)}\n`;
 }
@@ -514,6 +523,128 @@ describe('run build', () => {
     expect(listCalls).toHaveLength(0);
   });
 
+  it('asks setup for no target on a profile-only build', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      // The default target is not what the profile builds.
+      config.build.profile = 'Linux Profile';
+    });
+
+    expect(await runCommand(ctx, 'build')).toBe(0);
+
+    // No target means no target-driven module demand: the profile's modules
+    // cannot be derived and `setup` says so with a warning.
+    expect(mocks.setup).toHaveBeenCalledWith(ctx, { command: 'build', target: null });
+  });
+
+  it('still asks setup for an explicit target alongside a profile', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.build.profile = 'Linux Profile';
+      config.build.target = 'StandaloneLinux64';
+    });
+
+    expect(await runCommand(ctx, 'build')).toBe(0);
+
+    expect(mocks.setup).toHaveBeenCalledWith(ctx, {
+      command: 'build',
+      target: 'StandaloneLinux64',
+    });
+  });
+
+  it('drives the real setup module check: a profile-only build demands no target module', async () => {
+    const actual = await vi.importActual<typeof import('../src/lifecycle/setup.js')>(
+      '../src/lifecycle/setup.js',
+    );
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.build.profile = 'Linux Profile';
+      config.build.target = DEFAULT_CONFIG.build.target;
+      config.unity.editor.version = '6000.6.3f1';
+      config.unity.editor.terms = false;
+      config.packages.preflight = false;
+    });
+    const setupCalls: string[][] = [];
+    mocks.runUnity.mockImplementation(async (options: { args: string[] }) => {
+      setupCalls.push(options.args);
+      if (options.args[0] === 'version') {
+        return envelope({ version: '1.0.0-beta.14', channel: 'beta', commit: 'abc1234' });
+      }
+      if (options.args[0] === 'editors') return envelope([{ version: '6000.6.3f1' }]);
+      if (options.args[0] === 'install' && options.args.includes('--list-modules')) {
+        return envelope([
+          { id: 'windows-il2cpp', isInstalled: false },
+          { id: 'linux-il2cpp', isInstalled: false },
+        ]);
+      }
+      if (options.args[0] === 'license') {
+        return envelope({ active: true, signedIn: true, licenses: [] });
+      }
+      return envelope({});
+    });
+
+    // `host: 'linux'` reproduces the CI failure: the default Windows target
+    // would demand windows-il2cpp if it were still used.
+    const result = await actual.setup(ctx, {
+      command: 'build',
+      target: null,
+      host: 'linux',
+    });
+
+    expect(result.editorVersion).toBe('6000.6.3f1');
+    // No module list is consulted, so no windows-il2cpp can be demanded.
+    expect(setupCalls.some((args) => args[0] === 'install' && args.includes('--list-modules'))).toBe(
+      false,
+    );
+    expect(textOutput()).toContain('required Editor modules cannot be derived');
+  });
+
+  it('drives the real setup module check: an explicit Linux target still demands linux-il2cpp', async () => {
+    const actual = await vi.importActual<typeof import('../src/lifecycle/setup.js')>(
+      '../src/lifecycle/setup.js',
+    );
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.build.profile = 'Linux Profile';
+      config.build.target = 'StandaloneLinux64';
+      config.unity.editor.version = '6000.6.3f1';
+      config.unity.editor.terms = false;
+      config.unity.editor.acceptEula = false;
+      config.packages.preflight = false;
+    });
+    mocks.runUnity.mockImplementation(async (options: { args: string[] }) => {
+      if (options.args[0] === 'version') {
+        return envelope({ version: '1.0.0-beta.14', channel: 'beta', commit: 'abc1234' });
+      }
+      if (options.args[0] === 'editors') return envelope([{ version: '6000.6.3f1' }]);
+      if (options.args[0] === 'install' && options.args.includes('--list-modules')) {
+        return envelope([
+          { id: 'linux-il2cpp', isInstalled: false },
+          { id: 'windows-il2cpp', isInstalled: true },
+        ]);
+      }
+      if (options.args[0] === 'license') {
+        return envelope({ active: true, signedIn: true, licenses: [] });
+      }
+      return envelope({});
+    });
+
+    let message = '';
+    try {
+      // Windows host: the Linux target is a cross-build and needs linux-il2cpp.
+      await actual.setup(ctx, {
+        command: 'build',
+        target: 'StandaloneLinux64',
+        host: 'windows',
+      });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(message).toContain('linux-il2cpp');
+    expect(message).not.toContain('windows-il2cpp');
+  });
+
   it('fails with exit 64 when neither a target nor a profile is configured', async () => {
     const root = makeProject();
     const ctx = makeContext(root, (config) => {
@@ -580,6 +711,42 @@ describe('run build', () => {
     const summary = readSummary(root);
     expect(summary.artifacts).toEqual(['build/game']);
     expect((summary.artifacts as string[]).length).toBeGreaterThan(0);
+  });
+
+  it('does not count the toolkit’s own files as the build artifact', async () => {
+    // The provenance manifest written by the core sits inside this output path.
+    buildResponder = () => ({
+      code: 0,
+      artifact: 'none',
+      provenance: { target: 'StandaloneWindows64' },
+    });
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.build.outputPath = 'ci-output/build';
+    });
+
+    const code = await runCommand(ctx, 'build');
+
+    expect(code).toBe(6);
+    expect(existsSync(provenancePath(root))).toBe(true);
+    const summary = readSummary(root);
+    expect(summary.status).toBe('infra_failed');
+    expect(summary.exitCode).toBe(6);
+    expect(summary.artifacts).toEqual([]);
+
+    // The same holds when output.dir itself is the output path: the log, the
+    // test reports and summary.json are all toolkit output, not the player.
+    const broadRoot = makeProject();
+    mkdirSync(join(broadRoot, 'ci-output', 'tests'), { recursive: true });
+    writeFileSync(join(broadRoot, 'ci-output', 'tests', 'EditMode.xml'), '<test-run />');
+    writeFileSync(join(broadRoot, 'ci-output', 'summary.json'), '{"schema":1}');
+    const broadCtx = makeContext(broadRoot, (config) => {
+      config.build.outputPath = 'ci-output';
+    });
+    buildResponder = () => ({ code: 0, artifact: 'none', provenance: { target: 'x' } });
+
+    expect(await runCommand(broadCtx, 'build')).toBe(6);
+    expect(readSummary(broadRoot).exitCode).toBe(6);
   });
 
   it('returns the license when the build fails', async () => {

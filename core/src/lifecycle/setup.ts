@@ -61,6 +61,13 @@ export interface SetupResult {
 export interface SetupOptions {
   command?: 'build' | 'test';
   /**
+   * The build target to derive the module requirement from. `undefined` (the
+   * default) uses `config.build.target`; `null` says "no target is known" — a
+   * profile-only build — which skips the target-driven module check and warns,
+   * rather than silently skipping it the way an empty string once did.
+   */
+  target?: string | null;
+  /**
    * An explicit, non-empty override. When present the config-derived list is
    * ignored, so a caller that knows better (or a future command) can state its
    * modules. An empty array means "no override", never "disable the check".
@@ -843,10 +850,24 @@ function normaliseSetupInput(input: SetupInput): SetupOptions {
 }
 
 /**
+ * The target a build's module requirement derives from.
+ *
+ * `options.target === undefined` means "the configured target"; `null` means
+ * "no target is known" (a profile-only build). The distinction is deliberate:
+ * an empty target must not silently skip the check — the caller says `null`
+ * when it means it, and `setup` then warns.
+ */
+function buildTargetFor(ctx: CoreContext, options: SetupOptions): string | null {
+  const target =
+    options.target === undefined ? ctx.config.build.target : options.target;
+  return typeof target === 'string' && target.trim() !== '' ? target.trim() : null;
+}
+
+/**
  * The command owns its module requirement. A non-empty `requiredModules`
- * override always wins; otherwise a build derives from `config.build.target`
- * on the given host and a test from the configured test modes. No command
- * means no module requirement — the spec's version-only check.
+ * override always wins; otherwise a build derives from the target on the given
+ * host and a test from the configured test modes. No command means no module
+ * requirement — the spec's version-only check.
  */
 function requiredModulesFor(
   ctx: CoreContext,
@@ -857,7 +878,8 @@ function requiredModulesFor(
     return unique(options.requiredModules);
   }
   if (options.command === 'build') {
-    return unique(modulesForBuildTarget(ctx.config.build.target, host));
+    const target = buildTargetFor(ctx, options);
+    return target === null ? [] : unique(modulesForBuildTarget(target, host));
   }
   if (options.command === 'test') {
     return unique(ctx.config.test.modes.flatMap((mode) => modulesForTestMode(mode)));
@@ -875,6 +897,8 @@ function requiredModulesFor(
  *
  * The module requirement belongs to the **invoked command**:
  * `setup(ctx, { command: 'build' })` derives it from `config.build.target`,
+ * `{ command: 'build', target: null }` says no target is known (a profile-only
+ * build) and skips the target-driven check with a warning,
  * `{ command: 'test' }` checks no platform module, and `setup(ctx)` checks only
  * the Editor version. `requiredModules` is an explicit, non-empty override.
  *
@@ -892,12 +916,24 @@ export async function setup(
   const editorVersion = resolveEditorVersion(ctx);
 
   if (options.command === 'build') {
-    const support = isBuildTargetSupportedOnHost(ctx.config.build.target, host);
-    if (!support.supported) {
-      throw new SetupError(
-        `build target ${ctx.config.build.target} cannot be built here: ${support.reason ?? 'unsupported host'}.`,
-        EXIT.CONFIG_ERROR,
+    const target = buildTargetFor(ctx, options);
+    if (target === null) {
+      // A profile-only build: the profile defines the target, and the profile
+      // asset is the only place the module requirement is known. Never guess
+      // from the config default (that demanded windows-il2cpp on a Linux
+      // runner building a Linux profile), and never skip it silently.
+      ctx.logger.warn(
+        'no build target was supplied for this build, so the required Editor modules cannot be derived; ' +
+          "when a build profile defines the target, install that profile target's modules from the profile's own requirements.",
       );
+    } else {
+      const support = isBuildTargetSupportedOnHost(target, host);
+      if (!support.supported) {
+        throw new SetupError(
+          `build target ${target} cannot be built here: ${support.reason ?? 'unsupported host'}.`,
+          EXIT.CONFIG_ERROR,
+        );
+      }
     }
   }
 

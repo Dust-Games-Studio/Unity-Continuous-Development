@@ -34,6 +34,40 @@ const ANDROID_EXPORT_TYPES: ReadonlySet<string> = new Set([
   'android-studio-project',
 ]);
 
+/** A path separator on either platform; both are rejected in a plain name. */
+const PATH_SEPARATOR = /[\\/]/;
+
+/** Control characters, including line breaks (YAML can smuggle either in). */
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
+/**
+ * Validates `build.profile`: a plain profile name, or a path to a `.asset`
+ * file (relative or absolute). The value reaches argv, so a leading `-` is an
+ * argv injection (`--profile --output-path` would parse as two flags), a
+ * control character or line break can forge a second line, and a `..` segment
+ * would let the profile live outside the project. Returns the problem, or null.
+ */
+function buildProfileIssue(profile: string): string | null {
+  if (profile.trim() === '') {
+    return 'build.profile must be a non-empty path to a .asset file or a profile name, or null';
+  }
+  if (profile.startsWith('-')) {
+    return 'build.profile must not start with "-": it would be parsed as another command-line option';
+  }
+  if (CONTROL_CHARACTER.test(profile)) {
+    return 'build.profile must not contain control characters or line breaks';
+  }
+  if (profile.split(PATH_SEPARATOR).includes('..')) {
+    return 'build.profile must not contain a ".." segment: the profile must live inside the project';
+  }
+  const isName = !PATH_SEPARATOR.test(profile);
+  const isAssetPath = /\.asset$/i.test(profile);
+  if (!isName && !isAssetPath) {
+    return 'build.profile must be a plain profile name or a path ending in .asset';
+  }
+  return null;
+}
+
 const ANNOTATIONS: ReadonlySet<string> = new Set(['none', 'github']);
 
 /**
@@ -158,12 +192,16 @@ export function validateConfig(config: Config, projectRoot: string = process.cwd
   // real target, so a profile-only build clears it).
   const profile = config.build.profile;
   const hasProfile = typeof profile === 'string' && profile.trim() !== '';
-  if (profile !== null && !hasProfile) {
-    issues.push({
-      path: 'build.profile',
-      message:
-        'build.profile must be a non-empty path to a .asset file or a profile name, or null',
-    });
+  if (profile !== null) {
+    if (typeof profile !== 'string') {
+      issues.push({
+        path: 'build.profile',
+        message: 'build.profile must be a path to a .asset file or a profile name, or null',
+      });
+    } else {
+      const problem = buildProfileIssue(profile);
+      if (problem !== null) issues.push({ path: 'build.profile', message: problem });
+    }
   }
 
   const target = config.build.target;
