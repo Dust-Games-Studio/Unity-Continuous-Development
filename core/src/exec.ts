@@ -107,6 +107,43 @@ function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
   }
 }
 
+/**
+ * Every child `spawnProcess` has started and has not yet seen finish.
+ *
+ * A signal handler has no handle on the in-flight `unity test` call, so it
+ * cannot otherwise kill the Editor before the licence teardown — and returning
+ * a seat while an Editor still runs is worse than not returning it. A child
+ * leaves the registry from `settle`, which every exit path (success, failure,
+ * timeout) runs through, so the set cannot leak.
+ */
+const liveChildren = new Set<ChildProcess>();
+
+/**
+ * Kills every live child tree, then forgets it.
+ *
+ * Called from the signal handler **before** its first `await`, so the Editor is
+ * gone by the time `unity license return` runs. It is synchronous by contract
+ * and deliberately uses the forced branch of the timeout escalation: the
+ * process is about to exit, so there is no later tick in which to send SIGKILL
+ * after a graceful SIGTERM.
+ *
+ * Safe to call twice, and safe against a child that is mid-exit: a dead pid is
+ * removed from the registry by `settle`, and a child that has exited or is
+ * already marked killed is never signalled (on Windows a recycled pid would
+ * make that a different, innocent process).
+ */
+export function killAllChildren(): void {
+  for (const child of [...liveChildren]) {
+    liveChildren.delete(child);
+    if (child.exitCode !== null || child.killed) continue;
+    try {
+      killProcessTree(child, 'SIGKILL');
+    } catch {
+      // A child that vanished between the check and the signal is already gone.
+    }
+  }
+}
+
 /** A stream's unterminated tail, carried across data chunks. */
 interface Tail {
   value: string;
@@ -139,6 +176,9 @@ export function spawnProcess(opts: SpawnOptions): Promise<SpawnResult> {
     const settle = (code: number): void => {
       if (settled) return;
       settled = true;
+      // Every path — exit, spawn failure, timeout — settles exactly once, so
+      // this is the one place a child leaves the signal handler's registry.
+      liveChildren.delete(child);
       if (timeout) clearTimeout(timeout);
       if (escalate) clearTimeout(escalate);
       if (rescue) clearTimeout(rescue);
@@ -194,6 +234,10 @@ export function spawnProcess(opts: SpawnOptions): Promise<SpawnResult> {
       // used there instead.
       detached: process.platform !== 'win32',
     });
+
+    // Registered immediately: a signal that arrives while the child is starting
+    // must still find it, or the handler returns a seat an Editor still holds.
+    liveChildren.add(child);
 
     // Decode once, with a streaming decoder: a multi-byte character split
     // across chunks must not turn into replacement characters.
