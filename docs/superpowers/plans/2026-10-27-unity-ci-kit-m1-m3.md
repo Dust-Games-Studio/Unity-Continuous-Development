@@ -1121,6 +1121,10 @@ it('reports the library cache key from unity cache key', () => { /* library.key 
 it('reports a static library key made of the editor version and target', () => { /* library.staticKey */ });
 it('reports the library path inside the project', () => { /* <root>/Library */ });
 it('prints valid JSON when --json is passed', () => { /* JSON.parse */ });
+it('falls back to the static key when unity cache key reports NOT_A_PROJECT', () => { /* exit 0, warn, key === staticKey */ });
+it('accepts a cache key payload that is a bare string', () => { /* data: "<key>" */ });
+it('accepts a cache key payload that carries the three components', () => { /* editor/packages/target */ });
+it('never fails the command when the cache calls fail', () => { /* exit 0, both fallbacks */ });
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1132,8 +1136,16 @@ Expected: FAIL — module not found.
 
 `cacheInfo` calls `unity cache info --format json` for `data.path` (the Editor **download cache** — `$XDG_CONFIG_HOME/unityhub/downloads` on Linux, `%APPDATA%\UnityHub\downloads` on Windows, `~/Library/Application Support/UnityHub/downloads` on macOS) and `unity cache key <project> --target <target> --format json` for `data.key`. It builds the spec's shape:
 - `editor.paths` = `[<download cache path>]`, `editor.key` = `unity-downloads-<editorVersion>`.
-- `library.paths` = `[<projectRoot>/Library]`, `library.key` = the key from `unity cache key`.
+- `library.paths` = `[<projectRoot>/Library]`, `library.key` = the key from `unity cache key`, falling back to `staticKey` when the call cannot produce one.
 - `library.staticKey` = `unity-library-<editorVersion>-<target>` — for providers (like GitLab) that must compute a cache key **before** the job's script runs and therefore cannot shell out.
+
+**A cache hint must never fail a job.** `unity cache key` requires a real Unity project: measured against a non-project directory it exits **11** with `NOT_A_PROJECT` and `"Expected to find ProjectSettings\\ProjectVersion.txt"`. So every call in this command is **best-effort**: a non-zero exit, a `success: false` payload or an unparseable document degrades to the fallback value with a **warn**, and `cacheInfoCommand` still exits **0**. A cache is an optimisation; failing a green job because an optimisation could not be computed is worse than not caching.
+
+**Do not assume the `cache key` payload's shape.** The success document has not been observed on this machine (there is no Unity project in the repo yet, and the example project arrives in Task 15), so the reader must accept the plausible shapes rather than one guess: `data` as a **string**, or `data` as an object carrying a `key` (and, if present, `editor`/`packages`/`target` components — the CLI's own `--component <editor|packages|target>` flag prints one at a time, which is a strong hint the whole key is composite). Take the string when `data` is a string, `data.key` when it is an object with a string `key`, concatenate the three components when only those are present, and fall back to `staticKey` otherwise.
+
+**`editorVersion` comes from the resolved Editor, not from a guess.** Use `config.unity.editor.version` when it is set, and read `ProjectSettings/ProjectVersion.txt` when the config says `from-project`. If neither yields a version, `editor.key` and `staticKey` fall back to a marker (`unity-downloads-unknown`, `unity-library-unknown-<target>`) with a warn — never a crash, and never an empty segment that could collide two different Editors into one cache entry.
+
+`cacheInfoCommand` takes its output format as an argument — `cacheInfoCommand(ctx, opts?: { json?: boolean })` — because the core's command functions do not parse argv (the CLI does, in Task 13). Human output is a short labelled summary; `--json` prints the `CacheInfo` object as 2-space-indented JSON with a trailing newline, so a provider can pipe it.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
