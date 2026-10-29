@@ -41,6 +41,8 @@ interface Scenario {
 
 const tempDirs: string[] = [];
 const lines: string[] = [];
+/** stdout is captured separately: it must never mix with the log stream. */
+const stdoutLines: string[] = [];
 const calls: string[][] = [];
 let scenario: Scenario = {};
 
@@ -114,6 +116,9 @@ function makeContext(projectPath: string, edit?: (config: Config) => void): Core
     env: {},
     logger,
     redactor,
+    stdout: (text) => {
+      stdoutLines.push(text);
+    },
     binary: 'unity',
     startedAt: Date.now(),
     cliVersion: null,
@@ -125,6 +130,7 @@ function makeContext(projectPath: string, edit?: (config: Config) => void): Core
 beforeEach(() => {
   scenario = {};
   lines.length = 0;
+  stdoutLines.length = 0;
   calls.length = 0;
   mocks.runUnity.mockReset();
   mocks.runUnity.mockImplementation(async (options: { args: string[] }) => {
@@ -178,12 +184,20 @@ describe('cacheInfo', () => {
     expect(info.library.staticKey).toBe(`unity-library-${EDITOR_VERSION}-${TARGET}`);
   });
 
-  it('reports the library path inside the project', async () => {
+  it('reports the library path inside the project, not the cwd', async () => {
     const project = makeProject();
+    const cwd = mkdtempSync(join(tmpdir(), 'unityci-cache-cwd-'));
+    tempDirs.push(cwd);
+    const ctx = makeContext(project);
+    // `cwd` only sets where a child runs; `projectPath` decides which project
+    // is built, so the Library path must follow the latter.
+    ctx.cwd = cwd;
+    expect(ctx.cwd).not.toBe(ctx.projectPath);
 
-    const info = await cacheInfo(makeContext(project));
+    const info = await cacheInfo(ctx);
 
     expect(info.library.paths).toEqual([join(project, 'Library')]);
+    expect(info.library.paths).not.toContain(join(cwd, 'Library'));
   });
 
   it('uses the configured editor version without reading ProjectVersion.txt', async () => {
@@ -210,7 +224,7 @@ describe('cacheInfo', () => {
 });
 
 describe('cacheInfoCommand', () => {
-  it('prints valid JSON when --json is passed', async () => {
+  it('prints valid JSON to stdout when --json is passed', async () => {
     const project = makeProject();
     scenario.key = { data: { key: CACHE_KEY } };
     const ctx = makeContext(project);
@@ -218,7 +232,7 @@ describe('cacheInfoCommand', () => {
     const code = await cacheInfoCommand(ctx, { json: true });
 
     expect(code).toBe(0);
-    const output = lines.join('');
+    const output = stdoutLines.join('');
     // Two-space indentation and a trailing newline: a provider can pipe it.
     expect(output).toContain('\n  "editor"');
     expect(output.endsWith('\n')).toBe(true);
@@ -234,6 +248,39 @@ describe('cacheInfoCommand', () => {
         staticKey: `unity-library-${EDITOR_VERSION}-${TARGET}`,
       },
     });
+    // The document must not also be logged: the log stream is stderr.
+    expect(lines.join('')).not.toContain('"editor"');
+  });
+
+  it('keeps the --json document clean when a fallback warning fired', async () => {
+    const project = makeProject();
+    scenario.key = {
+      code: 11,
+      success: false,
+      json: {
+        success: false,
+        errors: [
+          {
+            code: 'NOT_A_PROJECT',
+            message: `No Unity project at ${project}. Expected to find ProjectSettings\\ProjectVersion.txt.`,
+          },
+        ],
+      },
+    };
+    const ctx = makeContext(project);
+
+    const code = await cacheInfoCommand(ctx, { json: true });
+
+    expect(code).toBe(0);
+    // The warning is on the log stream, never inside the document.
+    expect(lines.join('')).toContain('could not compute the Library cache key');
+    const output = stdoutLines.join('');
+    expect(lines.join('')).not.toContain('"editor"');
+
+    const parsed = JSON.parse(output) as CacheInfo;
+    expect(parsed.library.key).toBe(parsed.library.staticKey);
+    expect(parsed.library.staticKey).toBe(`unity-library-${EDITOR_VERSION}-${TARGET}`);
+    expect(output.endsWith('\n')).toBe(true);
   });
 
   it('prints a labelled human summary without --json', async () => {
@@ -248,6 +295,8 @@ describe('cacheInfoCommand', () => {
     expect(output).toContain('library');
     expect(output).toContain(join(project, 'Library'));
     expect(() => JSON.parse(output)).toThrow();
+    // Human output belongs to the log stream, never stdout.
+    expect(stdoutLines.join('')).toBe('');
   });
 
   it('falls back to the static key when unity cache key reports NOT_A_PROJECT', async () => {

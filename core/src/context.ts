@@ -15,6 +15,19 @@ export interface CoreContext {
   env: NodeJS.ProcessEnv;
   logger: Logger;
   redactor: Redactor;
+  /**
+   * Writes one intentionally machine-readable document to **stdout**.
+   *
+   * stdout is reserved for output a caller pipes (the `--json` document, and
+   * later GitHub workflow commands); every human-facing line — progress,
+   * warnings, diagnostics — goes through `logger`, which the CLI wires to
+   * stderr. A warning must therefore never share this stream.
+   *
+   * Optional so a fixture, or a command that never prints machine output, need
+   * not supply it; absent means `process.stdout.write`. The CLI entrypoint
+   * should inject it next to `logger` and `redactor` when it builds the context.
+   */
+  stdout?: (text: string) => void;
   /** The Unity CLI binary to spawn (`unity.cli.binary`). */
   binary: string;
   /**

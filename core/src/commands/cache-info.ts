@@ -259,11 +259,36 @@ export async function cacheInfo(ctx: CoreContext): Promise<CacheInfo> {
 }
 
 /**
+ * Writes one document to the machine-readable stdout stream, never the logger.
+ *
+ * The logger carries progress and warnings (the CLI sends it to stderr), so a
+ * degraded run still leaves a clean document for `unityci cache-info --json |
+ * jq`. The text is redacted first: it is built from Unity's output and may
+ * echo a value the redactor knows. A broken pipe or sink must not fail the job,
+ * so the write is best-effort like every other cache hint.
+ */
+function writeStdout(ctx: CoreContext, text: string): void {
+  const write =
+    ctx.stdout ??
+    ((output: string): void => {
+      process.stdout.write(output);
+    });
+  try {
+    write(ctx.redactor.redact(text));
+  } catch {
+    // Deliberately swallowed: a cache hint must never fail a job.
+  }
+}
+
+/**
  * `unityci cache-info`: prints the cache descriptors and always exits 0.
  *
- * `--json` (passed by the CLI) emits the {@link CacheInfo} object as
- * 2-space-indented JSON with a trailing newline so a provider can pipe it;
- * otherwise a short labelled summary goes to the log.
+ * `--json` (passed by the CLI) writes the {@link CacheInfo} object as
+ * 2-space-indented JSON with a trailing newline to **stdout**, so a provider
+ * can pipe it cleanly even when a fallback warning was logged; otherwise a
+ * short labelled summary goes to the log. `ctx.stdout` is used instead of the
+ * logger because Task 13 reserves stdout for machine-readable output and sends
+ * every log line to stderr.
  */
 export async function cacheInfoCommand(
   ctx: CoreContext,
@@ -272,7 +297,7 @@ export async function cacheInfoCommand(
   const info = await cacheInfo(ctx);
 
   if (opts.json === true) {
-    safeLog(ctx, 'info', JSON.stringify(info, null, 2));
+    writeStdout(ctx, `${JSON.stringify(info, null, 2)}\n`);
     return EXIT.SUCCESS;
   }
 
