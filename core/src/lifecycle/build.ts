@@ -58,16 +58,6 @@ export interface BuildRunResult {
   provenance: Record<string, unknown> | null;
 }
 
-/**
- * The two Android knobs the brief requires and the typed `Config['build']`
- * does not (yet) declare. They are read defensively so this module works both
- * with the current schema and with a schema that adds them.
- */
-interface BuildConfigExtras {
-  androidExportType?: string | null;
-  androidTargetSdkVersion?: number | null;
-}
-
 /** One row of `unity build --list-targets --format json`. */
 interface BuildTargetRow {
   target: string;
@@ -118,6 +108,43 @@ function isNonEmptyArtifact(path: string): boolean {
 }
 
 /**
+ * The newest modification time anywhere in the artifact tree, or `-Infinity`
+ * when it is absent.
+ *
+ * A retry that exits 0 must have written something itself; a file's own mtime
+ * says so directly, but a build directory's own mtime does not change when a
+ * contained file is overwritten, so every entry is considered. A build never
+ * renders, so the tree is finite and walking it is cheap relative to a build.
+ */
+function artifactModifiedAt(path: string): number {
+  try {
+    const stats = statSync(path);
+    if (stats.isFile()) return stats.mtimeMs;
+    if (!stats.isDirectory()) return Number.NEGATIVE_INFINITY;
+
+    let newest = stats.mtimeMs;
+    for (const entry of readdirSync(path, { withFileTypes: true })) {
+      const child = artifactModifiedAt(join(path, entry.name));
+      if (child > newest) newest = child;
+    }
+    return newest;
+  } catch {
+    return Number.NEGATIVE_INFINITY;
+  }
+}
+
+/** The configured target, with the empty string meaning "not set". */
+function configuredTarget(ctx: CoreContext): string {
+  return typeof ctx.config.build.target === 'string' ? ctx.config.build.target.trim() : '';
+}
+
+/** True when a build profile defines the target. */
+function hasBuildProfile(ctx: CoreContext): boolean {
+  const profile = ctx.config.build.profile;
+  return typeof profile === 'string' && profile.trim() !== '';
+}
+
+/**
  * Removes a previous attempt's manifest or log, so what is read (and
  * published) after a retry belongs to the last attempt. The build output itself
  * is deliberately never deleted: `output.dir` may be any directory inside the
@@ -160,7 +187,20 @@ function targetRows(result: UnityResult): BuildTargetRow[] | null {
  * build start and fail minutes later. The human table is never read.
  */
 async function validateTarget(ctx: CoreContext): Promise<TargetProblem | null> {
-  const target = ctx.config.build.target;
+  // A build profile defines the target, so there is no `--target` to validate
+  // and no execute method to require.
+  if (hasBuildProfile(ctx)) return null;
+
+  const target = configuredTarget(ctx);
+  if (target === '') {
+    // `validateConfig` rejects this before anything runs; the guard keeps a
+    // hand-built context from invoking `unity build` with neither selector.
+    ctx.logger.error(
+      'no build target is configured and no build profile is set: `unity build --target` is required unless `--profile` is used.',
+    );
+    return { code: EXIT.CONFIG_ERROR, unityExitCode: EXIT.SUCCESS };
+  }
+
   const result = await unityBuild(unityBaseOptions(ctx), [
     ctx.projectPath,
     '--list-targets',
@@ -219,6 +259,17 @@ async function validateTarget(ctx: CoreContext): Promise<TargetProblem | null> {
  * `--allow-install` is never sent: a missing Editor must fail fast in `setup`
  * with the exact install command, not download mid-run. `--output-path` is
  * always sent even for a zero-code target; the CLI requires it.
+ *
+ * `--target` and `--profile` are exclusive on argv: a profile defines the
+ * target, and `--target` is only required when no profile is used.
+ *
+ * `--no-tail` is unconditional. `unity build` streams the Editor log to stdout
+ * by default, and `--format json` does **not** turn that off (only `--quiet`
+ * and `--format ndjson` do), so without it the JSON reader sees an interleaved
+ * log (GC12). The log still lands in `--log-file`.
+ *
+ * `-nographics` goes through `--args` (shell-split), not a `--` tail: this verb
+ * has no separator. A batch build never renders, so R14 makes it unconditional.
  */
 function buildArguments(
   ctx: CoreContext,
@@ -227,22 +278,27 @@ function buildArguments(
   provenancePath: string,
 ): string[] {
   const build = ctx.config.build;
-  const extras = build as typeof build & BuildConfigExtras;
-  const args = [
-    ctx.projectPath,
-    '--target',
-    build.target,
+  const args = [ctx.projectPath];
+  const profile = build.profile;
+
+  if (typeof profile === 'string' && profile.trim() !== '') {
+    args.push('--profile', profile);
+  } else {
+    args.push('--target', configuredTarget(ctx));
+  }
+
+  args.push(
     '--output-path',
     outputPath,
     '--log-file',
     logFile,
     '--provenance-path',
     provenancePath,
-  ];
+    '--no-tail',
+    '--args',
+    '-nographics',
+  );
 
-  if (build.profile !== null && build.profile !== '') {
-    args.push('--profile', build.profile);
-  }
   if (build.executeMethod !== null && build.executeMethod !== '') {
     args.push('--execute-method', build.executeMethod);
   }
@@ -254,14 +310,14 @@ function buildArguments(
   if (build.versioningStrategy === 'custom' && build.buildVersion !== null) {
     args.push('--build-version', build.buildVersion);
   }
-  if (typeof extras.androidExportType === 'string' && extras.androidExportType !== '') {
-    args.push('--android-export-type', extras.androidExportType);
+  if (build.androidExportType !== null) {
+    args.push('--android-export-type', build.androidExportType);
   }
   if (build.androidVersionCode !== null) {
     args.push('--android-version-code', String(build.androidVersionCode));
   }
-  if (typeof extras.androidTargetSdkVersion === 'number') {
-    args.push('--android-target-sdk-version', String(extras.androidTargetSdkVersion));
+  if (build.androidTargetSdkVersion !== null) {
+    args.push('--android-target-sdk-version', String(build.androidTargetSdkVersion));
   }
   if (build.allowDirtyBuild) args.push('--allow-dirty-build');
 
@@ -331,6 +387,8 @@ export async function runBuild(ctx: CoreContext): Promise<BuildRunResult> {
   let exitCode: number = EXIT.SUCCESS;
   let unityExitCode: number = EXIT.SUCCESS;
   let attempts = 1;
+  /** When the last attempt began; a retry must have written after this. */
+  let lastAttemptStartedAt = 0;
 
   try {
     // The preflight gate (R11) comes first, as the spec's Section 4.5 orders it.
@@ -362,6 +420,7 @@ export async function runBuild(ctx: CoreContext): Promise<BuildRunResult> {
           async () => {
             removeStaleFile(logFile);
             removeStaleFile(provenanceFile);
+            lastAttemptStartedAt = Date.now();
             const result = await unityBuild(unityBaseOptions(ctx), args);
             return { value: result.code, code: result.code };
           },
@@ -405,6 +464,18 @@ export async function runBuild(ctx: CoreContext): Promise<BuildRunResult> {
           // usable (R18).
           ctx.logger.error(
             `unity build exited 0 but produced no non-empty artifact at ${outputPath}; the build has no verdict.`,
+          );
+          exitCode = EXIT.COMMAND_FAILED;
+        } else if (
+          run.attempts > 1 &&
+          artifactModifiedAt(outputPath) < lastAttemptStartedAt
+        ) {
+          // The retry exited 0 but touched nothing: the non-empty output is the
+          // previous attempt's artifact, which is not this run's verdict (R18).
+          // Deleting a user-configured output path is not acceptable, so the
+          // freshness check is the guard instead.
+          ctx.logger.error(
+            `unity build exited 0 on attempt ${run.attempts} but nothing at ${outputPath} was modified by that attempt; the artifact belongs to an earlier attempt and the build has no verdict.`,
           );
           exitCode = EXIT.COMMAND_FAILED;
         } else {

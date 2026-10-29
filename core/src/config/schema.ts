@@ -38,13 +38,21 @@ export interface Config {
     nographics: boolean;
   };
   build: {
+    /**
+     * The `--target` value. An empty string means "not set": `--target` is
+     * required unless a build profile defines the target, so a profile-only
+     * build leaves this empty rather than inventing a target.
+     */
     target: string;
+    /** A path to a `.asset` file or a profile name; `null` means not set. */
     profile: string | null;
     executeMethod: string | null;
     outputPath: string;
     versioningStrategy: 'none' | 'semantic' | 'tag' | 'custom';
     buildVersion: string | null;
+    androidExportType: 'apk' | 'aab' | 'android-studio-project' | null;
     androidVersionCode: number | null;
+    androidTargetSdkVersion: number | null;
     allowDirtyBuild: boolean;
   };
   retry: { onExitCodes: number[]; maxAttempts: number; backoffMs: number };
@@ -93,7 +101,11 @@ export const DEFAULT_CONFIG: Config = {
     outputPath: 'ci-output/build/game',
     versioningStrategy: 'none',
     buildVersion: null,
+    // The CLI's own default is `apk`, but the core sends no Android flag the
+    // user did not ask for; `null` means "leave the CLI default alone".
+    androidExportType: null,
     androidVersionCode: null,
+    androidTargetSdkVersion: null,
     allowDirtyBuild: false,
   },
   retry: { onExitCodes: [7, 9, 12, 14], maxAttempts: 2, backoffMs: 5000 },

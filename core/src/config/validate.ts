@@ -28,6 +28,12 @@ const LICENSE_MODES: ReadonlySet<string> = new Set([
 
 const TEST_MODES: ReadonlySet<string> = new Set(['EditMode', 'PlayMode']);
 
+const ANDROID_EXPORT_TYPES: ReadonlySet<string> = new Set([
+  'apk',
+  'aab',
+  'android-studio-project',
+]);
+
 const ANNOTATIONS: ReadonlySet<string> = new Set(['none', 'github']);
 
 /**
@@ -145,8 +151,54 @@ export function validateConfig(config: Config, projectRoot: string = process.cwd
   checkVersionString('unity.cli.version', config.unity.cli.version, issues);
   checkNullableVersion('unity.editor.changeset', config.unity.editor.changeset, issues);
   checkVersionString('unity.editor.version', config.unity.editor.version, issues);
-  checkVersionString('build.target', config.build.target, issues);
-  checkNullableVersion('build.profile', config.build.profile, issues);
+
+  // --- build target / profile ---------------------------------------------------
+  // `unity build --target` is "Required unless --profile is used", so a build
+  // needs one of them. An empty target is the unset value (the default is a
+  // real target, so a profile-only build clears it).
+  const profile = config.build.profile;
+  const hasProfile = typeof profile === 'string' && profile.trim() !== '';
+  if (profile !== null && !hasProfile) {
+    issues.push({
+      path: 'build.profile',
+      message:
+        'build.profile must be a non-empty path to a .asset file or a profile name, or null',
+    });
+  }
+
+  const target = config.build.target;
+  const hasTarget = typeof target === 'string' && target.trim() !== '';
+  if (!hasProfile && !hasTarget) {
+    issues.push({
+      path: 'build.target',
+      message:
+        'build.target is empty and build.profile is null: a build needs one of them, because ' +
+        '`unity build --target` is required unless `--profile` is used. Set build.target or build.profile',
+    });
+  } else if (hasTarget) {
+    checkVersionString('build.target', target, issues);
+  }
+  // A profile is a path to a `.asset` file or a profile name; both may contain
+  // spaces and slashes, so it is deliberately not checked as a version string.
+
+  // --- Android build knobs ------------------------------------------------------
+  const exportType = config.build.androidExportType;
+  if (exportType !== null && !ANDROID_EXPORT_TYPES.has(exportType)) {
+    issues.push({
+      path: 'build.androidExportType',
+      message:
+        'build.androidExportType must be one of apk, aab, android-studio-project, or null; ' +
+        `got ${JSON.stringify(exportType)}`,
+    });
+  }
+
+  const targetSdk = config.build.androidTargetSdkVersion;
+  if (targetSdk !== null && (!Number.isInteger(targetSdk) || targetSdk <= 0)) {
+    issues.push({
+      path: 'build.androidTargetSdkVersion',
+      message: `build.androidTargetSdkVersion must be a positive integer, or null; got ${JSON.stringify(targetSdk)}`,
+    });
+  }
 
   if (typeof config.unity.cli.binary !== 'string' || config.unity.cli.binary.trim() === '') {
     issues.push({ path: 'unity.cli.binary', message: 'unity.cli.binary must be a non-empty command or path' });

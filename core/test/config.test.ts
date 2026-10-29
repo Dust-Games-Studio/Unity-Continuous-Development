@@ -458,6 +458,95 @@ describe('config validation', () => {
     expect(issues).toEqual([]);
   });
 
+  it('defaults the Android build knobs to null so no flag is sent', () => {
+    const tmp = workspace();
+    const { config, issues } = loadIn(tmp);
+    expect(config.build.androidExportType).toBeNull();
+    expect(config.build.androidTargetSdkVersion).toBeNull();
+    expect(issues).toEqual([]);
+  });
+
+  it('accepts every Android export type and a positive target SDK', () => {
+    for (const type of ['apk', 'aab', 'android-studio-project']) {
+      const tmp = workspace();
+      const configFile = write(
+        tmp,
+        'unity-ci.yml',
+        `build:\n  androidExportType: ${type}\n  androidTargetSdkVersion: 34\n`,
+      );
+      const { config, issues } = loadIn(tmp, { configFile });
+      expect(issues).toEqual([]);
+      expect(config.build.androidExportType).toBe(type);
+      expect(config.build.androidTargetSdkVersion).toBe(34);
+    }
+  });
+
+  it('rejects an unknown Android export type', () => {
+    const tmp = workspace();
+    const configFile = write(tmp, 'unity-ci.yml', 'build:\n  androidExportType: ipa\n');
+    const { issues } = loadIn(tmp, { configFile });
+    expect(issues.some((i) => i.path === 'build.androidExportType')).toBe(true);
+    // The three CLI choices are named in the message.
+    const issue = issues.find((i) => i.path === 'build.androidExportType');
+    expect(issue?.message).toContain('apk, aab, android-studio-project');
+  });
+
+  it('rejects a non-positive or non-integer Android target SDK', () => {
+    for (const value of ['0', '-1', '33.5', '"34"']) {
+      const tmp = workspace();
+      const configFile = write(
+        tmp,
+        'unity-ci.yml',
+        `build:\n  androidTargetSdkVersion: ${value}\n`,
+      );
+      const { issues } = loadIn(tmp, { configFile });
+      expect(issues.some((i) => i.path === 'build.androidTargetSdkVersion')).toBe(true);
+    }
+  });
+
+  it('accepts a Unity build profile path with spaces', () => {
+    const tmp = workspace();
+    const profile = 'Assets/Settings/Build Profiles/Windows Release.asset';
+    const configFile = write(tmp, 'unity-ci.yml', `build:\n  profile: ${profile}\n`);
+    const { config, issues } = loadIn(tmp, { configFile });
+    expect(issues).toEqual([]);
+    expect(config.build.profile).toBe(profile);
+  });
+
+  it('accepts a build profile name', () => {
+    const tmp = workspace();
+    const configFile = write(tmp, 'unity-ci.yml', 'build:\n  profile: Windows Release\n');
+    const { config, issues } = loadIn(tmp, { configFile });
+    expect(issues).toEqual([]);
+    expect(config.build.profile).toBe('Windows Release');
+  });
+
+  it('rejects an empty build profile', () => {
+    const tmp = workspace();
+    const configFile = write(tmp, 'unity-ci.yml', 'build:\n  profile: ""\n');
+    const { issues } = loadIn(tmp, { configFile });
+    expect(issues.some((i) => i.path === 'build.profile')).toBe(true);
+  });
+
+  it('requires a build target unless a profile is configured', () => {
+    for (const target of ['""', 'null']) {
+      const tmp = workspace();
+      const configFile = write(tmp, 'unity-ci.yml', `build:\n  target: ${target}\n`);
+      const { issues } = loadIn(tmp, { configFile });
+      const issue = issues.find((i) => i.path === 'build.target');
+      expect(issue).toBeDefined();
+      expect(issue?.message).toContain('--target');
+      expect(issue?.message).toContain('--profile');
+    }
+  });
+
+  it('accepts an unset target when a profile defines it', () => {
+    const tmp = workspace();
+    const configFile = write(tmp, 'unity-ci.yml', 'build:\n  target: ""\n  profile: Windows\n');
+    const { issues } = loadIn(tmp, { configFile });
+    expect(issues).toEqual([]);
+  });
+
   it('rejects a test mode that is not EditMode or PlayMode', () => {
     const tmp = workspace();
     const { issues } = loadIn(tmp, { env: { UNITYCI_TEST_MODES: 'EditMode,SmokeMode' } });

@@ -2,8 +2,10 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -70,6 +72,8 @@ interface BuildOutcome {
   provenance?: Record<string, unknown> | string | null;
   /** False leaves no Editor log behind. */
   log?: boolean;
+  /** Backdates the artifact tree, as if an earlier attempt wrote it. */
+  staleMtime?: boolean;
 }
 
 interface TestOutcome {
@@ -161,6 +165,16 @@ function provenancePath(root: string): string {
 
 function renderProvenance(value: Record<string, unknown> | string): string {
   return typeof value === 'string' ? value : `${JSON.stringify(value, null, 2)}\n`;
+}
+
+/** Backdates every file and directory in a tree, simulating an older attempt. */
+function ageTree(path: string, when: Date): void {
+  for (const entry of readdirSync(path, { withFileTypes: true })) {
+    const child = join(path, entry.name);
+    if (entry.isDirectory()) ageTree(child, when);
+    else utimesSync(child, when, when);
+  }
+  utimesSync(path, when, when);
 }
 
 beforeEach(() => {
@@ -276,6 +290,9 @@ beforeEach(() => {
         mkdirSync(dirname(outputPath), { recursive: true });
         writeFileSync(outputPath, 'MZ');
       }
+      if (outcome.staleMtime === true && existsSync(outputPath)) {
+        ageTree(outputPath, new Date(Date.now() - 60_000));
+      }
       if (outcome.provenance !== null && outcome.provenance !== undefined) {
         mkdirSync(dirname(manifest), { recursive: true });
         writeFileSync(manifest, renderProvenance(outcome.provenance));
@@ -355,6 +372,12 @@ describe('run build', () => {
       join(root, 'ci-output', 'logs', 'editor.log'),
       '--provenance-path',
       join(root, 'ci-output', 'build', 'provenance.json'),
+      // The streamed Editor log would be interleaved into stdout, and
+      // `--format json` does not disable it; the log still lands in --log-file.
+      '--no-tail',
+      // R14: a batch build never renders, and there is no `--` on this verb.
+      '--args',
+      '-nographics',
       '--format',
       'json',
     ]);
@@ -420,12 +443,9 @@ describe('run build', () => {
     const ctx = makeContext(root, (config) => {
       config.build.target = 'Android';
       config.build.executeMethod = 'Build.Editor.BuildPlayer';
-      // The two Android fields are beyond the typed surface this task may edit.
-      Object.assign(config.build, {
-        androidExportType: 'aab',
-        androidVersionCode: 42,
-        androidTargetSdkVersion: 34,
-      });
+      config.build.androidExportType = 'aab';
+      config.build.androidVersionCode = 42;
+      config.build.androidTargetSdkVersion = 34;
     });
 
     expect(await runCommand(ctx, 'build')).toBe(0);
@@ -477,18 +497,40 @@ describe('run build', () => {
     expect(summary.exitCode).toBe(64);
   });
 
-  it('accepts a build profile as the alternative to --execute-method', async () => {
+  it('accepts a build profile path as the alternative to --execute-method', async () => {
+    const profile = 'Assets/Settings/Build Profiles/Windows Release.asset';
     const root = makeProject();
     const ctx = makeContext(root, (config) => {
-      config.build.target = 'Android';
-      // A profile *name* is accepted by the validator; a path (with spaces and
-      // slashes) is currently rejected as a version string (see the report).
-      config.build.profile = 'AndroidProfile';
+      config.build.profile = profile;
     });
 
     expect(await runCommand(ctx, 'build')).toBe(0);
 
-    expect(valueAfter(buildCalls[0]!, '--profile')).toBe('AndroidProfile');
+    const args = buildCalls[0]!;
+    expect(valueAfter(args, '--profile')).toBe(profile);
+    // The profile defines the target, so `--target` is not sent at all, and
+    // there is no target to validate against --list-targets.
+    expect(args).not.toContain('--target');
+    expect(listCalls).toHaveLength(0);
+  });
+
+  it('fails with exit 64 when neither a target nor a profile is configured', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.build.target = '';
+    });
+
+    const code = await runCommand(ctx, 'build');
+
+    expect(code).toBe(64);
+    // A configuration error is caught before anything is spawned.
+    expect(mocks.doctorCommand).not.toHaveBeenCalled();
+    expect(mocks.setup).not.toHaveBeenCalled();
+    expect(mocks.activateLicense).not.toHaveBeenCalled();
+    expect(listCalls).toHaveLength(0);
+    expect(buildCalls).toHaveLength(0);
+    expect(textOutput()).toContain('--target');
+    expect(textOutput()).toContain('--profile');
   });
 
   it('never passes --allow-install', async () => {
@@ -607,6 +649,35 @@ describe('run build', () => {
       exitCode: 65,
       unityExitCode: 0,
     });
+  });
+
+  it('does not accept the previous attempt’s artifact after a retry', async () => {
+    let attempt = 0;
+    buildResponder = () => {
+      attempt += 1;
+      // The first attempt writes a player and then fails the invocation; the
+      // retry exits 0 without touching anything. The stale tree must not count.
+      return attempt === 1
+        ? {
+            code: 7,
+            artifact: 'dir',
+            provenance: { target: 'StandaloneWindows64' },
+            staleMtime: true,
+          }
+        : { code: 0, artifact: 'none', provenance: null };
+    };
+    const root = makeProject();
+    const ctx = makeContext(root);
+
+    const code = await runCommand(ctx, 'build');
+
+    expect(code).toBe(6);
+    expect(buildCalls).toHaveLength(2);
+    const summary = readSummary(root);
+    expect(summary.status).toBe('infra_failed');
+    expect(summary.exitCode).toBe(6);
+    expect(summary.unityExitCode).toBe(0);
+    expect(summary.attempts).toBe(2);
   });
 
   it('converts NUnit to JUnit when unity produced no JUnit file', async () => {
