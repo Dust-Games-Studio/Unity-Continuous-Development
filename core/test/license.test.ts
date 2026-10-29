@@ -599,6 +599,60 @@ describe('returnLicense', () => {
     expect(calls).toHaveLength(1);
   });
 
+  it('returns a seat only once per context, even for a concurrent second call', async () => {
+    const ctx = makeContext('serial');
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mocks.runUnity.mockImplementation(async (options: UnityCall) => {
+      record(options);
+      await gate;
+      return ok({});
+    });
+
+    const first = returnLicense(ctx);
+    // Let the first call reach its first suspension point inside the return.
+    await Promise.resolve();
+    const second = await returnLicense(ctx);
+
+    // The signal handler and the run lifecycle's `finally` can meet here in one
+    // tick: the second caller must not spawn a second `unity license return`.
+    expect(second).toEqual({ returned: false, code: 0, skipped: true });
+    expect(calls).toHaveLength(1);
+    expect(lines.join('')).toContain('already been claimed');
+
+    release();
+    await expect(first).resolves.toMatchObject({ returned: true });
+    expect(calls).toHaveLength(1);
+
+    // The claim outlives the successful return: a later call is still a no-op.
+    await expect(returnLicense(ctx)).resolves.toEqual({
+      returned: false,
+      code: 0,
+      skipped: true,
+    });
+    expect(calls).toHaveLength(1);
+  });
+
+  it('does not attempt a second return after the first one failed', async () => {
+    mocks.runUnity.mockImplementation(async (options: UnityCall) => {
+      record(options);
+      return failed(7, 'the licensing service is unreachable');
+    });
+    const ctx = makeContext('serial');
+
+    await expect(returnLicense(ctx)).resolves.toMatchObject({ returned: false, code: 7 });
+    // A seat that was attempted is not a seat still ours to attempt again: an
+    // automatic retry would be a second CLI call with nobody left to report to.
+    await expect(returnLicense(ctx)).resolves.toEqual({
+      returned: false,
+      code: 0,
+      skipped: true,
+    });
+    expect(calls).toHaveLength(1);
+  });
+
   it('returns the license with --yes', async () => {
     const result = await returnLicense(makeContext('serial'));
 

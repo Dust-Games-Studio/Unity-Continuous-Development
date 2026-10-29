@@ -241,6 +241,29 @@ describe('run test', () => {
     expect(readSummary(root).license).toMatchObject({ activated: true, returned: true });
   });
 
+  it('stops without touching the license or summary.json when a signal owns the run', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.license.mode = 'serial';
+    });
+    // The handler records the signal before killing the child; the killed
+    // `unity test` then resolves and the run continues into its `finally`.
+    responder = () => {
+      ctx.signalCode = 130;
+      return { code: 0, report: PASS };
+    };
+
+    await runCommand(ctx, 'test');
+
+    // One owner: the signal path returns the seat and writes summary.json. A
+    // second `unity license return` here would race the handler's, and a summary
+    // written here would replace its infra_failed/130 with the killed child's
+    // exit code.
+    expect(licenseReturns).toHaveLength(0);
+    expect(existsSync(summaryPath(root))).toBe(false);
+    expect(textOutput()).toContain('a signal owns this run');
+  });
+
   it('returns the license when setup fails', async () => {
     mocks.setup.mockImplementation(async () => {
       order.push('setup');

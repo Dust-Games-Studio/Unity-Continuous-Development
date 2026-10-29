@@ -459,6 +459,26 @@ export async function activateLicense(ctx: CoreContext): Promise<LicenseActivati
   }
 }
 
+/**
+ * Contexts whose seat return has already been **claimed**.
+ *
+ * A signalled run has two possible teardown callers — the signal handler and the
+ * run lifecycle's `finally` — and they can reach `returnLicense` in the same
+ * tick. A second `unity license return` on an already-returned seat fails, races
+ * the first, and can win: the review's bad ordering. So the claim is taken
+ * synchronously, before the first `await`, and a second caller gets a no-op
+ * skip.
+ *
+ * The claim is never released. A return that failed was still **attempted**:
+ * the seat is not ours to retry behind a caller that may already be doing it,
+ * and an automatic retry here would be a second CLI call against the licensing
+ * service with no one to report to.
+ *
+ * A `WeakSet` (not a property on the context) keeps the claim out of the
+ * serialisable context and lets a context fixture be garbage-collected normally.
+ */
+const claimedReturns = new WeakSet<CoreContext>();
+
 /** Options for the teardown. */
 export interface ReturnLicenseOptions {
   /**
@@ -501,11 +521,29 @@ export interface ReturnLicenseOptions {
  * seat under `license.mode: serial`, died before the teardown, and someone runs
  * `unityci license return` in a fresh process to reclaim it. A signal-driven
  * teardown from a run does **not** set it and inherits the same guards.
+ *
+ * **At most one return per context.** The claim is taken synchronously, before
+ * the first `await` and before the gates, so a signal handler and the run
+ * lifecycle's `finally` cannot both spawn `unity license return` for the same
+ * seat. Every later call — concurrent, or after a failed attempt — is the same
+ * debug-logged skip as a gate. One seat, one owner, one CLI call.
  */
 export async function returnLicense(
   ctx: CoreContext,
   opts: ReturnLicenseOptions = {},
 ): Promise<LicenseReturnResult> {
+  // Claim first, before any suspension point: two callers that both reach this
+  // function in one tick must not both decide they own the seat.
+  if (claimedReturns.has(ctx)) {
+    safeLog(
+      ctx,
+      'debug',
+      'the license seat return for this process has already been claimed; not running `unity license return` again.',
+    );
+    return { returned: false, code: EXIT.SUCCESS, skipped: true };
+  }
+  claimedReturns.add(ctx);
+
   let seatLeaked = false;
 
   try {

@@ -28,6 +28,16 @@ export interface CoreContext {
    * gate therefore fails closed.
    */
   licenseActivated?: boolean;
+  /**
+   * Set by the signal handler before it does anything else, so the rest of the
+   * process can tell that a signal owns the shutdown.
+   *
+   * A signalled run has **one** teardown and **one** summary writer: the signal
+   * path. `runLifecycle`'s `finally` stops instead of racing it with a second
+   * `unity license return` and a second `summary.json` (Task 11 fix round).
+   * Absent means no signal arrived.
+   */
+  signalCode?: number;
   /** Milliseconds since the epoch, for duration reporting. */
   startedAt: number;
   /**

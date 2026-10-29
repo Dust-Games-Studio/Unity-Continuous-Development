@@ -247,48 +247,71 @@ export async function runLifecycle<T>(
       exitCode = EXIT.INTERNAL_ERROR;
     }
   } finally {
-    // GC9: the teardown is entered on every path, and its seat gate — not this
-    // function's locals — decides whether anything is returned.
-    teardown = await teardownLicense(ctx);
-
-    const contribution = definition.summary(ctx);
-    const summary = buildSummary({
-      command: definition.command,
-      status: deriveStatus(exitCode),
-      exitCode,
-      // Decision 5: the real Unity exit code of the last attempt, never a
-      // second, more flattering number.
-      unityExitCode,
-      attempts,
-      cliVersion: ctx.cliVersion ?? '',
-      cliChannel: ctx.cliChannel,
-      cliCommit: ctx.cliCommit,
-      editorVersion: setupResult?.editorVersion ?? configuredEditorVersion(ctx),
-      durationMs: Math.max(0, Date.now() - ctx.startedAt),
-      license: {
-        mode: activation?.mode ?? ctx.config.license.mode,
-        activated: activation?.activated === true,
-        returned: teardown?.returned === true,
-        seatLeaked: teardown?.seatLeaked === true,
-      },
-      ...contribution.fields,
-    });
-
-    // `writeSummary` takes the documented `Summary`; the intersection keeps a
-    // command's extra top-level key (build provenance) honest.
-    const published: Summary & Record<string, unknown> = {
-      ...redactSummary(ctx, summary),
-      ...(contribution.extras ?? {}),
-    };
-
-    try {
-      writeSummary(summaryDir, published);
-      ctx.logger.info(
-        `${definition.command} status ${summary.status} (exit ${exitCode}); summary at ${join(summaryDir, 'summary.json')}.`,
+    // Ownership, not agreement. When a signal arrives, the signal path kills
+    // the Editor, returns the seat and writes `summary.json`; this function
+    // stops instead of racing it. A second `unity license return` in that
+    // moment fails against the seat the handler is returning and can land
+    // first, and a summary written here would replace the signal's
+    // `infra_failed`/130 record with the killed child's exit code.
+    if (ctx.signalCode !== undefined) {
+      ctx.logger.warn(
+        'a signal owns this run: not returning the license or writing summary.json here; the signal handler does both.',
       );
-    } catch (error) {
-      ctx.logger.error(`could not write summary.json under ${summaryDir}: ${describe(error)}`);
-      exitCode = EXIT.INTERNAL_ERROR;
+    } else {
+      // GC9: the teardown is entered on every path, and its seat gate — not this
+      // function's locals — decides whether anything is returned.
+      teardown = await teardownLicense(ctx);
+
+      // A signal can land while that teardown runs. Check again before writing:
+      // from here on the signal path is the only writer, even when the
+      // teardown above had already claimed the seat.
+      if (ctx.signalCode !== undefined) {
+        ctx.logger.warn(
+          'a signal arrived during the license teardown: leaving summary.json to the signal handler.',
+        );
+      } else {
+        const contribution = definition.summary(ctx);
+        const summary = buildSummary({
+          command: definition.command,
+          status: deriveStatus(exitCode),
+          exitCode,
+          // Decision 5: the real Unity exit code of the last attempt, never a
+          // second, more flattering number.
+          unityExitCode,
+          attempts,
+          cliVersion: ctx.cliVersion ?? '',
+          cliChannel: ctx.cliChannel,
+          cliCommit: ctx.cliCommit,
+          editorVersion: setupResult?.editorVersion ?? configuredEditorVersion(ctx),
+          durationMs: Math.max(0, Date.now() - ctx.startedAt),
+          license: {
+            mode: activation?.mode ?? ctx.config.license.mode,
+            activated: activation?.activated === true,
+            returned: teardown?.returned === true,
+            seatLeaked: teardown?.seatLeaked === true,
+          },
+          ...contribution.fields,
+        });
+
+        // `writeSummary` takes the documented `Summary`; the intersection keeps a
+        // command's extra top-level key (build provenance) honest.
+        const published: Summary & Record<string, unknown> = {
+          ...redactSummary(ctx, summary),
+          ...(contribution.extras ?? {}),
+        };
+
+        try {
+          writeSummary(summaryDir, published);
+          ctx.logger.info(
+            `${definition.command} status ${summary.status} (exit ${exitCode}); summary at ${join(summaryDir, 'summary.json')}.`,
+          );
+        } catch (error) {
+          ctx.logger.error(
+            `could not write summary.json under ${summaryDir}: ${describe(error)}`,
+          );
+          exitCode = EXIT.INTERNAL_ERROR;
+        }
+      }
     }
   }
 

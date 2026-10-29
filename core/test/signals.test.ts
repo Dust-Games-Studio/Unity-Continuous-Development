@@ -6,6 +6,7 @@ import { DEFAULT_CONFIG, type Config } from '../src/config/schema.js';
 import type { CoreContext } from '../src/context.js';
 import { EXIT } from '../src/exit-codes.js';
 import {
+  SIGNAL_LICENSE_RETURN_TIMEOUT_MS,
   createSignalTeardown,
   installSignalHandlers,
 } from '../src/lifecycle/signals.js';
@@ -201,6 +202,13 @@ describe('installSignalHandlers', () => {
     });
     ctx.licenseActivated = true;
     const { exit, exited } = makeExit();
+    // The lifecycle's `finally` reads `ctx.signalCode` the moment the killed
+    // child resolves, so it must already be set when the kill happens.
+    let codeAtKill: number | undefined;
+    mocks.killAllChildren.mockImplementation(() => {
+      order.push('kill-children');
+      codeAtKill = ctx.signalCode;
+    });
     const handlers = installSignalHandlers(ctx, createSignalTeardown(ctx, 'test'), {
       exit,
     });
@@ -215,6 +223,8 @@ describe('installSignalHandlers', () => {
     // Returning the seat while an Editor still runs would hand back a licence
     // the Editor is still holding.
     expect(order).toEqual(['kill-children', 'license-return']);
+    expect(codeAtKill).toBe(EXIT.INTERRUPTED);
+    expect(ctx.signalCode).toBe(EXIT.INTERRUPTED);
   });
 
   it('writes summary.json before exiting on a signal', async () => {
@@ -370,6 +380,65 @@ describe('installSignalHandlers', () => {
     } finally {
       handlers.dispose();
     }
+  });
+
+  it('writes summary.json even when the license return itself hangs', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.license.mode = 'serial';
+    });
+    ctx.licenseActivated = true;
+    // The child never settles. The inner 45 s budget — not the outer 60 s
+    // backstop — must win, or the summary would never be written.
+    mocks.runUnity.mockImplementation(() => new Promise<never>(() => {}));
+
+    vi.useFakeTimers();
+    const { exit, codes } = makeExit();
+    const handlers = installSignalHandlers(ctx, createSignalTeardown(ctx, 'test'), {
+      exit,
+    });
+    try {
+      process.emit('SIGINT');
+      expect(codes).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(SIGNAL_LICENSE_RETURN_TIMEOUT_MS);
+
+      expect(codes).toEqual([EXIT.INTERRUPTED]);
+      const summary = JSON.parse(readFileSync(summaryPath(root), 'utf8')) as Record<
+        string,
+        unknown
+      >;
+      expect(summary).toMatchObject({
+        status: 'infra_failed',
+        exitCode: EXIT.INTERRUPTED,
+        license: { mode: 'serial', activated: true, returned: false },
+      });
+      expect(lines.join('')).toContain('did not finish within');
+    } finally {
+      handlers.dispose();
+    }
+  });
+
+  it('exits anyway when onSignal rejects', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root);
+    const onSignal = vi.fn(async () => {
+      throw new Error('the teardown exploded');
+    });
+    const { exit, exited, codes } = makeExit();
+    const handlers = installSignalHandlers(ctx, onSignal, { exit });
+
+    try {
+      process.emit('SIGTERM');
+      await expect(exited).resolves.toBe(EXIT.TERMINATED);
+    } finally {
+      handlers.dispose();
+    }
+
+    // Delete the catch around `onSignal` and this hangs: the exit is the whole
+    // point of the handler.
+    expect(codes).toEqual([EXIT.TERMINATED]);
+    expect(lines.join('')).toContain('the teardown exploded');
   });
 
   it('removes its listeners on dispose', async () => {

@@ -248,5 +248,75 @@ describe('killAllChildren', () => {
         await pending;
       });
     });
+
+    it('deregisters a child whose spawn failed with ENOENT', async () => {
+      const child = fakeChild();
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+      await withMockedSpawn(child, async (exec) => {
+        const { logger, redactor } = harness();
+        const pending = exec.spawnProcess({
+          file: 'unity-no-such-binary-4a1f',
+          args: [],
+          cwd: CWD,
+          env: {},
+          logger,
+          redactor,
+        });
+
+        // The error path never emits `close` in every Node version; the registry
+        // must not depend on it.
+        child.emit('error', Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }));
+        await expect(pending).resolves.toMatchObject({ code: EXIT.NOT_FOUND });
+
+        exec.spawnMock.mockClear();
+        killSpy.mockClear();
+        child.kill.mockClear();
+        exec.killAllChildren();
+
+        // An empty registry: no second spawn (Windows `taskkill`), no group
+        // signal (POSIX), no direct kill.
+        expect(exec.spawnMock).not.toHaveBeenCalled();
+        expect(killSpy).not.toHaveBeenCalled();
+        expect(child.kill).not.toHaveBeenCalled();
+      });
+    });
+
+    it('deregisters a child settled by the timeout, even when close never arrives', async () => {
+      const child = fakeChild();
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+      await withMockedSpawn(child, async (exec) => {
+        vi.useFakeTimers();
+        try {
+          const { logger, redactor } = harness();
+          const pending = exec.spawnProcess({
+            file: 'unity',
+            args: ['test'],
+            cwd: CWD,
+            env: {},
+            logger,
+            redactor,
+            timeoutMs: 100,
+          });
+
+          // SIGTERM at 100 ms, SIGKILL at 2.1 s, and the rescue settles at 3.1 s
+          // because this fake child never emits `close`.
+          await vi.advanceTimersByTimeAsync(3200);
+          await expect(pending).resolves.toMatchObject({ code: EXIT.TIMEOUT });
+
+          exec.spawnMock.mockClear();
+          killSpy.mockClear();
+          child.kill.mockClear();
+          exec.killAllChildren();
+
+          expect(exec.spawnMock).not.toHaveBeenCalled();
+          expect(killSpy).not.toHaveBeenCalled();
+          expect(child.kill).not.toHaveBeenCalled();
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+    });
   });
 });

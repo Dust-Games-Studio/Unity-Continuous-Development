@@ -38,12 +38,22 @@ export interface SignalHandlerOptions {
 }
 
 /**
- * The teardown's ceiling. `unity license return` is already bounded to 60 s, and
- * the signal path repeats the bound so a hung child, a stuck logger or a broken
- * `onSignal` cannot hold the exit open forever (a CI timeout may be what sent
- * the signal in the first place).
+ * The outer backstop: `onSignal` as a whole (licence return **and** summary
+ * write) must never hold the exit open forever — a CI timeout may be what sent
+ * the signal in the first place.
  */
 export const SIGNAL_TEARDOWN_TIMEOUT_MS = 60_000;
+
+/**
+ * How long the licence return gets inside the signal teardown.
+ *
+ * Deliberately shorter than the outer backstop above. The child itself can take
+ * ~63 s to settle (Unity's 60 s bound plus the SIGTERM/SIGKILL escalation), so
+ * racing the return at 60 s would always lose to the outer race and the summary
+ * — the record CI actually reads — would never be written. 45 s leaves ample
+ * time to write it.
+ */
+export const SIGNAL_LICENSE_RETURN_TIMEOUT_MS = 45_000;
 
 /** The command the signal interrupted, for `summary.json`'s `command` key. */
 export type SignalCommand = 'test' | 'build';
@@ -100,8 +110,19 @@ export function createSignalTeardown(
 ): (code: number) => Promise<void> {
   return async (code: number): Promise<void> => {
     // Never throws, and it applies the seat gate: `{ skipped: true }` when this
-    // process took no seat, or when `license.mode` is `none`.
-    const teardown = await returnLicense(ctx);
+    // process took no seat, or when `license.mode` is `none`. Budgeted shorter
+    // than the outer race so a hung return still leaves a summary behind.
+    const teardown = await bounded(
+      ctx,
+      returnLicense(ctx),
+      SIGNAL_LICENSE_RETURN_TIMEOUT_MS,
+      () => ({
+        returned: false,
+        code: EXIT.TIMEOUT,
+        error: 'the license return did not finish in time; the seat may still be held.',
+      }),
+      `the license return did not finish within ${SIGNAL_LICENSE_RETURN_TIMEOUT_MS} ms; writing summary.json and exiting anyway. The seat may still be held.`,
+    );
 
     const summary = buildSummary({
       command,
@@ -143,27 +164,27 @@ export function createSignalTeardown(
   };
 }
 
-/** True when `promise` settled by itself within `timeoutMs`. */
-async function bounded(
+/**
+ * Runs `work` with a deadline, resolving with `onTimeout()` (and a warning) if
+ * the deadline wins. The timer is deliberately not `unref`'d: with nothing else
+ * pending, an unref'd timer would let the event loop drain and the process exit
+ * `0` instead of the signal's code.
+ */
+async function bounded<T>(
   ctx: CoreContext,
-  promise: Promise<void>,
+  work: Promise<T>,
   timeoutMs: number,
-): Promise<void> {
+  onTimeout: () => T,
+  message: string,
+): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
-    await Promise.race([
-      promise,
-      new Promise<void>((done) => {
-        // Deliberately not unref'd: if the teardown hangs and nothing else is
-        // pending, an unref'd timer would let the event loop drain and the
-        // process exit with 0 instead of the signal's code.
+    return await Promise.race([
+      work,
+      new Promise<T>((done) => {
         timer = setTimeout(() => {
-          safeLog(
-            ctx,
-            'warn',
-            `the license teardown did not finish within ${timeoutMs} ms; exiting anyway. The seat may still be held.`,
-          );
-          done();
+          safeLog(ctx, 'warn', message);
+          done(onTimeout());
         }, timeoutMs);
       }),
     ]);
@@ -180,10 +201,13 @@ async function bounded(
  * 1. `handled` is set before anything else, so a second Ctrl-C is ignored.
  *    Running the teardown twice would call `unity license return` on an
  *    already-returned seat and race the first exit.
- * 2. Every live child tree is killed synchronously, before the first `await`.
- * 3. `onSignal(code)` — the licence return and the summary write — is awaited
+ * 2. `ctx.signalCode` is recorded before the child kill, so the run lifecycle's
+ *    `finally` — which the kill is about to release — knows the signal path now
+ *    owns the teardown and the summary.
+ * 3. Every live child tree is killed synchronously, before the first `await`.
+ * 4. `onSignal(code)` — the licence return and the summary write — is awaited
  *    under {@link SIGNAL_TEARDOWN_TIMEOUT_MS}.
- * 4. The process exits with `130` (SIGINT) or `143` (SIGTERM).
+ * 5. The process exits with `130` (SIGINT) or `143` (SIGTERM).
  *
  * `exit` and `timeoutMs` are injectable so tests never call the real
  * `process.exit`; a caller is not required to pass either.
@@ -201,8 +225,14 @@ export function installSignalHandlers(
     if (handled) return;
     handled = true;
 
-    // Synchronous, and first: the Editor must be dead before the licence is
-    // handed back.
+    // Synchronous, and before the kill: killing the child is what makes the
+    // in-flight `unity test` resolve and run the run lifecycle's `finally`, and
+    // that `finally` must already know the signal owns the teardown and the
+    // summary. Otherwise it spawns a second `unity license return` and writes
+    // the wrong summary over this one.
+    ctx.signalCode = code;
+
+    // Then the Editor must be dead before the licence is handed back.
     try {
       killAllChildren();
     } catch (error) {
@@ -223,7 +253,13 @@ export function installSignalHandlers(
     // rest of the loop. The exit at the end is what keeps the process alive.
     void (async (): Promise<void> => {
       try {
-        await bounded(ctx, onSignal(code), timeoutMs);
+        await bounded(
+          ctx,
+          onSignal(code),
+          timeoutMs,
+          () => undefined,
+          `the license teardown did not finish within ${timeoutMs} ms; exiting anyway. The seat may still be held.`,
+        );
       } catch (error) {
         // The teardown never throws by contract, but a broken caller must not
         // prevent the exit either.
