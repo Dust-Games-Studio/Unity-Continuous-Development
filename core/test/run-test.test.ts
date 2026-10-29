@@ -21,9 +21,8 @@ const mocks = vi.hoisted(() => ({
   setup: vi.fn(),
   unityBaseOptions: vi.fn(),
   activateLicense: vi.fn(),
-  returnLicense: vi.fn(),
   doctorCommand: vi.fn(),
-  unityTest: vi.fn(),
+  runUnity: vi.fn(),
 }));
 
 vi.mock('../src/lifecycle/setup.js', async (importOriginal) => {
@@ -31,23 +30,20 @@ vi.mock('../src/lifecycle/setup.js', async (importOriginal) => {
   return { ...actual, setup: mocks.setup, unityBaseOptions: mocks.unityBaseOptions };
 });
 
+// Only activation is mocked: the real `returnLicense` runs, so its seat gate is
+// exercised by the run path itself and not only by license.test.ts.
 vi.mock('../src/lifecycle/license.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/lifecycle/license.js')>();
-  return {
-    ...actual,
-    activateLicense: mocks.activateLicense,
-    returnLicense: mocks.returnLicense,
-  };
+  return { ...actual, activateLicense: mocks.activateLicense };
 });
 
 vi.mock('../src/commands/doctor.js', () => ({
   doctorCommand: mocks.doctorCommand,
 }));
 
-vi.mock('../src/unity/cli.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../src/unity/cli.js')>();
-  return { ...actual, unityTest: mocks.unityTest };
-});
+vi.mock('../src/unity/exec.js', () => ({
+  runUnity: mocks.runUnity,
+}));
 
 const PASS = readFileSync(new URL('./fixtures/editmode-pass.xml', import.meta.url), 'utf8');
 const FAIL = readFileSync(new URL('./fixtures/editmode-fail.xml', import.meta.url), 'utf8');
@@ -70,7 +66,10 @@ interface ResponderCall {
 const tempDirs: string[] = [];
 const lines: string[] = [];
 const order: string[] = [];
+/** The final `unity test` argv the child receives. */
 const testCalls: string[][] = [];
+/** Every `unity license return` argv the child receives. */
+const licenseReturns: string[][] = [];
 let responder: (call: ResponderCall) => TestOutcome;
 
 function valueAfter(args: string[], flag: string): string {
@@ -109,6 +108,7 @@ function makeContext(root: string, edit?: (config: Config) => void): CoreContext
     cliVersion: null,
     cliChannel: null,
     cliCommit: null,
+    licenseActivated: false,
   };
 }
 
@@ -128,6 +128,7 @@ beforeEach(() => {
   lines.length = 0;
   order.length = 0;
   testCalls.length = 0;
+  licenseReturns.length = 0;
   responder = () => ({ code: 0, report: PASS });
   for (const mock of Object.values(mocks)) mock.mockReset();
 
@@ -164,31 +165,40 @@ beforeEach(() => {
     return { activated: ctx.config.license.mode !== 'none', mode: ctx.config.license.mode };
   });
 
-  mocks.returnLicense.mockImplementation(async () => {
-    order.push('return');
-    return { returned: true, code: 0, seatLeaked: false };
-  });
+  mocks.runUnity.mockImplementation(
+    async (options: { args: string[] }): Promise<{
+      code: number;
+      stdout: string;
+      stderr: string;
+      json: unknown;
+    }> => {
+      const args = options.args;
+      if (args[0] === 'license') {
+        order.push('license-return');
+        licenseReturns.push(args);
+        return { code: 0, stdout: '', stderr: '', json: { success: true, data: {} } };
+      }
 
-  mocks.unityTest.mockImplementation(async (_options: unknown, args: string[]) => {
-    order.push('unity-test');
-    testCalls.push(args);
-    const mode = valueAfter(args, '--mode');
-    const output = valueAfter(args, '--output');
-    const junit = valueAfter(args, '--junit-output');
-    const outcome = responder({ args, mode, output, junit });
-    if (outcome.report !== null && outcome.report !== undefined) {
-      mkdirSync(dirname(output), { recursive: true });
-      writeFileSync(output, outcome.report);
-      // `--report-format nunit,junit --junit-output` makes Unity write both.
-      writeFileSync(junit, '<testsuites />');
-    }
-    return {
-      code: outcome.code,
-      stdout: '',
-      stderr: '',
-      json: { success: outcome.code === 0, data: {} },
-    };
-  });
+      order.push('unity-test');
+      testCalls.push(args);
+      const mode = valueAfter(args, '--mode');
+      const output = valueAfter(args, '--output');
+      const junit = valueAfter(args, '--junit-output');
+      const outcome = responder({ args, mode, output, junit });
+      if (outcome.report !== null && outcome.report !== undefined) {
+        mkdirSync(dirname(output), { recursive: true });
+        writeFileSync(output, outcome.report);
+        // `--report-format nunit,junit --junit-output` makes Unity write both.
+        writeFileSync(junit, '<testsuites />');
+      }
+      return {
+        code: outcome.code,
+        stdout: '',
+        stderr: '',
+        json: { success: outcome.code === 0, data: {} },
+      };
+    },
+  );
 });
 
 afterEach(() => {
@@ -197,7 +207,7 @@ afterEach(() => {
 });
 
 describe('run test', () => {
-  it('runs setup, activates the license, runs the tests and returns the license', async () => {
+  it('runs the doctor, setup, activates the license, runs the tests and returns the license', async () => {
     const root = makeProject();
     const ctx = makeContext(root, (config) => {
       config.license.mode = 'serial';
@@ -206,7 +216,9 @@ describe('run test', () => {
     const code = await runCommand(ctx, 'test');
 
     expect(code).toBe(0);
-    expect(order).toEqual(['setup', 'doctor', 'activate', 'unity-test', 'return']);
+    // The binding order (Section 4.5): doctor → setup → license → run → teardown.
+    expect(order).toEqual(['doctor', 'setup', 'activate', 'unity-test', 'license-return']);
+    expect(ctx.licenseActivated).toBe(true);
     expect(readSummary(root).license).toMatchObject({
       mode: 'serial',
       activated: true,
@@ -224,12 +236,16 @@ describe('run test', () => {
     const code = await runCommand(ctx, 'test');
 
     expect(code).toBe(8);
-    expect(mocks.returnLicense).toHaveBeenCalledTimes(1);
+    expect(licenseReturns).toHaveLength(1);
+    expect(licenseReturns[0]).toEqual(['license', 'return', '--yes', '--format', 'json']);
     expect(readSummary(root).license).toMatchObject({ activated: true, returned: true });
   });
 
   it('returns the license when setup fails', async () => {
-    mocks.setup.mockRejectedValue(new SetupError('the Unity Editor 6000.6.3f1 is not installed.', 64));
+    mocks.setup.mockImplementation(async () => {
+      order.push('setup');
+      throw new SetupError('the Unity Editor 6000.6.3f1 is not installed.', 64);
+    });
     const root = makeProject();
     const ctx = makeContext(root, (config) => {
       config.license.mode = 'serial';
@@ -241,8 +257,9 @@ describe('run test', () => {
     // The teardown step is entered on every path, but it releases nothing: no
     // seat was activated, so `unity license return` must never run (a developer's
     // own personal licence would otherwise be returned as a side effect).
+    expect(order).toEqual(['doctor', 'setup']);
     expect(mocks.activateLicense).not.toHaveBeenCalled();
-    expect(mocks.returnLicense).not.toHaveBeenCalled();
+    expect(licenseReturns).toHaveLength(0);
     expect(textOutput()).toContain('activated no license seat');
     expect(readSummary(root).status).toBe('config_error');
   });
@@ -255,9 +272,14 @@ describe('run test', () => {
 
     expect(code).toBe(0);
     expect(mocks.activateLicense).toHaveBeenCalledTimes(1);
-    expect(mocks.returnLicense).not.toHaveBeenCalled();
+    expect(ctx.licenseActivated).toBe(false);
+    expect(licenseReturns).toHaveLength(0);
     expect(textOutput()).toContain('activated no license seat');
-    expect(readSummary(root).license).toMatchObject({ mode: 'none', activated: false, returned: false });
+    expect(readSummary(root).license).toMatchObject({
+      mode: 'none',
+      activated: false,
+      returned: false,
+    });
   });
 
   it('runs one unity test per configured mode and collects both reports', async () => {
@@ -302,6 +324,7 @@ describe('run test', () => {
     const code = await runCommand(ctx, 'test');
 
     expect(code).toBe(64);
+    expect(mocks.doctorCommand).not.toHaveBeenCalled();
     expect(mocks.setup).not.toHaveBeenCalled();
     expect(testCalls).toHaveLength(0);
     const summary = readSummary(root);
@@ -331,6 +354,8 @@ describe('run test', () => {
       join(root, 'ci-output', 'tests', 'EditMode.junit.xml'),
     );
     expect(valueAfter(args, '--output')).toBe(join(root, 'ci-output', 'tests', 'EditMode.xml'));
+    // The final argv, not the caller's args: `unityTest` owns `--format json`.
+    expect(valueAfter(args, '--format')).toBe('json');
   });
 
   it('passes the configured filter, coverage, shard and per-test retries', async () => {
@@ -355,11 +380,13 @@ describe('run test', () => {
     expect(valueAfter(args, '--retries')).toBe('2');
   });
 
-  it('retries exit code 7 and reports attempts 2', async () => {
+  it('retries exit code 7, reports attempts 2 and counts one report', async () => {
+    // Both attempts write a report. A run loop that summed across attempts would
+    // report 6 tests here; the last attempt's report says 3.
     let attempt = 0;
     responder = () => {
       attempt += 1;
-      return attempt === 1 ? { code: 7, report: null } : { code: 0, report: PASS };
+      return { code: attempt === 1 ? 7 : 0, report: PASS };
     };
     const root = makeProject();
     const ctx = makeContext(root);
@@ -372,6 +399,7 @@ describe('run test', () => {
     expect(summary.attempts).toBe(2);
     expect(summary.status).toBe('passed');
     expect(summary.unityExitCode).toBe(0);
+    expect(summary.tests).toEqual({ total: 3, passed: 2, failed: 0, skipped: 1 });
   });
 
   it('does not retry exit code 8', async () => {
@@ -415,6 +443,25 @@ describe('run test', () => {
     // The last attempt really exited 0: the false green is refused by the
     // artifact check, not by pretending Unity failed.
     expect(summary.unityExitCode).toBe(0);
+  });
+
+  it('exits 6 when the NUnit report exists but is zero bytes', async () => {
+    responder = () => ({ code: 0, report: '' });
+    const root = makeProject();
+    const ctx = makeContext(root);
+
+    const code = await runCommand(ctx, 'test');
+
+    expect(code).toBe(6);
+    expect(existsSync(join(root, 'ci-output', 'tests', 'EditMode.xml'))).toBe(true);
+    // An empty artifact is not a produced artifact: the run is verified as
+    // missing, not parsed as a zero-count pass (R18).
+    expect(textOutput()).toContain('produced no NUnit report');
+    const summary = readSummary(root);
+    expect(summary.status).toBe('infra_failed');
+    expect(summary.exitCode).toBe(6);
+    expect(summary.unityExitCode).toBe(0);
+    expect(summary.tests).toEqual({ total: 0, passed: 0, failed: 0, skipped: 0 });
   });
 
   it('exits 6 when a mode exited 8 but wrote no report', async () => {
@@ -461,14 +508,34 @@ describe('run test', () => {
     expect(readSummary(root).status).toBe('infra_failed');
   });
 
-  it('passes -- -nographics for EditMode when nographics is enabled', async () => {
+  it('asserts the complete unity test argv with --format json before the -- tail', async () => {
     const root = makeProject();
     const ctx = makeContext(root);
 
     await runCommand(ctx, 'test');
 
     const args = testCalls[0]!;
+    expect(args).toEqual([
+      'test',
+      root,
+      '--mode',
+      'EditMode',
+      '--output',
+      join(root, 'ci-output', 'tests', 'EditMode.xml'),
+      '--report-format',
+      'nunit,junit',
+      '--junit-output',
+      join(root, 'ci-output', 'tests', 'EditMode.junit.xml'),
+      '--format',
+      'json',
+      '--',
+      '-nographics',
+    ]);
+    // The literal `--` endures as the last separator and `--format` is a
+    // CLI-level option immediately before it, never an Editor argument.
     expect(args.slice(-2)).toEqual(['--', '-nographics']);
+    expect(args.indexOf('--format')).toBe(args.indexOf('--') - 2);
+    expect(args.filter((arg) => arg === '--format')).toHaveLength(1);
   });
 
   it('does not pass -nographics for PlayMode', async () => {
@@ -571,7 +638,7 @@ describe('run test', () => {
     expect(textOutput()).not.toContain(secret);
   });
 
-  it('does not activate a license when the doctor gate fails', async () => {
+  it('does not activate a license when the doctor gate fails, and still tears down', async () => {
     mocks.doctorCommand.mockImplementation(async () => {
       order.push('doctor');
       return 64;
@@ -584,14 +651,19 @@ describe('run test', () => {
     const code = await runCommand(ctx, 'test');
 
     expect(code).toBe(64);
-    expect(order).toEqual(['setup', 'doctor']);
+    expect(order).toEqual(['doctor']);
+    expect(mocks.setup).not.toHaveBeenCalled();
     expect(mocks.activateLicense).not.toHaveBeenCalled();
-    expect(mocks.returnLicense).not.toHaveBeenCalled();
+    expect(licenseReturns).toHaveLength(0);
+    expect(textOutput()).toContain('activated no license seat');
     expect(readSummary(root).status).toBe('config_error');
   });
 
   it('turns a licence activation failure into exit 64 and still tears down', async () => {
-    mocks.activateLicense.mockRejectedValue(new LicenseError('no serial in the environment', 64));
+    mocks.activateLicense.mockImplementation(async () => {
+      order.push('activate');
+      throw new LicenseError('no serial in the environment', 64);
+    });
     const root = makeProject();
     const ctx = makeContext(root, (config) => {
       config.license.mode = 'serial';
@@ -600,7 +672,8 @@ describe('run test', () => {
     const code = await runCommand(ctx, 'test');
 
     expect(code).toBe(64);
-    expect(mocks.returnLicense).not.toHaveBeenCalled();
+    expect(order).toEqual(['doctor', 'setup', 'activate']);
+    expect(licenseReturns).toHaveLength(0);
     expect(readSummary(root).status).toBe('config_error');
   });
 });

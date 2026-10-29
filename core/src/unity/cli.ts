@@ -47,10 +47,43 @@ export interface UnityInstallOptions {
   yes?: boolean;
 }
 
+/**
+ * `--format json` is a CLI-level option, and a literal `--` terminates the CLI's
+ * own option parsing: everything after it is forwarded to the **Editor**. A
+ * wrapper that appends the flag at the end of the argv therefore left the CLI in
+ * human-output mode and handed the Editor a `--format` argument it does not
+ * understand. Every wrapper routes through {@link run}, so the placement is
+ * enforced here once, before any passthrough tail.
+ */
+function splitPassthrough(args: string[]): { head: string[]; tail: string[] } {
+  const index = args.indexOf('--');
+  return index === -1
+    ? { head: args, tail: [] }
+    : { head: args.slice(0, index), tail: args.slice(index) };
+}
+
+/**
+ * Places exactly one `['--format','json']` immediately before the first `--`
+ * tail, keeping the tail byte-for-byte unchanged. A caller-supplied
+ * `--format json` pair is removed first, so the flag is never duplicated.
+ */
+function withJsonFormat(args: string[]): string[] {
+  const { head, tail } = splitPassthrough(args);
+  const cleaned: string[] = [];
+  for (let index = 0; index < head.length; index += 1) {
+    if (head[index] === '--format' && head[index + 1] === 'json') {
+      index += 1;
+      continue;
+    }
+    cleaned.push(head[index]!);
+  }
+  return [...cleaned, '--format', 'json', ...tail];
+}
+
 function run(opts: UnityBaseOptions, args: string[]): Promise<UnityResult> {
   return runUnity({
     binary: opts.binary,
-    args,
+    args: withJsonFormat(args),
     cwd: opts.cwd,
     env: opts.env,
     logger: opts.logger,
@@ -61,12 +94,12 @@ function run(opts: UnityBaseOptions, args: string[]): Promise<UnityResult> {
 
 /** `unity version --format json`: the CLI's own identity, never `--version`. */
 export function unityVersion(opts: UnityBaseOptions): Promise<UnityResult> {
-  return run(opts, ['version', '--format', 'json']);
+  return run(opts, ['version']);
 }
 
 /** `unity doctor --ci --format json`: the machine-readable preflight report. */
 export function unityDoctorCi(opts: UnityBaseOptions): Promise<UnityResult> {
-  return run(opts, ['doctor', '--ci', '--format', 'json']);
+  return run(opts, ['doctor', '--ci']);
 }
 
 /** `unity install <version> [--module <ids…>] [--cm|--no-cm] …` */
@@ -87,7 +120,6 @@ export function unityInstall(
   if (install.yes !== false) args.push('--yes');
   if (install.acceptEula) args.push('--accept-eula');
 
-  args.push('--format', 'json');
   return run(opts, args);
 }
 
@@ -96,12 +128,12 @@ export function unityTermsAccept(
   opts: UnityBaseOptions,
   version: string,
 ): Promise<UnityResult> {
-  return run(opts, ['terms', 'accept', version, '--yes', '--format', 'json']);
+  return run(opts, ['terms', 'accept', version, '--yes']);
 }
 
 /** `unity license status --format json`: `data.active` is the precondition. */
 export function unityLicenseStatus(opts: UnityBaseOptions): Promise<UnityResult> {
-  return run(opts, ['license', 'status', '--format', 'json']);
+  return run(opts, ['license', 'status']);
 }
 
 /** `unity license activate <args…> --format json`. Secrets stay in `env`. */
@@ -109,20 +141,23 @@ export function unityLicenseActivate(
   opts: UnityBaseOptions,
   args: string[],
 ): Promise<UnityResult> {
-  return run(opts, ['license', 'activate', ...args, '--format', 'json']);
+  return run(opts, ['license', 'activate', ...args]);
 }
 
 /** `unity license return --yes --format json`: the teardown step. */
 export function unityLicenseReturn(opts: UnityBaseOptions): Promise<UnityResult> {
-  return run(opts, ['license', 'return', '--yes', '--format', 'json']);
+  return run(opts, ['license', 'return', '--yes']);
 }
 
 /**
  * `unity test <args…> --format json`. The caller owns mode selection; a project
  * path, when given, is one of the positional `args`.
+ *
+ * Editor arguments after the caller's `--` are preserved as a passthrough tail;
+ * `run` places `--format json` before that tail, never after it.
  */
 export function unityTest(opts: UnityBaseOptions, args: string[]): Promise<UnityResult> {
-  return run(opts, ['test', ...args, '--format', 'json']);
+  return run(opts, ['test', ...args]);
 }
 
 /**
@@ -130,7 +165,7 @@ export function unityTest(opts: UnityBaseOptions, args: string[]): Promise<Unity
  * positional `args`.
  */
 export function unityBuild(opts: UnityBaseOptions, args: string[]): Promise<UnityResult> {
-  return run(opts, ['build', ...args, '--format', 'json']);
+  return run(opts, ['build', ...args]);
 }
 
 /**
@@ -144,13 +179,12 @@ export function unityCacheKey(
 ): Promise<UnityResult> {
   const args = ['cache', 'key', projectPath];
   if (target) args.push('--target', target);
-  args.push('--format', 'json');
   return run(opts, args);
 }
 
 /** `unity cache info --format json`: the download-cache descriptor. */
 export function unityCacheInfo(opts: UnityBaseOptions): Promise<UnityResult> {
-  return run(opts, ['cache', 'info', '--format', 'json']);
+  return run(opts, ['cache', 'info']);
 }
 
 /**
@@ -161,7 +195,7 @@ export function unityProjectsVerify(
   opts: UnityBaseOptions,
   projectPath: string,
 ): Promise<UnityResult> {
-  return run(opts, ['projects', 'verify', projectPath, '--strict', '--format', 'json']);
+  return run(opts, ['projects', 'verify', projectPath, '--strict']);
 }
 
 /**
@@ -174,7 +208,7 @@ export function unityProjectsVerify(
  * is a valid installed Editor that carries no platform modules.
  */
 export function unityEditorsInstalled(opts: UnityBaseOptions): Promise<UnityResult> {
-  return run(opts, ['editors', '--installed', '--format', 'json']);
+  return run(opts, ['editors', '--installed']);
 }
 
 /**
@@ -191,7 +225,7 @@ export function unityModulesList(
   opts: UnityBaseOptions,
   version: string,
 ): Promise<UnityResult> {
-  return run(opts, ['install', version, '--list-modules', '--format', 'json']);
+  return run(opts, ['install', version, '--list-modules']);
 }
 
 /** Error codes a CLI uses when the verb (or one of its words) does not exist. */

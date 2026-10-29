@@ -115,6 +115,10 @@ function makeContext(
     cliVersion: null,
     cliChannel: null,
     cliCommit: null,
+    // The fixture models a process that has already taken a seat: the teardown
+    // tests are about a return that has something to give back. The gate tests
+    // below override this to false to model a run that activated nothing.
+    licenseActivated: true,
   };
 }
 
@@ -546,6 +550,42 @@ describe('activateLicense', () => {
 });
 
 describe('returnLicense', () => {
+  it('is a no-op that spawns nothing when this process activated no seat', async () => {
+    const ctx = makeContext('none');
+    ctx.licenseActivated = false;
+
+    const result = await returnLicense(ctx);
+
+    // GC9 enters the teardown on every path; the gate is what keeps a
+    // developer's own personal licence from being returned locally.
+    expect(result).toEqual({ returned: false, code: 0, seatLeaked: false });
+    expect(mocks.runUnity).not.toHaveBeenCalled();
+    expect(lines.join('')).toContain('activated no license seat');
+  });
+
+  it('returns the seat with force: true even when this process activated nothing', async () => {
+    // The standalone `unityci license return` command: the user explicitly asked
+    // for the seat back, so the gate must not swallow the call.
+    const ctx = makeContext('serial');
+    ctx.licenseActivated = false;
+
+    const result = await returnLicense(ctx, { force: true });
+
+    expect(result).toMatchObject({ returned: true, code: 0, seatLeaked: false });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toEqual(['license', 'return', '--yes', '--format', 'json']);
+  });
+
+  it('returns the seat when this process activated one', async () => {
+    const ctx = makeContext('serial');
+    ctx.licenseActivated = true;
+
+    const result = await returnLicense(ctx);
+
+    expect(result).toMatchObject({ returned: true, code: 0 });
+    expect(calls).toHaveLength(1);
+  });
+
   it('returns the license with --yes', async () => {
     const result = await returnLicense(makeContext('none'));
 

@@ -532,6 +532,66 @@ describe('unity CLI wrappers', () => {
     }
   });
 
+  it('places --format json before a -- editor-argument tail, for every wrapper', async () => {
+    const calls: string[][] = [];
+
+    vi.resetModules();
+    vi.doMock('../src/unity/exec.js', () => ({
+      runUnity: vi.fn(async (opts: { args: string[] }) => {
+        calls.push(opts.args);
+        return { code: 0, stdout: '', stderr: '', json: null };
+      }),
+    }));
+
+    const { logger, redactor } = harness();
+    const base = { binary: 'unity', cwd: CWD, env: {}, logger, redactor };
+    try {
+      const cli = await import('../src/unity/cli.js');
+      await cli.unityTest(base, [
+        '--mode',
+        'EditMode',
+        '--output',
+        'ci-output/tests/EditMode.xml',
+        '--report-format',
+        'nunit,junit',
+        '--junit-output',
+        'ci-output/tests/EditMode.junit.xml',
+        '--',
+        '-nographics',
+      ]);
+      await cli.unityBuild(base, ['--target', 'WebGL', '--', '-nographics']);
+      // A caller that already passes the flag must not get a duplicate either.
+      await cli.unityTest(base, ['--format', 'json', '--', '-nographics']);
+    } finally {
+      vi.doUnmock('../src/unity/exec.js');
+      vi.resetModules();
+    }
+
+    // A literal `--` ends the CLI's own option parsing; everything after it is an
+    // Editor argument. The JSON flag must therefore sit immediately before it.
+    expect(calls[0]).toEqual([
+      'test',
+      '--mode',
+      'EditMode',
+      '--output',
+      'ci-output/tests/EditMode.xml',
+      '--report-format',
+      'nunit,junit',
+      '--junit-output',
+      'ci-output/tests/EditMode.junit.xml',
+      '--format',
+      'json',
+      '--',
+      '-nographics',
+    ]);
+    expect(calls[1]).toEqual(['build', '--target', 'WebGL', '--format', 'json', '--', '-nographics']);
+    expect(calls[2]).toEqual(['test', '--format', 'json', '--', '-nographics']);
+    for (const args of calls) {
+      expect(args.filter((arg) => arg === '--format')).toHaveLength(1);
+      expect(args.slice(args.indexOf('--'))).toEqual(['--', '-nographics']);
+    }
+  });
+
   it('exports the tested CLI range', async () => {
     const cli = await import('../src/unity/cli.js');
     expect(cli.TESTED_CLI_MIN).toBe('1.0.0-beta.9');

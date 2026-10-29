@@ -1,7 +1,12 @@
 /**
- * The test run lifecycle: `setup` → `doctor` → activate → run each configured
+ * The test run lifecycle: `doctor` → `setup` → activate → run each configured
  * mode → verify the artifacts → `summary.json`, with an unconditional licence
  * teardown.
+ *
+ * The preflight comes first, as the spec's Section 4.5 orders it; `setup` then
+ * verifies or installs the Editor and accepts its terms. The teardown is entered
+ * on every path, including a doctor or setup failure, where it is a no-op
+ * because nothing was activated.
  *
  * The artifact check is the core of the module (R18). A run that exits 0 but
  * leaves no NUnit report is **not** a green suite: `unity test --output
@@ -226,26 +231,24 @@ async function runMode(
 }
 
 /**
- * GC9's teardown step. It is entered on **every** path, including a failed
- * setup; but it only asks Unity to return a seat this run actually took.
- *
- * Under `license.mode: none` a developer's own personal licence is active, and a
- * blanket `unity license return` would return it as a side effect of running the
- * toolkit locally. So the step is a debug-logged no-op whenever
- * `activateLicense` did not report `activated: true` — which also covers setup,
- * doctor and activation failures, where no seat was ever taken.
+ * GC9's teardown, called from the `finally` on **every** path. The seat gate
+ * lives in `returnLicense` and reads `ctx.licenseActivated`, so a signal-driven
+ * teardown (Task 11), which cannot see this function's locals, inherits exactly
+ * the same rule. Nothing activated (a failed doctor or setup, `license.mode:
+ * none`) means nothing is returned — a developer's own personal licence must
+ * never be returned as a side effect of running the toolkit locally.
  */
-async function teardownLicense(
-  ctx: CoreContext,
-  activation: LicenseActivation | null,
-): Promise<LicenseReturnResult | null> {
-  if (activation?.activated !== true) {
-    ctx.logger.debug(
-      'this run activated no license seat; not running `unity license return`.',
+async function teardownLicense(ctx: CoreContext): Promise<LicenseReturnResult> {
+  try {
+    return await returnLicense(ctx);
+  } catch (error) {
+    // `returnLicense` does not throw today; a regression here must still not
+    // mask the primary exit code or stop `summary.json` from being written.
+    ctx.logger.error(
+      `the license teardown failed: ${describe(error)}. The seat may still be held.`,
     );
-    return null;
+    return { returned: false, code: EXIT.COMMAND_FAILED };
   }
-  return returnLicense(ctx);
 }
 
 /**
@@ -282,17 +285,20 @@ export async function runTest(ctx: CoreContext): Promise<TestRunResult> {
   };
 
   try {
-    setupResult = await setup(ctx, { command: 'test' });
-
-    // The preflight gate (R11), once, after setup and before the licence step.
-    // `setup` deliberately does not run `unity doctor --ci`; without this call
-    // the run path would never execute the preflight at all.
+    // The preflight gate (R11) comes first, as the spec's Section 4.5 orders it
+    // (`doctor → setup → … → license step`). `setup` deliberately does not run
+    // `unity doctor --ci`; without this call the run path would never execute
+    // the preflight at all.
     const doctorCode = await doctorCommand(ctx);
     if (doctorCode !== EXIT.SUCCESS) {
       ctx.logger.error(`the doctor preflight failed with exit ${doctorCode}; refusing to run the tests.`);
       exitCode = doctorCode;
     } else {
+      setupResult = await setup(ctx, { command: 'test' });
       activation = await activateLicense(ctx);
+      // The gate every later teardown reads — including a signal-driven one that
+      // cannot see this function's locals (Task 11).
+      if (activation.activated) ctx.licenseActivated = true;
 
       // Unity's --output is a FILE. Make sure the directory exists before the
       // first invocation; a missing report is still verified below, not assumed.
@@ -372,16 +378,9 @@ export async function runTest(ctx: CoreContext): Promise<TestRunResult> {
       exitCode = EXIT.INTERNAL_ERROR;
     }
   } finally {
-    // GC9: the teardown is entered on every path, and a teardown failure must
-    // never mask the primary exit code or stop the summary from being written.
-    try {
-      teardown = await teardownLicense(ctx, activation);
-    } catch (error) {
-      ctx.logger.error(
-        `the license teardown failed: ${describe(error)}. The seat may still be held.`,
-      );
-      teardown = { returned: false, code: EXIT.COMMAND_FAILED };
-    }
+    // GC9: the teardown is entered on every path, and its seat gate — not this
+    // function's locals — decides whether anything is returned.
+    teardown = await teardownLicense(ctx);
 
     const summary = buildSummary({
       command: 'test',

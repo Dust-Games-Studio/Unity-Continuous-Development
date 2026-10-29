@@ -159,7 +159,7 @@ function safeRedact(ctx: CoreContext, value: string): string {
  */
 function safeLog(
   ctx: CoreContext,
-  level: 'info' | 'warn' | 'error',
+  level: 'debug' | 'info' | 'warn' | 'error',
   message: string,
 ): void {
   try {
@@ -452,6 +452,16 @@ export async function activateLicense(ctx: CoreContext): Promise<LicenseActivati
   }
 }
 
+/** Options for the teardown. */
+export interface ReturnLicenseOptions {
+  /**
+   * Return a seat this process did not take. The standalone
+   * `unityci license return` command sets it because the user explicitly asked
+   * for the seat back; a run lifecycle never does.
+   */
+  force?: boolean;
+}
+
 /**
  * Returns the licence seat.
  *
@@ -462,13 +472,33 @@ export async function activateLicense(ctx: CoreContext): Promise<LicenseActivati
  * log a failure loudly without changing its primary exit code (GC9). The call
  * is bounded to 60 s.
  *
- * It runs regardless of mode, too: `return` is a safe no-op when nothing is
- * held, and a run must not guess whether a previous step took a seat.
+ * The teardown is **unconditional in the sense that it is always entered**, but
+ * it returns a seat only if this process took one. A blanket
+ * `unity license return` under `license.mode: none` would return the developer's
+ * own personal licence as a side effect of running the toolkit locally. So unless
+ * `ctx.licenseActivated` is true **or** `opts.force` is set, this is a
+ * debug-logged no-op: `{ returned: false, code: 0 }`, spawning nothing.
+ *
+ * `opts.force` is for a caller that represents an explicit user request, not a
+ * run: the standalone `license return` command. A signal-driven teardown from a
+ * run does **not** set it and inherits the same gate through this function.
  */
-export async function returnLicense(ctx: CoreContext): Promise<LicenseReturnResult> {
+export async function returnLicense(
+  ctx: CoreContext,
+  opts: ReturnLicenseOptions = {},
+): Promise<LicenseReturnResult> {
   let seatLeaked = false;
 
   try {
+    if (ctx.licenseActivated !== true && opts.force !== true) {
+      safeLog(
+        ctx,
+        'debug',
+        'this process activated no license seat; not running `unity license return`.',
+      );
+      return { returned: false, code: EXIT.SUCCESS, seatLeaked: false };
+    }
+
     // An offline `--file` licence is left in place by `unity license return`,
     // so the seat is held whichever way the CLI call goes. Compute it once and
     // put it on every result (R17).

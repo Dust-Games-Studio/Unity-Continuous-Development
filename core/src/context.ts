@@ -17,6 +17,17 @@ export interface CoreContext {
   redactor: Redactor;
   /** The Unity CLI binary to spawn (`unity.cli.binary`). */
   binary: string;
+  /**
+   * True once this process has activated a licence seat, so the teardown may
+   * return it. Absent (or `false`) means no seat was taken: `returnLicense` is
+   * then a no-op instead of returning whatever licence the machine already had
+   * (for example a developer's own personal licence under `license.mode: none`).
+   *
+   * Optional so a caller that never touches licensing (a report-only command, a
+   * test fixture) does not have to state it; absent is read as `false` and the
+   * gate therefore fails closed.
+   */
+  licenseActivated?: boolean;
   /** Milliseconds since the epoch, for duration reporting. */
   startedAt: number;
   /**
