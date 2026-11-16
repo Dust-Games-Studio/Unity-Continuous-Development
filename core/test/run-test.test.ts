@@ -137,6 +137,7 @@ beforeEach(() => {
     ctx.cliVersion = '1.0.0-beta.14';
     ctx.cliChannel = 'beta';
     ctx.cliCommit = 'abc1234';
+    ctx.editorVersion = '6000.6.3f1';
     return {
       editorVersion: '6000.6.3f1',
       cliVersion: '1.0.0-beta.14',
@@ -403,6 +404,74 @@ describe('run test', () => {
     expect(valueAfter(args, '--retries')).toBe('2');
   });
 
+  it('passes --editor-version, --architecture and --editor-path from the setup result', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.unity.editor.architecture = 'arm64';
+      config.unity.editor.path = '/opt/unity/6000.6.3f1/Editor/Unity';
+    });
+
+    await runCommand(ctx, 'test');
+
+    const args = testCalls[0]!;
+    expect(valueAfter(args, '--editor-version')).toBe('6000.6.3f1');
+    expect(valueAfter(args, '--architecture')).toBe('arm64');
+    expect(valueAfter(args, '--editor-path')).toBe('/opt/unity/6000.6.3f1/Editor/Unity');
+  });
+
+  it('passes the 1.0.x affected-test selection flags', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.test.affected = true;
+      config.test.since = 'origin/main';
+    });
+
+    await runCommand(ctx, 'test');
+
+    const args = testCalls[0]!;
+    expect(args).toContain('--affected');
+    expect(valueAfter(args, '--since')).toBe('origin/main');
+  });
+
+  it('passes --rerun-failed and --affected-compare when configured', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.test.rerunFailed = true;
+      config.test.affectedCompare = 'origin/develop';
+    });
+
+    await runCommand(ctx, 'test');
+
+    const args = testCalls[0]!;
+    expect(args).toContain('--rerun-failed');
+    expect(valueAfter(args, '--affected-compare')).toBe('origin/develop');
+  });
+
+  it('passes --accelerator to test and never mixes it with --no-accelerator', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.accelerator.endpoint = 'accelerator.local:10080';
+    });
+
+    await runCommand(ctx, 'test');
+
+    const args = testCalls[0]!;
+    expect(valueAfter(args, '--accelerator')).toBe('accelerator.local:10080');
+    expect(args).not.toContain('--no-accelerator');
+  });
+
+  it('passes --no-accelerator when the accelerator is disabled', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.accelerator.disabled = true;
+    });
+
+    await runCommand(ctx, 'test');
+
+    expect(testCalls[0]).toContain('--no-accelerator');
+    expect(testCalls[0]).not.toContain('--accelerator');
+  });
+
   it('retries exit code 7, reports attempts 2 and counts one report', async () => {
     // Both attempts write a report. A run loop that summed across attempts would
     // report 6 tests here; the last attempt's report says 3.
@@ -549,6 +618,8 @@ describe('run test', () => {
       'nunit,junit',
       '--junit-output',
       join(root, 'ci-output', 'tests', 'EditMode.junit.xml'),
+      '--editor-version',
+      '6000.6.3f1',
       '--format',
       'json',
       '--',

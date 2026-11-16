@@ -83,8 +83,8 @@ function defaultLicense(): unknown {
 function responder(args: string[]) {
   if (args[0] === 'version') {
     return envelope({
-      version: scenario.version ?? '1.0.0-beta.14',
-      channel: 'beta',
+      version: scenario.version ?? '1.0.1',
+      channel: 'stable',
       commit: 'cli-commit-abc',
     });
   }
@@ -157,6 +157,7 @@ function readReport(project: string): {
   verdict: string;
   checks: { id: string; status: string; code: string; blocking: boolean; message: string }[];
   projectsVerify: { status: string; blocking: boolean; detail: string };
+  license: { active: boolean | null; mode: string; detail: string };
 } {
   return JSON.parse(readFileSync(reportPath(project), 'utf8')) as never;
 }
@@ -406,28 +407,28 @@ describe('doctorCommand', () => {
   });
 
   it('warns but does not fail when the CLI is newer than the tested ceiling', async () => {
-    scenario.version = '1.0.0-beta.20';
+    scenario.version = '1.0.2';
     const project = makeProject();
 
     const code = await doctorCommand(makeContext(project));
 
     expect(code).toBe(0);
-    expect(lines.join('')).toContain('1.0.0-beta.14');
+    expect(lines.join('')).toContain('1.0.1');
     expect(lines.join('')).toMatch(/newer than the tested ceiling/);
     const capability = readReport(project).checks.find((check) => check.id === 'cli-version');
     expect(capability).toMatchObject({ status: 'info', blocking: false });
-    expect(capability?.message).toContain('1.0.0-beta.20');
+    expect(capability?.message).toContain('1.0.2');
     expect(capability?.message).toContain('cli-commit-abc');
   });
 
   it('fails with exit 64 when the CLI is older than the tested floor, and records it', async () => {
-    scenario.version = '1.0.0-beta.8';
+    scenario.version = '0.9.0';
     const project = makeProject();
 
     const code = await doctorCommand(makeContext(project));
 
     expect(code).toBe(64);
-    expect(lines.join('')).toContain('1.0.0-beta.9');
+    expect(lines.join('')).toContain('1.0.0');
     const capability = readReport(project).checks.find((check) => check.id === 'cli-version');
     expect(capability).toMatchObject({
       status: 'fail',
@@ -437,6 +438,25 @@ describe('doctorCommand', () => {
     expect(readReport(project).verdict).toBe('fail');
   });
 
+  it('treats the last beta, 1.0.0-beta.17, as below the stable floor', async () => {
+    scenario.version = '1.0.0-beta.17';
+    const project = makeProject();
+
+    const code = await doctorCommand(makeContext(project));
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toContain('older than the tested floor 1.0.0');
+  });
+
+  it('accepts both tested stable releases', async () => {
+    const project = makeProject();
+
+    for (const version of ['1.0.0', '1.0.1']) {
+      scenario.version = version;
+      expect(await doctorCommand(makeContext(project))).toBe(0);
+    }
+  });
+
   it('records the CLI version, channel and commit on the context', async () => {
     const project = makeProject();
     const ctx = makeContext(project);
@@ -444,9 +464,53 @@ describe('doctorCommand', () => {
     const code = await doctorCommand(ctx);
 
     expect(code).toBe(0);
-    expect(ctx.cliVersion).toBe('1.0.0-beta.14');
-    expect(ctx.cliChannel).toBe('beta');
+    expect(ctx.cliVersion).toBe('1.0.1');
+    expect(ctx.cliChannel).toBe('stable');
     expect(ctx.cliCommit).toBe('cli-commit-abc');
+  });
+
+  it('does not fail on a 1.0.x check that is blocking yet informational', async () => {
+    // Live 1.0.1: `doctor --ci --skip-license` reports Unity's own check as
+    // `{status: "info", blocking: true}`. Only a blocking *failure* may fail
+    // the preflight, or every `--skip-license` run would exit 64.
+    scenario.doctor = {
+      verdict: 'pass',
+      checks: [
+        {
+          id: 'license',
+          status: 'info',
+          code: 'LICENSE_SKIPPED',
+          blocking: true,
+          message: 'License check skipped (--skip-license)',
+        },
+      ],
+    };
+
+    const code = await doctorCommand(makeContext(makeProject()));
+
+    expect(code).toBe(0);
+  });
+
+  it('passes --skip-license and skips its own licence check when configured', async () => {
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.doctor.skipLicense = true;
+    });
+
+    const code = await doctorCommand(ctx);
+
+    expect(code).toBe(0);
+    const doctor = calls.find((args) => args[0] === 'doctor' && args.includes('--ci'));
+    expect(doctor).toContain('--skip-license');
+    // `--skip-license` would be pointless if the core then asked the CLI again.
+    expect(calls.some((args) => args[0] === 'license')).toBe(false);
+    const license = readReport(project).checks.find((check) => check.id === 'license');
+    expect(license).toMatchObject({ status: 'info', code: 'LICENSE_SKIPPED', blocking: false });
+    // `null`, not `false`: the record must say "not checked", not "no licence".
+    expect(readReport(project).license).toMatchObject({
+      active: null,
+      detail: 'skipped by doctor.skipLicense',
+    });
   });
 
   it('does not run the git preflight: setup owns it', async () => {

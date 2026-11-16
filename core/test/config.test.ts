@@ -589,7 +589,7 @@ describe('config validation', () => {
 
   it('accepts a build output path that is an existing directory', () => {
     const tmp = workspace();
-    // `unity build --output-path ./Build/WebGL` is documented as a directory
+    // `unity build --output ./Build/WebGL` is documented as a directory
     // for directory-style targets, and `ci-output/build/` holds the build's
     // files and provenance.json after the first successful build.
     mkdirSync(join(tmp, 'ci-output', 'build', 'game'), { recursive: true });
@@ -829,5 +829,97 @@ describe('config validation', () => {
     const tmp = workspace();
     const { issues } = loadIn(tmp, { env: { UNITYCI_EDITOR_VERSION: 'from-project' } });
     expect(issues).toEqual([]);
+  });
+});
+
+describe('1.0.x configuration surface', () => {
+  it('defaults the new switches to off and provenance to on', () => {
+    const config = structuredClone(DEFAULT_CONFIG);
+    expect(config.unity.editor.headless).toBe(false);
+    expect(config.unity.editor.resume).toBe(false);
+    expect(config.unity.editor.path).toBeNull();
+    expect(config.unity.editor.architecture).toBeNull();
+    expect(config.test.affected).toBe(false);
+    expect(config.test.affectedCompare).toBeNull();
+    expect(config.test.since).toBeNull();
+    expect(config.test.rerunFailed).toBe(false);
+    expect(config.build.provenance).toBe(true);
+    expect(config.build.buildTargetGroup).toBeNull();
+    expect(config.doctor.skipLicense).toBe(false);
+    expect(config.accelerator).toEqual({ endpoint: null, disabled: false });
+  });
+
+  it('maps every new environment variable', () => {
+    const { patch, unknown } = readEnvConfig({
+      UNITYCI_EDITOR_HEADLESS: 'true',
+      UNITYCI_EDITOR_RESUME: 'true',
+      UNITYCI_EDITOR_PATH: '/opt/unity/Editor/Unity',
+      UNITYCI_EDITOR_ARCHITECTURE: 'arm64',
+      UNITYCI_TEST_AFFECTED: 'true',
+      UNITYCI_TEST_AFFECTED_COMPARE: 'origin/main',
+      UNITYCI_TEST_SINCE: 'origin/main',
+      UNITYCI_TEST_RERUN_FAILED: 'true',
+      UNITYCI_BUILD_PROVENANCE: 'false',
+      UNITYCI_BUILD_TARGET_GROUP: 'Standalone',
+      UNITYCI_DOCTOR_SKIP_LICENSE: 'true',
+      UNITYCI_ACCELERATOR: 'accelerator.local:10080',
+      UNITYCI_ACCELERATOR_DISABLED: 'true',
+    });
+    expect(unknown).toEqual([]);
+    expect(patch.unity?.editor).toMatchObject({
+      headless: true,
+      resume: true,
+      path: '/opt/unity/Editor/Unity',
+      architecture: 'arm64',
+    });
+    expect(patch.test).toMatchObject({
+      affected: true,
+      affectedCompare: 'origin/main',
+      since: 'origin/main',
+      rerunFailed: true,
+    });
+    expect(patch.build).toMatchObject({ provenance: false, buildTargetGroup: 'Standalone' });
+    expect(patch.doctor?.skipLicense).toBe(true);
+    expect(patch.accelerator).toEqual({ endpoint: 'accelerator.local:10080', disabled: true });
+  });
+
+  it('rejects an unknown editor architecture', () => {
+    const tmp = workspace();
+    const { issues } = loadIn(tmp, { env: { UNITYCI_EDITOR_ARCHITECTURE: 'mips' } });
+    expect(issues.some((issue) => issue.path === 'unity.editor.architecture')).toBe(true);
+  });
+
+  it('accepts the two Editor architectures the CLI supports', () => {
+    for (const architecture of ['x86_64', 'arm64']) {
+      const tmp = workspace();
+      const { issues } = loadIn(tmp, { env: { UNITYCI_EDITOR_ARCHITECTURE: architecture } });
+      expect(issues).toEqual([]);
+    }
+  });
+
+  it('rejects an Editor path that would parse as another option', () => {
+    const tmp = workspace();
+    const { issues } = loadIn(tmp, { env: { UNITYCI_EDITOR_PATH: '--output=/tmp/x' } });
+    expect(issues.some((issue) => issue.path === 'unity.editor.path')).toBe(true);
+  });
+
+  it('rejects a since ref that would parse as another option', () => {
+    const tmp = workspace();
+    const { issues } = loadIn(tmp, { env: { UNITYCI_TEST_SINCE: '--output-path' } });
+    expect(issues.some((issue) => issue.path === 'test.since')).toBe(true);
+  });
+
+  it('rejects a malformed accelerator endpoint', () => {
+    const tmp = workspace();
+    const { issues } = loadIn(tmp, { env: { UNITYCI_ACCELERATOR: 'host:not-a-port' } });
+    expect(issues.some((issue) => issue.path === 'accelerator.endpoint')).toBe(true);
+  });
+
+  it('rejects an endpoint and --no-accelerator at the same time', () => {
+    const tmp = workspace();
+    const { issues } = loadIn(tmp, {
+      env: { UNITYCI_ACCELERATOR: 'accelerator:10080', UNITYCI_ACCELERATOR_DISABLED: 'true' },
+    });
+    expect(issues.some((issue) => issue.path === 'accelerator')).toBe(true);
   });
 });

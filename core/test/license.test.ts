@@ -225,8 +225,60 @@ describe('activateLicense', () => {
     const result = await activateLicense(makeContext('floating'));
 
     expect(result).toEqual({ activated: true, mode: 'floating' });
-    expect(calls[0]!.args).toContain('--floating');
-    expect(calls[0]!.args).not.toContain('--serial');
+    // 1.0.x: the health endpoint is asked first; activation is the second call.
+    expect(calls[0]!.args).toEqual(['license', 'server', 'health', '--format', 'json']);
+    expect(calls[1]!.args).toContain('--floating');
+    expect(calls[1]!.args).not.toContain('--serial');
+  });
+
+  it('refuses to activate when the floating server health check fails', async () => {
+    let call = 0;
+    mocks.runUnity.mockImplementation(async (options: UnityCall) => {
+      record(options);
+      call += 1;
+      if (call === 1) return failed(6, 'floating server is unreachable');
+      return ok({ activated: true });
+    });
+
+    const code = await licenseActivateCommand(makeContext('floating'));
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toMatch(/floating license server is not healthy/i);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toEqual(['license', 'server', 'health', '--format', 'json']);
+  });
+
+  it('fails fast when no floating server is configured', async () => {
+    mocks.runUnity.mockImplementation(async (options: UnityCall) => {
+      record(options);
+      return failed(4, 'no licensing server is configured');
+    });
+
+    const code = await licenseActivateCommand(makeContext('floating'));
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toMatch(/no floating license server is configured/i);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('still activates when this CLI does not know `license server health`', async () => {
+    let call = 0;
+    mocks.runUnity.mockImplementation(async (options: UnityCall) => {
+      record(options);
+      call += 1;
+      if (call === 1) {
+        return {
+          ...failed(2, "unknown command 'server'"),
+          json: { success: false, errors: [{ code: 'UNKNOWN_COMMAND', message: "unknown command 'server'" }] },
+        };
+      }
+      return ok({ activated: true });
+    });
+
+    const result = await activateLicense(makeContext('floating'));
+
+    expect(result).toEqual({ activated: true, mode: 'floating' });
+    expect(calls[1]!.args).toContain('--floating');
   });
 
   it('explains a missing floating server when the CLI exits 4', async () => {

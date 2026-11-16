@@ -32,9 +32,10 @@ jobs:
       - name: Install pnpm
         run: npm install --global pnpm@12.15.0
 
-      # Deliberately unpinned. `install.sh` fetches the current beta "until a
-      # stable release ships"; the Hub and winget/MSIX self-update regardless, so
-      # a version string here would be a fiction (docs/compatibility.md).
+      # Deliberately unpinned. The installer now fetches the current stable
+      # release (`UNITY_CLI_CHANNEL=beta` would select the beta channel); the
+      # Hub and winget/MSIX self-update regardless, so a version string here
+      # would be a fiction (docs/compatibility.md).
       - name: Install the latest Unity CLI
         run: |
           curl -fsSL https://unity.com/install.sh | bash

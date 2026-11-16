@@ -31,6 +31,7 @@ import {
   runLifecycle,
   runWithRetry,
 } from './run-lifecycle.js';
+import { acceleratorArgs, editorIdentityArgs } from './editor-args.js';
 import { unityBaseOptions } from './setup.js';
 
 /**
@@ -111,6 +112,7 @@ function testArguments(ctx: CoreContext, mode: string, outputDir: string): strin
     'nunit,junit',
     '--junit-output',
     join(outputDir, `${mode}.junit.xml`),
+    ...editorIdentityArgs(ctx),
   ];
 
   if (ctx.config.test.filter !== null && ctx.config.test.filter !== '') {
@@ -130,6 +132,19 @@ function testArguments(ctx: CoreContext, mode: string, outputDir: string): strin
   if (ctx.config.test.retries > 0) {
     args.push('--retries', String(ctx.config.test.retries));
   }
+  // 1.0.x affected-test selection. `--since` is a git revision; `--affected`
+  // runs the whole suite when the impact graph cannot tell.
+  if (ctx.config.test.affected) args.push('--affected');
+  if (ctx.config.test.since !== null) {
+    args.push('--since', ctx.config.test.since);
+  }
+  if (ctx.config.test.affectedCompare !== null) {
+    args.push('--affected-compare', ctx.config.test.affectedCompare);
+  }
+  // `--rerun-failed` reads the previous NUnit report at `--output`; it is
+  // opt-in because a fresh runner has no previous report.
+  if (ctx.config.test.rerunFailed) args.push('--rerun-failed');
+  args.push(...acceleratorArgs(ctx));
   // PlayMode needs a graphics device for simulated input; -nographics is an
   // Editor argument, so it travels after the `--` separator.
   if (ctx.config.test.nographics && mode === 'EditMode') {

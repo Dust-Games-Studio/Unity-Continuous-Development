@@ -173,7 +173,7 @@ describe('the example Unity project', () => {
     const source = readText('Assets/Editor/Builder.cs');
     expect(source).toMatch(/public\s+static\s+void\s+PerformBuild\s*\(\s*\)/);
     expect(source).toContain('BuildPipeline.BuildPlayer');
-    // `unity build --output-path` forwards its value as `-buildOutput`; a
+    // `unity build --output` forwards its value as `-buildOutput`; a
     // builder that ignored it would write somewhere the toolkit never reads.
     expect(source).toContain('-buildOutput');
     // A build method that returns quietly on failure is a false green.

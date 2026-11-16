@@ -99,6 +99,36 @@ function buildProfileIssue(profile: string): string | null {
 
 const ANNOTATIONS: ReadonlySet<string> = new Set(['none', 'github']);
 
+const EDITOR_ARCHITECTURES: ReadonlySet<string> = new Set(['x86_64', 'arm64']);
+
+/** `host`, `host:port`; Unity's Accelerator endpoint. */
+const ACCELERATOR_ENDPOINT = /^[A-Za-z0-9][A-Za-z0-9._-]*(?::[0-9]{1,5})?$/;
+
+/**
+ * A value that reaches argv as a value (not a flag): non-empty, no control
+ * characters and no leading `-`. Applied to Editor paths, git refs and the
+ * build-target group. Whitespace is allowed: the value is its own argv entry
+ * and `shell: false` makes it inert (a Windows Editor path contains spaces).
+ */
+function checkArgValue(path: string, value: string, issues: ConfigIssue[]): void {
+  if (value.trim() === '') {
+    issues.push({ path, message: `${path} must be a non-empty string` });
+    return;
+  }
+  if (value.startsWith('-')) {
+    issues.push({
+      path,
+      message: `${path} must not start with "-": it would be parsed as another command-line option`,
+    });
+  }
+  if (CONTROL_CHARACTER.test(value)) {
+    issues.push({
+      path,
+      message: `${path} must not contain control characters or line breaks`,
+    });
+  }
+}
+
 /**
  * The variables `spawnProcess` removes from every child (GC23). A licence
  * secret cannot be carried in one of these: it would be deleted before
@@ -214,6 +244,19 @@ export function validateConfig(config: Config, projectRoot: string = process.cwd
   checkVersionString('unity.cli.version', config.unity.cli.version, issues);
   checkNullableVersion('unity.editor.changeset', config.unity.editor.changeset, issues);
   checkVersionString('unity.editor.version', config.unity.editor.version, issues);
+  if (config.unity.editor.path !== null) {
+    checkArgValue('unity.editor.path', config.unity.editor.path, issues);
+  }
+  if (config.unity.editor.architecture !== null) {
+    if (!EDITOR_ARCHITECTURES.has(config.unity.editor.architecture)) {
+      issues.push({
+        path: 'unity.editor.architecture',
+        message:
+          'unity.editor.architecture must be x86_64, arm64, or null; ' +
+          `got ${JSON.stringify(config.unity.editor.architecture)}`,
+      });
+    }
+  }
 
   // --- build target / profile ---------------------------------------------------
   // `unity build --target` is "Required unless --profile is used", so a build
@@ -265,6 +308,10 @@ export function validateConfig(config: Config, projectRoot: string = process.cwd
       path: 'build.androidTargetSdkVersion',
       message: `build.androidTargetSdkVersion must be a positive integer, or null; got ${JSON.stringify(targetSdk)}`,
     });
+  }
+
+  if (config.build.buildTargetGroup !== null) {
+    checkArgValue('build.buildTargetGroup', config.build.buildTargetGroup, issues);
   }
 
   if (typeof config.unity.cli.binary !== 'string' || config.unity.cli.binary.trim() === '') {
@@ -357,6 +404,15 @@ export function validateConfig(config: Config, projectRoot: string = process.cwd
     }
   }
 
+  // 1.0.x affected-test selection takes a git revision. It reaches argv, so
+  // reject an option-like or multi-word value here rather than at the Editor.
+  if (config.test.since !== null) {
+    checkArgValue('test.since', config.test.since, issues);
+  }
+  if (config.test.affectedCompare !== null) {
+    checkArgValue('test.affectedCompare', config.test.affectedCompare, issues);
+  }
+
   // --- license / output enums ---------------------------------------------------
   if (!LICENSE_MODES.has(config.license.mode)) {
     issues.push({
@@ -373,6 +429,30 @@ export function validateConfig(config: Config, projectRoot: string = process.cwd
     issues.push({
       path: 'output.annotations',
       message: `output.annotations must be none or github; got ${JSON.stringify(config.output.annotations)}`,
+    });
+  }
+
+  // --- Accelerator --------------------------------------------------------------
+  const accelerator = config.accelerator;
+  if (accelerator.endpoint !== null) {
+    if (
+      typeof accelerator.endpoint !== 'string' ||
+      !ACCELERATOR_ENDPOINT.test(accelerator.endpoint)
+    ) {
+      issues.push({
+        path: 'accelerator.endpoint',
+        message:
+          'accelerator.endpoint must be host or host:port (for example accelerator.local:10080), or null; ' +
+          `got ${JSON.stringify(accelerator.endpoint)}`,
+      });
+    }
+  }
+  if (accelerator.disabled === true && accelerator.endpoint !== null) {
+    issues.push({
+      path: 'accelerator',
+      message:
+        'accelerator.endpoint and accelerator.disabled are mutually exclusive: ' +
+        'set one, or leave both unset to use the machine configuration',
     });
   }
 

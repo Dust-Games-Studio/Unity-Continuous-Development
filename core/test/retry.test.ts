@@ -8,10 +8,13 @@ import {
 /**
  * The shipped default (GC8). Exit 10 is excluded because it only applies to
  * `unity open --until-ready`; 130/143 are excluded because a signalled CI job
- * must fail, never loop.
+ * must fail, never loop. 16 (`JOB_SUSPENDED`) and 17 (`UNAVAILABLE`, an Editor
+ * that is loading, compiling or reloading) are transient and retryable; 15
+ * (`RUN_FAILED`) and 18 (`AWAITING_INPUT`, a modal dialog) are not retried by
+ * default.
  */
 const DEFAULT_POLICY: RetryPolicy = {
-  onExitCodes: [7, 9, 12, 14],
+  onExitCodes: [7, 9, 12, 14, 16, 17],
   maxAttempts: 2,
   backoffMs: 5000,
 };
@@ -39,6 +42,49 @@ describe('withRetry', () => {
 
     expect(fn).toHaveBeenCalledTimes(2);
     expect(result.attempts).toBe(2);
+  });
+
+  it('retries exit code 17 (UNAVAILABLE: an Editor that is loading or compiling)', async () => {
+    const fn = vi.fn(async () => outcome('editor busy', 17));
+
+    const run = withRetry(fn, DEFAULT_POLICY);
+    await vi.advanceTimersByTimeAsync(DEFAULT_POLICY.backoffMs);
+    const result = await run;
+
+    expect(fn).toHaveBeenCalledTimes(2);
+    expect(result.code).toBe(17);
+  });
+
+  it('retries exit code 16 (JOB_SUSPENDED)', async () => {
+    const fn = vi.fn(async () => outcome('job suspended', 16));
+
+    const run = withRetry(fn, DEFAULT_POLICY);
+    await vi.advanceTimersByTimeAsync(DEFAULT_POLICY.backoffMs);
+    const result = await run;
+
+    expect(fn).toHaveBeenCalledTimes(2);
+    expect(result.code).toBe(16);
+  });
+
+  it('does not retry exit code 15 (RUN_FAILED) by default', async () => {
+    const fn = vi.fn(async () => outcome('run failed', 15));
+
+    const result = await withRetry(fn, DEFAULT_POLICY);
+
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(result.code).toBe(15);
+  });
+
+  it('does not retry exit code 18 (AWAITING_INPUT) by default', async () => {
+    // A modal dialog in a batch Editor will not clear on its own; retrying it
+    // just burns the job's remaining time. It can still be opted into per
+    // pipeline.
+    const fn = vi.fn(async () => outcome('dialog', 18));
+
+    const result = await withRetry(fn, DEFAULT_POLICY);
+
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(result.code).toBe(18);
   });
 
   it('never retries exit code 8', async () => {

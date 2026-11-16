@@ -12,9 +12,9 @@ the reverse) is a bug worth reporting.
   working on this repository.
 - **pnpm 12** (`npm install --global pnpm@12.15.0`, or Corepack).
 - **git**, on `PATH`.
-- **The Unity CLI**, named `unity`. It is pre-1.0 beta software; see
-  [compatibility.md](compatibility.md) for the tested range and the pinning
-  policy.
+- **The Unity CLI**, named `unity`. It is stable at 1.0.x and still
+  self-updating; see [compatibility.md](compatibility.md) for the tested range
+  and the pinning policy.
 - **A Unity Editor** matching the project's `ProjectSettings/ProjectVersion.txt`,
   or `unity.editor.acceptEula: true` so the toolkit can install the missing one
   explicitly.
@@ -24,11 +24,18 @@ the reverse) is a bug worth reporting.
 Unity's documented installer for a developer machine:
 
 ```bash
+# macOS / Linux
 curl -fsSL https://unity.com/install.sh | bash
+
+# Windows (PowerShell)
+irm https://unity.com/install.ps1 | iex
 ```
 
-Packages also exist for Homebrew, winget and apt/dnf. Whichever route you use,
-verify the result with the machine-readable form, not `--version`:
+The installers now fetch the **latest stable** release. Set
+`UNITY_CLI_CHANNEL=beta` before running one only if you deliberately want the
+beta channel. Packages also exist for Homebrew, winget and apt/dnf. Whichever
+route you use, verify the result with the machine-readable form, not
+`--version`:
 
 ```bash
 unity version --format json
@@ -92,8 +99,17 @@ unity:
     version: from-project       # read ProjectSettings/ProjectVersion.txt
     terms: true                 # run `unity terms accept <version> --yes`
     acceptEula: false           # keep false unless the toolkit may install
+    headless: false             # Linux only: install the headless Editor
+    architecture: null          # x86_64 | arm64
+    path: null                  # pin a specific Editor binary (--editor-path)
+    resume: true                # resume a cached/interrupted download
 test:
   modes: [EditMode]
+  # 1.0.x: run only the tests a change can reach.
+  affected: false
+  since: origin/main
+build:
+  provenance: true              # false sends --no-provenance
 output:
   dir: ci-output
 ```
@@ -125,6 +141,14 @@ The Editor version comes from the project. If it is not installed, the core
 fails fast with the exact `unity install …` command rather than silently
 downloading gigabytes; set `unity.editor.acceptEula: true` to let it run that
 install (which accepts Unity's and every selected module's licence agreements).
+`unity.editor.headless: true` installs the headless Linux Editor (Linux only);
+`unity.editor.resume: true` resumes a cached or interrupted download;
+`unity.editor.architecture` selects `x86_64` or `arm64`.
+
+`unity.editor.path` pins a specific Editor binary with `--editor-path`, for a
+self-contained or non-Hub install. The run still verifies the project's Editor
+version through `editors --installed`; the path only decides which binary the
+test or build actually launches.
 
 ## The fake-`unity` loop (no Editor, no licence)
 
@@ -203,3 +227,13 @@ Editor. Ubuntu 22.04/24.04 on x64 is the supported Editor target. See
   is reported as an infrastructure failure (exit 6), never a green run.
 - **Tests failed (exit 8)** — the run produced a verdict. Publish the reports;
   do not retry it blindly. The core never retries exit 8.
+- **Exit 15 (`RUN_FAILED`)** — the run failed without a more specific code.
+  Terminal; read the log.
+- **Exit 16 (`JOB_SUSPENDED`) or 17 (`UNAVAILABLE`)** — a transient state
+  (install lock, Editor loading/compiling/reloading/Safe Mode). The core retries
+  these by default.
+- **Exit 18 (`AWAITING_INPUT`)** — a modal dialog blocks the Editor. Not retried
+  by default: a batch Editor will not clear it on its own. Find the dialog with
+  `unity status` or the Editor window.
+- **Exit 141 (`OUTPUT_CLOSED`)** — the reader of stdout closed the pipe. Nothing
+  was wrong with the run; fix the consumer.

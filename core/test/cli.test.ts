@@ -346,7 +346,7 @@ describe('main', () => {
           code: 0,
           json: {
             success: true,
-            data: { version: '1.0.0-beta.14', channel: 'beta', commit: 'abc123' },
+            data: { version: '1.0.1', channel: 'stable', commit: 'abc123' },
           },
         },
         {

@@ -100,18 +100,19 @@ function defaultLicense(): unknown {
 function responder(args: string[]) {
   if (args[0] === 'version') {
     return envelope({
-      version: scenario.version ?? '1.0.0-beta.14',
-      channel: 'beta',
+      version: scenario.version ?? '1.0.1',
+      channel: 'stable',
       commit: 'cli-commit-abc',
     });
   }
   if (args[0] === 'editors') {
-    return envelope(scenario.editors ?? [editorRow(EDITOR)]);
+    // Unity CLI 1.0.x listing envelope: rows live under `data.items`.
+    const items = scenario.editors ?? [editorRow(EDITOR)];
+    return envelope({ items, total: items.length, nextPage: null, partial: false });
   }
   if (args[0] === 'install' && args.includes('--list-modules')) {
-    return envelope(
-      scenario.modules ?? [moduleRow('android', true), moduleRow('webgl', true)],
-    );
+    const items = scenario.modules ?? [moduleRow('android', true), moduleRow('webgl', true)];
+    return envelope({ items, total: items.length, nextPage: null, partial: false });
   }
   if (args[0] === 'install') {
     const code = scenario.installCode ?? 0;
@@ -288,6 +289,59 @@ describe('setupCommand', () => {
     expect(install).toContain('webgl');
     expect(install).toContain('--cm');
     expect(install).toContain('--accept-eula');
+  });
+
+  it('passes the 1.0.x install flags: --headless, --resume and --architecture', async () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    scenario.editors = [];
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.unity.editor.acceptEula = true;
+      config.unity.editor.terms = false;
+      config.unity.editor.headless = true;
+      config.unity.editor.resume = true;
+      config.unity.editor.architecture = 'arm64';
+    });
+
+    const code = await setupCommand(ctx);
+
+    expect(code).toBe(0);
+    const install = installCalls()[0]!;
+    expect(install).toContain('--headless');
+    expect(install).toContain('--resume');
+    expect(install).toContain('--architecture');
+    expect(install[install.indexOf('--architecture') + 1]).toBe('arm64');
+  });
+
+  it('refuses --headless on a non-Linux host before starting an install', async () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    scenario.editors = [];
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.unity.editor.acceptEula = true;
+      config.unity.editor.terms = false;
+      config.unity.editor.headless = true;
+    });
+
+    const code = await setupCommand(ctx);
+
+    expect(code).toBe(64);
+    expect(lines.join('')).toMatch(/headless.*Linux/i);
+    expect(installCalls()).toEqual([]);
+  });
+
+  it('keeps --headless and --resume off by default', async () => {
+    scenario.editors = [];
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.unity.editor.acceptEula = true;
+      config.unity.editor.terms = false;
+    });
+
+    expect(await setupCommand(ctx)).toBe(0);
+    const install = installCalls()[0]!;
+    expect(install).not.toContain('--headless');
+    expect(install).not.toContain('--resume');
   });
 
   it('fails with exit 64 when the editor version is not from-project and is not a valid version', async () => {

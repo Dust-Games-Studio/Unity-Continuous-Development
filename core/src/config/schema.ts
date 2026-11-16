@@ -16,6 +16,14 @@ export interface Config {
       childModules: boolean;
       terms: boolean;
       acceptEula: boolean;
+      /** 1.0.x: install the headless Linux Editor (`install --headless`). */
+      headless: boolean;
+      /** 1.0.x: resume an interrupted Editor download (`install --resume`). */
+      resume: boolean;
+      /** 1.0.x: a specific Editor binary for test/build (`--editor-path`). */
+      path: string | null;
+      /** 1.0.x: `x86_64` or `arm64` (`--architecture`). */
+      architecture: string | null;
     };
   };
   license: {
@@ -27,6 +35,8 @@ export interface Config {
   doctor: {
     /** Free space the project root must have, in bytes (default 10 GiB). */
     minFreeBytes: number;
+    /** 1.0.x: skip the licence check in `unity doctor --ci` (`--skip-license`). */
+    skipLicense: boolean;
   };
   test: {
     modes: string[];
@@ -36,6 +46,14 @@ export interface Config {
     shards: string | null;
     retries: number;
     nographics: boolean;
+    /** 1.0.x: only the tests a change can reach (`--affected`). */
+    affected: boolean;
+    /** 1.0.x: report what affected selection would skip (`--affected-compare`). */
+    affectedCompare: string | null;
+    /** 1.0.x: the revision affected selection compares against (`--since`). */
+    since: string | null;
+    /** 1.0.x: only the tests that failed last time (`--rerun-failed`). */
+    rerunFailed: boolean;
   };
   build: {
     /**
@@ -54,7 +72,13 @@ export interface Config {
     androidVersionCode: number | null;
     androidTargetSdkVersion: number | null;
     allowDirtyBuild: boolean;
+    /** 1.0.x: write a provenance manifest (default true). */
+    provenance: boolean;
+    /** 1.0.x: `--build-target-group`, forwarded to Unity. */
+    buildTargetGroup: string | null;
   };
+  /** 1.0.x: `--accelerator` / `--no-accelerator`, shared by test and build. */
+  accelerator: { endpoint: string | null; disabled: boolean };
   retry: { onExitCodes: number[]; maxAttempts: number; backoffMs: number };
   output: { dir: string; annotations: 'none' | 'github'; ci: boolean };
 }
@@ -68,7 +92,7 @@ export type ConfigIssue = { path: string; message: string };
  */
 export const DEFAULT_CONFIG: Config = {
   unity: {
-    cli: { version: '1.0.0-beta.14', allowLatest: false, binary: 'unity' },
+    cli: { version: '1.0.1', allowLatest: false, binary: 'unity' },
     editor: {
       version: 'from-project',
       changeset: null,
@@ -76,6 +100,10 @@ export const DEFAULT_CONFIG: Config = {
       childModules: true,
       terms: true,
       acceptEula: false,
+      headless: false,
+      resume: false,
+      path: null,
+      architecture: null,
     },
   },
   license: {
@@ -84,7 +112,7 @@ export const DEFAULT_CONFIG: Config = {
     fileEnv: 'UNITY_LICENSE_FILE_BASE64',
   },
   packages: { preflight: true },
-  doctor: { minFreeBytes: 10 * 1024 * 1024 * 1024 },
+  doctor: { minFreeBytes: 10 * 1024 * 1024 * 1024, skipLicense: false },
   test: {
     modes: ['EditMode'],
     outputDir: 'ci-output/tests',
@@ -93,6 +121,10 @@ export const DEFAULT_CONFIG: Config = {
     shards: null,
     retries: 0,
     nographics: true,
+    affected: false,
+    affectedCompare: null,
+    since: null,
+    rerunFailed: false,
   },
   build: {
     target: 'StandaloneWindows64',
@@ -107,7 +139,10 @@ export const DEFAULT_CONFIG: Config = {
     androidVersionCode: null,
     androidTargetSdkVersion: null,
     allowDirtyBuild: false,
+    provenance: true,
+    buildTargetGroup: null,
   },
-  retry: { onExitCodes: [7, 9, 12, 14], maxAttempts: 2, backoffMs: 5000 },
+  accelerator: { endpoint: null, disabled: false },
+  retry: { onExitCodes: [7, 9, 12, 14, 16, 17], maxAttempts: 2, backoffMs: 5000 },
   output: { dir: 'ci-output', annotations: 'none', ci: true },
 };

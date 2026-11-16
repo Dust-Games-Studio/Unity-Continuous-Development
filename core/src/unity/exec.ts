@@ -50,6 +50,12 @@ const STRIPPED_VARIABLES = [
   'UNITY_GITLAB_TOKEN',
 ] as const;
 
+/** Ambient Editor selection the CLI honours; only a caller-set value survives. */
+const EDITOR_SELECTION_VARIABLES = [
+  'UNITY_EDITOR_VERSION',
+  'UNITY_ARCHITECTURE',
+] as const;
+
 /**
  * Unattended, quiet and telemetry-free for every Unity child process (GC13).
  * `UNITY_NO_CRASH_REPORT` and `UNITY_NO_CONSENT_PROMPT` are deliberately not
@@ -68,10 +74,18 @@ const ALWAYS_ON: Readonly<Record<string, string>> = {
  * stripped token names and the five forced variables. `UNITY_LICENSE_SERIAL`
  * passes through: the CLI reads it from the environment by design and never
  * puts it on argv.
+ *
+ * 1.0.x lets `UNITY_EDITOR_VERSION` and `UNITY_ARCHITECTURE` steer `build` and
+ * `test`. They are ambient Editor selection, not caller intent: when the caller
+ * does not set them explicitly, the ambient value is removed so an operator's
+ * export cannot silently override the project's Editor.
  */
 function unityChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const childEnv: NodeJS.ProcessEnv = { ...process.env, ...env };
   for (const name of STRIPPED_VARIABLES) delete childEnv[name];
+  for (const name of EDITOR_SELECTION_VARIABLES) {
+    if (env[name] === undefined) delete childEnv[name];
+  }
   Object.assign(childEnv, ALWAYS_ON);
   return childEnv;
 }

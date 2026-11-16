@@ -10,7 +10,8 @@ The measurements behind every claim on this page are in
 [`docs/decisions/upm-git-auth-probe.md`](decisions/upm-git-auth-probe.md). They
 were taken end to end through `unity build` (the CLI spawned the Editor and the
 Editor's Package Manager performed the clone) on Editor 6000.6.6f1 with Unity
-CLI 1.0.0-beta.14.
+CLI 1.0.0-beta.14. The mechanism is unchanged in 1.0.x; the 1.0.0 changelog
+changes the `build` invocation spelling (`--output`), not git or UPM auth.
 
 ## Why the manifest URL must stay credential-free
 

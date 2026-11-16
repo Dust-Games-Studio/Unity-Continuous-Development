@@ -7,8 +7,8 @@ import { runUnity, type UnityResult } from './exec.js';
  * fails the preflight; one above the ceiling is a loud warning, not a failure
  * (R13).
  */
-export const TESTED_CLI_MIN = '1.0.0-beta.9';
-export const TESTED_CLI_MAX = '1.0.0-beta.14';
+export const TESTED_CLI_MIN = '1.0.0';
+export const TESTED_CLI_MAX = '1.0.1';
 
 /**
  * Everything a wrapper needs to start one Unity invocation.
@@ -45,6 +45,14 @@ export interface UnityInstallOptions {
   acceptEula?: boolean;
   /** Defaults to true: the toolkit never wants an interactive install. */
   yes?: boolean;
+  /** 1.0.x: install the headless Linux Editor (`--headless`). */
+  headless?: boolean;
+  /** 1.0.x: resume an interrupted download from cache (`--resume`). */
+  resume?: boolean;
+  /** 1.0.x: install into this folder without registering it. */
+  downloadDirectory?: string;
+  /** 1.0.x: download and verify into the cache without installing. */
+  downloadOnly?: boolean;
 }
 
 /**
@@ -98,8 +106,13 @@ export function unityVersion(opts: UnityBaseOptions): Promise<UnityResult> {
 }
 
 /** `unity doctor --ci --format json`: the machine-readable preflight report. */
-export function unityDoctorCi(opts: UnityBaseOptions): Promise<UnityResult> {
-  return run(opts, ['doctor', '--ci']);
+export function unityDoctorCi(
+  opts: UnityBaseOptions,
+  options: { skipLicense?: boolean } = {},
+): Promise<UnityResult> {
+  const args = ['doctor', '--ci'];
+  if (options.skipLicense === true) args.push('--skip-license');
+  return run(opts, args);
 }
 
 /** `unity install <version> [--module <ids…>] [--cm|--no-cm] …` */
@@ -117,6 +130,12 @@ export function unityInstall(
   else if (install.childModules === false) args.push('--no-cm');
   if (install.changeset) args.push('--changeset', install.changeset);
   if (install.architecture) args.push('--architecture', install.architecture);
+  if (install.resume) args.push('--resume');
+  if (install.downloadDirectory) {
+    args.push('--download-directory', install.downloadDirectory);
+  }
+  if (install.downloadOnly) args.push('--download-only');
+  if (install.headless) args.push('--headless');
   if (install.yes !== false) args.push('--yes');
   if (install.acceptEula) args.push('--accept-eula');
 
@@ -134,6 +153,16 @@ export function unityTermsAccept(
 /** `unity license status --format json`: `data.active` is the precondition. */
 export function unityLicenseStatus(opts: UnityBaseOptions): Promise<UnityResult> {
   return run(opts, ['license', 'status']);
+}
+
+/**
+ * `unity license server health --format json` (1.0.x): a floating licence
+ * server's `/v1/status` endpoint, with no sign-in and no licensing client.
+ * Exits 0 for Healthy or Degraded, 4 when no server is configured, 6 when it is
+ * unreachable or unhealthy.
+ */
+export function unityLicenseServerHealth(opts: UnityBaseOptions): Promise<UnityResult> {
+  return run(opts, ['license', 'server', 'health']);
 }
 
 /** `unity license activate <args…> --format json`. Secrets stay in `env`. */

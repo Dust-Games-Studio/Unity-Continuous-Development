@@ -26,6 +26,7 @@ import {
   type UnityBaseOptions,
 } from '../unity/cli.js';
 import type { UnityResult } from '../unity/exec.js';
+import { listingRows } from '../unity/listings.js';
 
 /** A precondition failure: the caller prints the message and exits `exitCode`. */
 export class SetupError extends Error {
@@ -163,6 +164,14 @@ export function unityBaseOptions(ctx: CoreContext): UnityBaseOptions {
     env.UNITY_NO_CRASH_REPORT = '1';
     env.UNITY_NO_CONSENT_PROMPT = '1';
   }
+  // 1.0.x makes these ambient variables steer build/test ('build' and 'test'
+  // read them; the flag still wins). The project's own version and the
+  // toolkit's architecture must be the only source, so an operator's exported
+  // value cannot silently change which Editor a pipeline uses.
+  delete env.UNITY_EDITOR_VERSION;
+  delete env.UNITY_ARCHITECTURE;
+  const architecture = ctx.config.unity.editor.architecture;
+  if (architecture !== null) env.UNITY_ARCHITECTURE = architecture;
   return {
     binary: ctx.binary,
     // Doctor/verify act on the project passed to the command, so the child's
@@ -184,9 +193,10 @@ interface ParsedCliVersion {
 }
 
 /**
- * A deliberately small, semver-ish parser: the tested range is
- * `1.0.0-beta.9` … `1.0.0-beta.14`, so only the numeric triple and a
- * `-channel.N` suffix are meaningful. Build metadata is ignored.
+ * A deliberately small, semver-ish parser: the tested range is `1.0.0`
+ * through `1.0.x` with no channel suffix today, but a `-channel.N` prerelease
+ * still has to compare correctly for a CLI that predates the stable floor.
+ * Build metadata is ignored.
  */
 function parseCliVersion(version: string): ParsedCliVersion | null {
   const withoutBuild = version.split('+', 1)[0] ?? version;
@@ -601,7 +611,7 @@ function editorRows(result: UnityResult): EditorRow[] {
     );
   }
   const data = result.json?.data;
-  const rows = Array.isArray(data) ? data : asArray(asObject(data)?.editors);
+  const rows = listingRows(data, ['editors']);
   if (rows.length === 0 && result.json === null) {
     throw new SetupError(
       '`unity editors --installed --format json` returned no machine-readable report.',
@@ -628,7 +638,7 @@ function moduleRows(result: UnityResult): ModuleRow[] {
     );
   }
   const data = result.json?.data;
-  const rows = Array.isArray(data) ? data : asArray(asObject(data)?.modules);
+  const rows = listingRows(data, ['modules']);
   const modules: ModuleRow[] = [];
   for (const raw of rows) {
     const row = asObject(raw);
@@ -658,18 +668,18 @@ async function missingModules(
 }
 
 /** The exact, copy-pasteable `unity install` command for a failure message. */
-function installCommand(
-  version: string,
-  modules: string[],
-  childModules: boolean,
-): string {
+function installCommand(ctx: CoreContext, version: string, modules: string[]): string {
+  const editor = ctx.config.unity.editor;
   const parts = ['unity', 'install', version];
   if (modules.length > 0) {
     parts.push('--module', ...modules);
     // `--cm`/`--no-cm` only mean anything with a module selection. Keep the
     // printed command identical to the argv `installEditor` runs (I4).
-    parts.push(childModules ? '--cm' : '--no-cm');
+    parts.push(editor.childModules ? '--cm' : '--no-cm');
   }
+  if (editor.architecture !== null) parts.push('--architecture', editor.architecture);
+  if (editor.resume) parts.push('--resume');
+  if (editor.headless) parts.push('--headless');
   parts.push('--yes', '--accept-eula');
   return parts.join(' ');
 }
@@ -679,15 +689,18 @@ async function installEditor(
   version: string,
   modules: string[],
 ): Promise<void> {
+  const editor = ctx.config.unity.editor;
   const result = await unityInstall(unityBaseOptions(ctx), {
     version,
     modules,
     // `--cm` only means anything with a module selection: without one it would
     // pull every child module (or is meaningless). Keep the argv in lockstep
     // with `installCommand`'s printed form in both directions (I4).
-    childModules:
-      modules.length > 0 ? ctx.config.unity.editor.childModules : undefined,
-    changeset: ctx.config.unity.editor.changeset ?? undefined,
+    childModules: modules.length > 0 ? editor.childModules : undefined,
+    changeset: editor.changeset ?? undefined,
+    architecture: editor.architecture ?? undefined,
+    resume: editor.resume,
+    headless: editor.headless,
     acceptEula: true,
   });
   if (isUnsupportedCommand(result)) {
@@ -698,7 +711,7 @@ async function installEditor(
   }
   if (result.code !== 0) {
     throw new SetupError(
-      `\`${installCommand(version, modules, ctx.config.unity.editor.childModules)}\` failed (exit ${result.code})${resultDetail(result)}`,
+      `\`${installCommand(ctx, version, modules)}\` failed (exit ${result.code})${resultDetail(result)}`,
       result.code === 0 ? EXIT.COMMAND_FAILED : result.code,
     );
   }
@@ -913,7 +926,16 @@ export async function setup(
   const identity = await resolveCliIdentity(ctx);
   const host = options.host ?? hostPlatform();
 
+  if (ctx.config.unity.editor.headless && host !== 'linux') {
+    throw new SetupError(
+      'unity.editor.headless installs the headless Linux Editor, which is only available on Linux; ' +
+        `this host is ${host}. Clear unity.editor.headless to install the regular Editor.`,
+      EXIT.CONFIG_ERROR,
+    );
+  }
+
   const editorVersion = resolveEditorVersion(ctx);
+  ctx.editorVersion = editorVersion;
 
   if (options.command === 'build') {
     const target = buildTargetFor(ctx, options);
@@ -940,7 +962,6 @@ export async function setup(
   const required = requiredModulesFor(ctx, options, host);
   const configuredModules = ctx.config.unity.editor.modules;
   const installModules = unique([...configuredModules, ...required]);
-  const childModules = ctx.config.unity.editor.childModules;
   let installed = false;
 
   const editors = editorRows(await unityEditorsInstalled(unityBaseOptions(ctx)));
@@ -949,7 +970,7 @@ export async function setup(
   if (!present) {
     if (!ctx.config.unity.editor.acceptEula) {
       throw new SetupError(
-        `the Unity Editor ${editorVersion} is not installed. Run \`${installCommand(editorVersion, installModules, childModules)}\`, ` +
+        `the Unity Editor ${editorVersion} is not installed. Run \`${installCommand(ctx, editorVersion, installModules)}\`, ` +
           'or set unity.editor.acceptEula: true to let the toolkit run it.',
         EXIT.CONFIG_ERROR,
       );
@@ -961,7 +982,7 @@ export async function setup(
   if (required.length > 0) {
     let missing = await missingModules(ctx, editorVersion, required);
     if (missing.length > 0) {
-      const command = installCommand(editorVersion, missing, childModules);
+      const command = installCommand(ctx, editorVersion, missing);
       if (!ctx.config.unity.editor.acceptEula) {
         throw new SetupError(
           `the installed Unity Editor ${editorVersion} is missing the required module${missing.length === 1 ? '' : 's'} ${missing.join(', ')}. ` +

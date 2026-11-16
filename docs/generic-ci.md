@@ -63,6 +63,8 @@ the signal to reclaim it by hand.
 | 6 | The run produced no verdict (compile error, crash, expired licence, unknown platform) | no: logs and diagnostics only |
 | 64 | Configuration/precondition error; nothing was spawned | no |
 | 7, 9, 12, 14 | Retried by the core; if still failing, infrastructure | no |
+| 16, 17 | 1.0.x: suspended; Editor unavailable (loading/compiling/reloading/Safe Mode). Retried by the core | no |
+| 15, 18, 141 | 1.0.x: run failed; modal dialog awaiting input; output pipe closed | no |
 | 130 / 143 | Interrupted / terminated | no |
 
 Publish on **0 or 8** only. On anything else there is no test result to show,

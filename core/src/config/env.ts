@@ -13,15 +13,25 @@ export const ENV_KEYS: Record<string, string> = {
   UNITYCI_EDITOR_CHANGESET: 'unity.editor.changeset',
   UNITYCI_EDITOR_ACCEPT_EULA: 'unity.editor.acceptEula',
   UNITYCI_EDITOR_TERMS: 'unity.editor.terms',
+  UNITYCI_EDITOR_HEADLESS: 'unity.editor.headless',
+  UNITYCI_EDITOR_RESUME: 'unity.editor.resume',
+  UNITYCI_EDITOR_PATH: 'unity.editor.path',
+  UNITYCI_EDITOR_ARCHITECTURE: 'unity.editor.architecture',
   UNITYCI_LICENSE_MODE: 'license.mode',
   UNITYCI_TEST_MODES: 'test.modes',
   UNITYCI_TEST_FILTER: 'test.filter',
   UNITYCI_TEST_COVERAGE: 'test.coverage',
   UNITYCI_TEST_NOGRAPHICS: 'test.nographics',
   UNITYCI_TEST_SHARDS: 'test.shards',
+  UNITYCI_TEST_AFFECTED: 'test.affected',
+  UNITYCI_TEST_AFFECTED_COMPARE: 'test.affectedCompare',
+  UNITYCI_TEST_SINCE: 'test.since',
+  UNITYCI_TEST_RERUN_FAILED: 'test.rerunFailed',
   UNITYCI_BUILD_TARGET: 'build.target',
   UNITYCI_BUILD_PROFILE: 'build.profile',
   UNITYCI_BUILD_METHOD: 'build.executeMethod',
+  UNITYCI_BUILD_PROVENANCE: 'build.provenance',
+  UNITYCI_BUILD_TARGET_GROUP: 'build.buildTargetGroup',
   UNITYCI_RETRY_EXIT_CODES: 'retry.onExitCodes',
   UNITYCI_RETRY_MAX_ATTEMPTS: 'retry.maxAttempts',
   UNITYCI_OUTPUT_DIR: 'output.dir',
@@ -29,6 +39,9 @@ export const ENV_KEYS: Record<string, string> = {
   UNITYCI_CI: 'output.ci',
   UNITYCI_PACKAGES_PREFLIGHT: 'packages.preflight',
   UNITYCI_DOCTOR_MIN_FREE_BYTES: 'doctor.minFreeBytes',
+  UNITYCI_DOCTOR_SKIP_LICENSE: 'doctor.skipLicense',
+  UNITYCI_ACCELERATOR: 'accelerator.endpoint',
+  UNITYCI_ACCELERATOR_DISABLED: 'accelerator.disabled',
 };
 
 /**
@@ -49,10 +62,16 @@ const LIST_PATHS: ReadonlyMap<string, 'string' | 'number'> = new Map([
 /** Nullable strings: an empty value clears them, matching the file's `null`. */
 const NULLABLE_PATHS: ReadonlySet<string> = new Set([
   'unity.editor.changeset',
+  'unity.editor.path',
+  'unity.editor.architecture',
   'test.filter',
   'test.shards',
+  'test.affectedCompare',
+  'test.since',
   'build.profile',
   'build.executeMethod',
+  'build.buildTargetGroup',
+  'accelerator.endpoint',
 ]);
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

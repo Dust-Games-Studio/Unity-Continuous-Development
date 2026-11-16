@@ -7,6 +7,7 @@ import {
   isUnsupportedCommand,
   unityLicenseActivate,
   unityLicenseReturn,
+  unityLicenseServerHealth,
 } from '../unity/cli.js';
 import type { UnityResult } from '../unity/exec.js';
 import { unityBaseOptions } from './setup.js';
@@ -398,6 +399,34 @@ export async function activateLicense(ctx: CoreContext): Promise<LicenseActivati
     }
 
     case 'floating': {
+      safeLog(
+        ctx,
+        'info',
+        "checking the floating license server configured on this machine (`licensingServiceBaseUrl`) before activating.",
+      );
+      // 1.0.x: `license server health` reports the server's own /v1/status
+      // without a sign-in or the licensing client. Exit 0 is Healthy or
+      // Degraded, 4 means no server is configured, 6 unreachable or unhealthy.
+      // Failing here names the actual problem instead of a licensing-client 401.
+      const health = await unityLicenseServerHealth(licenseBaseOptions(ctx));
+      if (!isUnsupportedCommand(health)) {
+        if (health.code === EXIT.NEEDS_CONFIG) {
+          throw new LicenseError(
+            '`unity license server health` reports that no floating license server is configured on this machine (exit 4). ' +
+              "Set the CLI's `licensingServiceBaseUrl` to your server; there is no UNITY_LICENSING_SERVER environment variable." +
+              failureDetail(health),
+            EXIT.CONFIG_ERROR,
+          );
+        }
+        if (health.code !== EXIT.SUCCESS) {
+          throw new LicenseError(
+            `the floating license server is not healthy (exit ${health.code})${failureDetail(health)}. ` +
+              'Fix the server or its `licensingServiceBaseUrl` before running; no seat was requested.',
+            EXIT.CONFIG_ERROR,
+          );
+        }
+      }
+
       safeLog(
         ctx,
         'info',

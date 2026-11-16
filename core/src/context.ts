@@ -61,4 +61,11 @@ export interface CoreContext {
   cliVersion: string | null;
   cliChannel: string | null;
   cliCommit: string | null;
+  /**
+   * The Editor version resolved by `setup` from `ProjectVersion.txt` (or the
+   * configured version). Test/build pass it as `--editor-version` so an
+   * ambient `UNITY_EDITOR_VERSION` can never steer the run onto another
+   * Editor.
+   */
+  editorVersion?: string;
 }

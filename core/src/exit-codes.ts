@@ -12,9 +12,14 @@ export const EXIT = {
   EDITOR_UNREACHABLE: 12,
   REMOTE_COMMAND_FAILED: 13,
   TIMEOUT: 14,
+  RUN_FAILED: 15,
+  JOB_SUSPENDED: 16,
+  UNAVAILABLE: 17,
+  AWAITING_INPUT: 18,
   CONFIG_ERROR: 64,
   INTERNAL_ERROR: 65,
   INTERRUPTED: 130,
+  OUTPUT_CLOSED: 141,
   TERMINATED: 143,
 } as const;
 
@@ -39,9 +44,14 @@ const DESCRIPTIONS: Readonly<Record<number, string>> = {
   [EXIT.EDITOR_UNREACHABLE]: 'editor unreachable',
   [EXIT.REMOTE_COMMAND_FAILED]: 'remote command failed',
   [EXIT.TIMEOUT]: 'timed out',
+  [EXIT.RUN_FAILED]: 'run failed',
+  [EXIT.JOB_SUSPENDED]: 'job suspended',
+  [EXIT.UNAVAILABLE]: 'editor unavailable (loading, compiling, reloading or in Safe Mode)',
+  [EXIT.AWAITING_INPUT]: 'editor awaiting input (a modal dialog is blocking it)',
   [EXIT.CONFIG_ERROR]: 'configuration error',
   [EXIT.INTERNAL_ERROR]: 'internal error',
   [EXIT.INTERRUPTED]: 'interrupted (SIGINT)',
+  [EXIT.OUTPUT_CLOSED]: 'output closed (the reader of stdout closed the pipe)',
   [EXIT.TERMINATED]: 'terminated (SIGTERM)',
 };
 

@@ -53,7 +53,7 @@ interface TargetRow {
   requirement: string;
 }
 
-const ZERO_CODE = 'Zero-code (no --execute-method needed, but --output-path is still required)';
+const ZERO_CODE = 'Zero-code (no --execute-method needed, but --output is still required)';
 const NEEDS_CODE = 'Requires --execute-method, or a Unity 6+ build profile (--profile)';
 
 const DEFAULT_TARGETS: TargetRow[] = [
@@ -66,7 +66,7 @@ const DEFAULT_TARGETS: TargetRow[] = [
 
 interface BuildOutcome {
   code: number;
-  /** What the fake Editor leaves at `--output-path`. */
+  /** What the fake Editor leaves at `--output`. */
   artifact?: 'dir' | 'file' | 'none';
   /** A JSON manifest to write, a raw string (malformed), or null for none. */
   provenance?: Record<string, unknown> | string | null;
@@ -211,6 +211,7 @@ beforeEach(() => {
     ctx.cliVersion = '1.0.0-beta.14';
     ctx.cliChannel = 'beta';
     ctx.cliCommit = 'abc1234';
+    ctx.editorVersion = '6000.6.3f1';
     return {
       editorVersion: '6000.6.3f1',
       cliVersion: '1.0.0-beta.14',
@@ -281,13 +282,13 @@ beforeEach(() => {
           code: 0,
           stdout: '',
           stderr: '',
-          json: { success: true, data: targets },
+          json: { success: true, data: { items: targets, total: targets.length, nextPage: null, partial: false } },
         };
       }
 
       order.push('unity-build');
       buildCalls.push(args);
-      const outputPath = valueAfter(args, '--output-path');
+      const outputPath = valueAfter(args, '--output');
       const manifest = valueAfter(args, '--provenance-path');
       const logFile = valueAfter(args, '--log-file');
       const outcome = buildResponder({ args, outputPath, provenancePath: manifest, logFile });
@@ -302,7 +303,7 @@ beforeEach(() => {
       if (outcome.staleMtime === true && existsSync(outputPath)) {
         ageTree(outputPath, new Date(Date.now() - 60_000));
       }
-      if (outcome.provenance !== null && outcome.provenance !== undefined) {
+      if (outcome.provenance !== null && outcome.provenance !== undefined && manifest !== '') {
         mkdirSync(dirname(manifest), { recursive: true });
         writeFileSync(manifest, renderProvenance(outcome.provenance));
       }
@@ -357,7 +358,7 @@ describe('run build', () => {
     });
   });
 
-  it('passes --target and --output-path to unity build', async () => {
+  it('passes --target and the 1.0.x --output to unity build', async () => {
     const root = makeProject();
     const ctx = makeContext(root, (config) => {
       config.build.target = 'StandaloneLinux64';
@@ -368,25 +369,83 @@ describe('run build', () => {
 
     const args = buildCalls[0]!;
     expect(valueAfter(args, '--target')).toBe('StandaloneLinux64');
-    expect(valueAfter(args, '--output-path')).toBe(join(root, 'ci-output', 'build', 'linux'));
+    expect(valueAfter(args, '--output')).toBe(join(root, 'ci-output', 'build', 'linux'));
+    // `--output-path` still works silently in 1.0.x, but it is the deprecated
+    // spelling; the toolkit sends the documented one.
+    expect(args).not.toContain('--output-path');
     // The complete argv, including the wrapper's placement of `--format json`.
     expect(args).toEqual([
       'build',
       root,
       '--target',
       'StandaloneLinux64',
-      '--output-path',
+      '--output',
       join(root, 'ci-output', 'build', 'linux'),
       '--log-file',
       join(root, 'ci-output', 'logs', 'editor.log'),
       '--provenance-path',
       join(root, 'ci-output', 'build', 'provenance.json'),
+      '--editor-version',
+      '6000.6.3f1',
       // The streamed Editor log would be interleaved into stdout, and
       // `--format json` does not disable it; the log still lands in --log-file.
       '--no-tail',
       '--format',
       'json',
     ]);
+  });
+
+  it('disables the provenance manifest with --no-provenance and reads none', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.build.provenance = false;
+    });
+
+    expect(await runCommand(ctx, 'build')).toBe(0);
+
+    const args = buildCalls[0]!;
+    expect(args).toContain('--no-provenance');
+    expect(args).not.toContain('--provenance-path');
+    expect(readSummary(root).status).toBe('passed');
+  });
+
+  it('passes --build-target-group, --architecture and --editor-path to build', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.build.buildTargetGroup = 'Standalone';
+      config.unity.editor.architecture = 'arm64';
+      config.unity.editor.path = '/opt/unity/Editor/Unity';
+    });
+
+    expect(await runCommand(ctx, 'build')).toBe(0);
+
+    const args = buildCalls[0]!;
+    expect(valueAfter(args, '--build-target-group')).toBe('Standalone');
+    expect(valueAfter(args, '--architecture')).toBe('arm64');
+    expect(valueAfter(args, '--editor-path')).toBe('/opt/unity/Editor/Unity');
+  });
+
+  it('passes the accelerator endpoint to build', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.accelerator.endpoint = 'accelerator.local:10080';
+    });
+
+    expect(await runCommand(ctx, 'build')).toBe(0);
+
+    const args = buildCalls[0]!;
+    expect(valueAfter(args, '--accelerator')).toBe('accelerator.local:10080');
+    expect(args).not.toContain('--no-accelerator');
+  });
+
+  it('passes --no-accelerator to build when the accelerator is disabled', async () => {
+    const root = makeProject();
+    const ctx = makeContext(root, (config) => {
+      config.accelerator.disabled = true;
+    });
+
+    expect(await runCommand(ctx, 'build')).toBe(0);
+    expect(buildCalls[0]).toContain('--no-accelerator');
   });
 
   it('never sends -nographics to unity build', async () => {
@@ -579,14 +638,18 @@ describe('run build', () => {
     mocks.runUnity.mockImplementation(async (options: { args: string[] }) => {
       setupCalls.push(options.args);
       if (options.args[0] === 'version') {
-        return envelope({ version: '1.0.0-beta.14', channel: 'beta', commit: 'abc1234' });
+        return envelope({ version: '1.0.1', channel: 'stable', commit: 'abc1234' });
       }
-      if (options.args[0] === 'editors') return envelope([{ version: '6000.6.3f1' }]);
+      if (options.args[0] === 'editors') {
+        return envelope({ items: [{ version: '6000.6.3f1' }] });
+      }
       if (options.args[0] === 'install' && options.args.includes('--list-modules')) {
-        return envelope([
-          { id: 'windows-il2cpp', isInstalled: false },
-          { id: 'linux-il2cpp', isInstalled: false },
-        ]);
+        return envelope({
+          items: [
+            { id: 'windows-il2cpp', isInstalled: false },
+            { id: 'linux-il2cpp', isInstalled: false },
+          ],
+        });
       }
       if (options.args[0] === 'license') {
         return envelope({ active: true, signedIn: true, licenses: [] });
@@ -625,14 +688,18 @@ describe('run build', () => {
     });
     mocks.runUnity.mockImplementation(async (options: { args: string[] }) => {
       if (options.args[0] === 'version') {
-        return envelope({ version: '1.0.0-beta.14', channel: 'beta', commit: 'abc1234' });
+        return envelope({ version: '1.0.1', channel: 'stable', commit: 'abc1234' });
       }
-      if (options.args[0] === 'editors') return envelope([{ version: '6000.6.3f1' }]);
+      if (options.args[0] === 'editors') {
+        return envelope({ items: [{ version: '6000.6.3f1' }] });
+      }
       if (options.args[0] === 'install' && options.args.includes('--list-modules')) {
-        return envelope([
-          { id: 'linux-il2cpp', isInstalled: false },
-          { id: 'windows-il2cpp', isInstalled: true },
-        ]);
+        return envelope({
+          items: [
+            { id: 'linux-il2cpp', isInstalled: false },
+            { id: 'windows-il2cpp', isInstalled: true },
+          ],
+        });
       }
       if (options.args[0] === 'license') {
         return envelope({ active: true, signedIn: true, licenses: [] });

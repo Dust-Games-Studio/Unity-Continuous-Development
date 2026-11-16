@@ -376,9 +376,34 @@ describe('runUnity', () => {
     expect(result.json).toEqual({ success: true, data: { a: '', b: 1 } });
   });
 
+  it('removes ambient Editor-selection variables unless the caller sets them', async () => {
+    // 1.0.x makes UNITY_EDITOR_VERSION and UNITY_ARCHITECTURE steer build/test.
+    // An operator's exported value must not override the project's Editor.
+    setEnv('UNITY_EDITOR_VERSION', '6000.0.1f1');
+    setEnv('UNITY_ARCHITECTURE', 'x86_64');
+    const script = `process.stdout.write(JSON.stringify({
+      editorVersion: process.env.UNITY_EDITOR_VERSION ?? null,
+      architecture: process.env.UNITY_ARCHITECTURE ?? null,
+    }));`;
+
+    const without = await runUnity(unityOpts(script, { env: {} }));
+    const withValues = await runUnity(
+      unityOpts(script, {
+        env: { UNITY_EDITOR_VERSION: '6000.6.6f1', UNITY_ARCHITECTURE: 'arm64' },
+      }),
+    );
+
+    // No envelope: the fixture writes the raw fields, so `json` carries them
+    // as-is. What matters is that the ambient values did not reach the child.
+    expect(without.json).toEqual({ editorVersion: null, architecture: null });
+    expect(withValues.json).toEqual({
+      editorVersion: '6000.6.6f1',
+      architecture: 'arm64',
+    });
+  });
+
   it('passes the always-on Unity variables and strips the four token variables', async () => {
-    setEnv('UNITY_SERVICE_ACCOUNT_ID', 'service-account-id');
-    setEnv('UNITY_SERVICE_ACCOUNT_SECRET', 'service-account-secret');
+    setEnv('UNITY_SERVICE_ACCOUNT_ID', 'service-account-id');    setEnv('UNITY_SERVICE_ACCOUNT_SECRET', 'service-account-secret');
     setEnv('UNITY_GITHUB_TOKEN', 'github-token');
     setEnv('UNITY_GITLAB_TOKEN', 'gitlab-token');
     setEnv('UNITY_LICENSE_SERIAL', 'serial-from-ambient-env');
@@ -594,8 +619,8 @@ describe('unity CLI wrappers', () => {
 
   it('exports the tested CLI range', async () => {
     const cli = await import('../src/unity/cli.js');
-    expect(cli.TESTED_CLI_MIN).toBe('1.0.0-beta.9');
-    expect(cli.TESTED_CLI_MAX).toBe('1.0.0-beta.14');
+    expect(cli.TESTED_CLI_MIN).toBe('1.0.0');
+    expect(cli.TESTED_CLI_MAX).toBe('1.0.1');
   });
 
   it('uses --cm when child modules are requested and omits it when unset', async () => {
@@ -624,5 +649,73 @@ describe('unity CLI wrappers', () => {
     expect(calls[0]).not.toContain('--no-cm');
     expect(calls[1]).not.toContain('--cm');
     expect(calls[1]).not.toContain('--no-cm');
+  });
+
+  it('passes the 1.0.x install flags', async () => {
+    const calls: string[][] = [];
+
+    vi.resetModules();
+    vi.doMock('../src/unity/exec.js', () => ({
+      runUnity: vi.fn(async (opts: { args: string[] }) => {
+        calls.push(opts.args);
+        return { code: 0, stdout: '', stderr: '', json: null };
+      }),
+    }));
+
+    const { logger, redactor } = harness();
+    const base = { binary: 'unity', cwd: CWD, env: {}, logger, redactor };
+    try {
+      const cli = await import('../src/unity/cli.js');
+      await cli.unityInstall(base, {
+        version: '6000.0.47f1',
+        architecture: 'arm64',
+        resume: true,
+        downloadDirectory: '/tmp/editor',
+        downloadOnly: true,
+        headless: true,
+      });
+    } finally {
+      vi.doUnmock('../src/unity/exec.js');
+      vi.resetModules();
+    }
+
+    expect(calls[0]).toEqual([
+      'install',
+      '6000.0.47f1',
+      '--architecture',
+      'arm64',
+      '--resume',
+      '--download-directory',
+      '/tmp/editor',
+      '--download-only',
+      '--headless',
+      '--yes',
+      '--format',
+      'json',
+    ]);
+  });
+
+  it('asks the floating licence server for its health', async () => {
+    const calls: string[][] = [];
+
+    vi.resetModules();
+    vi.doMock('../src/unity/exec.js', () => ({
+      runUnity: vi.fn(async (opts: { args: string[] }) => {
+        calls.push(opts.args);
+        return { code: 0, stdout: '', stderr: '', json: null };
+      }),
+    }));
+
+    const { logger, redactor } = harness();
+    const base = { binary: 'unity', cwd: CWD, env: {}, logger, redactor };
+    try {
+      const cli = await import('../src/unity/cli.js');
+      await cli.unityLicenseServerHealth(base);
+    } finally {
+      vi.doUnmock('../src/unity/exec.js');
+      vi.resetModules();
+    }
+
+    expect(calls[0]).toEqual(['license', 'server', 'health', '--format', 'json']);
   });
 });

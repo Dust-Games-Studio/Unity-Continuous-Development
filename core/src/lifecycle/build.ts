@@ -7,7 +7,7 @@
  * and the artifact/provenance verification.
  *
  * A build produces a player (a file or a directory), and an exit 0 with nothing
- * at `--output-path` is the build-side false green (R18), exactly like a test
+ * at `--output` is the build-side false green (R18), exactly like a test
  * run with no NUnit report. "Nothing" excludes every file the toolkit writes
  * itself: the provenance manifest it asks Unity to write is a sibling of the
  * default output directory and must not satisfy the check.
@@ -35,6 +35,7 @@ import {
   runLifecycle,
   runWithRetry,
 } from './run-lifecycle.js';
+import { acceleratorArgs, editorIdentityArgs } from './editor-args.js';
 import { unityBaseOptions } from './setup.js';
 
 /** The verdict of one `run build`. A build is either usable or it is not. */
@@ -198,10 +199,10 @@ function removeStaleFile(path: string): void {
   }
 }
 
-/** `data` directly, or `data.targets`, as Unity's listing envelope allows. */
+/** `data.items` in 1.0.x, or the legacy `data` / `data.targets` shape. */
 function targetRows(result: UnityResult): BuildTargetRow[] | null {
   const data = result.json?.data;
-  const raw = Array.isArray(data) ? data : asObject(data)?.targets;
+  const raw = Array.isArray(data) ? data : asObject(data)?.items ?? asObject(data)?.targets;
   if (!Array.isArray(raw)) return null;
 
   const rows: BuildTargetRow[] = [];
@@ -295,8 +296,10 @@ async function validateTarget(ctx: CoreContext): Promise<TargetProblem | null> {
  *
  * `--format json` is appended by `unityBuild` itself (GC12), never here, and
  * `--allow-install` is never sent: a missing Editor must fail fast in `setup`
- * with the exact install command, not download mid-run. `--output-path` is
- * always sent even for a zero-code target; the CLI requires it.
+ * with the exact install command, not download mid-run. `--output` is always
+ * sent even for a zero-code target; the CLI requires it. 1.0.0 renamed
+ * `--output-path` to `--output`; the old spelling still works silently, but
+ * only the documented one is emitted.
  *
  * `--target` and `--profile` are exclusive on argv: a profile defines the
  * target, and `--target` is only required when no profile is used.
@@ -329,14 +332,28 @@ function buildArguments(
   }
 
   args.push(
-    '--output-path',
+    '--output',
     outputPath,
     '--log-file',
     logFile,
-    '--provenance-path',
-    provenancePath,
-    '--no-tail',
   );
+
+  if (build.provenance) {
+    args.push('--provenance-path', provenancePath);
+  } else {
+    // 1.0.x: an explicit opt-out. Without a path the CLI writes nothing anyway,
+    // but the flag is the documented contract and keeps the intent legible in
+    // the logged argv.
+    args.push('--no-provenance');
+  }
+
+  args.push(...editorIdentityArgs(ctx));
+
+  if (build.buildTargetGroup !== null) {
+    args.push('--build-target-group', build.buildTargetGroup);
+  }
+
+  args.push(...acceleratorArgs(ctx), '--no-tail');
 
   if (build.executeMethod !== null && build.executeMethod !== '') {
     args.push('--execute-method', build.executeMethod);
@@ -463,9 +480,11 @@ export async function runBuild(ctx: CoreContext): Promise<BuildRunResult> {
       }
 
       mkdirSync(dirname(logFile), { recursive: true });
-      mkdirSync(dirname(provenanceFile), { recursive: true });
+      if (ctx.config.build.provenance) {
+        mkdirSync(dirname(provenanceFile), { recursive: true });
+        removeStaleFile(provenanceFile);
+      }
       removeStaleFile(logFile);
-      removeStaleFile(provenanceFile);
 
       let lastAttemptStartedAt = 0;
       const args = buildArguments(ctx, outputPath, logFile, provenanceFile);
@@ -500,18 +519,22 @@ export async function runBuild(ctx: CoreContext): Promise<BuildRunResult> {
       if (result.data.problem !== null) return { exitCode: result.data.problem.code };
       const run = result.data.run;
 
-      const manifest = readProvenance(provenanceFile);
-      provenance = manifest.provenance;
-      if (manifest.malformed) {
-        ctx.logger.error(
-          `the build provenance manifest at ${provenanceFile} is not a JSON object; it cannot be published.`,
-        );
-      } else if (provenance === null) {
-        // Not a failure on its own, but an absent manifest is worth saying:
-        // the build is still traceable through the CLI identity in the summary.
-        ctx.logger.warn(
-          `unity build wrote no provenance manifest at ${provenanceFile}; summary.json has no provenance.`,
-        );
+      let manifestMalformed = false;
+      if (ctx.config.build.provenance) {
+        const manifest = readProvenance(provenanceFile);
+        provenance = manifest.provenance;
+        manifestMalformed = manifest.malformed;
+        if (manifest.malformed) {
+          ctx.logger.error(
+            `the build provenance manifest at ${provenanceFile} is not a JSON object; it cannot be published.`,
+          );
+        } else if (provenance === null) {
+          // Not a failure on its own, but an absent manifest is worth saying:
+          // the build is still traceable through the CLI identity in the summary.
+          ctx.logger.warn(
+            `unity build wrote no provenance manifest at ${provenanceFile}; summary.json has no provenance.`,
+          );
+        }
       }
 
       const artifactProduced = artifactHasContent(outputPath, toolkit);
@@ -552,7 +575,7 @@ export async function runBuild(ctx: CoreContext): Promise<BuildRunResult> {
       artifacts.push(reportPath(summaryDir, outputPath));
       // A produced artifact that cannot be read is a malformed artifact (GC7),
       // not a green build with a missing key.
-      return { exitCode: manifest.malformed ? EXIT.INTERNAL_ERROR : EXIT.SUCCESS };
+      return { exitCode: manifestMalformed ? EXIT.INTERNAL_ERROR : EXIT.SUCCESS };
     },
     summary: (ctx) => ({
       fields: {

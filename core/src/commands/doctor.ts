@@ -258,7 +258,9 @@ export async function doctorCommand(ctx: CoreContext): Promise<number> {
     const checks: DoctorCheck[] = [...coreEnvironmentChecks(ctx)];
     let unityVerdict: 'pass' | 'fail' | 'unknown' = 'unknown';
 
-    const doctorResult = await unityDoctorCi(base);
+    const doctorResult = await unityDoctorCi(base, {
+      skipLicense: ctx.config.doctor.skipLicense,
+    });
     if (isUnsupportedCommand(doctorResult)) {
       checks.push({
         id: 'unity-doctor',
@@ -308,35 +310,71 @@ export async function doctorCommand(ctx: CoreContext): Promise<number> {
       source: 'core',
     });
 
-    const license = await checkLicense(ctx);
-    const licenseFails =
-      !license.active && !license.unsupported && ctx.config.license.mode === 'none';
-    checks.push({
-      id: 'license',
-      status: license.unsupported
-        ? 'fail'
-        : license.active
-          ? 'pass'
-          : licenseFails
-            ? 'fail'
-            : 'info',
-      code: license.unsupported
-        ? 'UNSUPPORTED_COMMAND'
-        : license.active
-          ? 'OK'
-          : licenseFails
-            ? 'LICENSE_NOT_ACTIVE'
-            : 'LICENSE_INACTIVE_REPORTED',
-      blocking: license.unsupported || licenseFails,
-      message: license.unsupported
-        ? 'this Unity CLI does not support `license status`'
-        : license.active
-          ? `active: ${license.detail}`
-          : licenseFails
-            ? `no active Unity license (${license.detail}); a run with license.mode: none requires one`
-            : `no active Unity license yet (${license.detail}); license.mode "${ctx.config.license.mode}" activates it in the lifecycle`,
-      source: 'core',
-    });
+    const skipLicense = ctx.config.doctor.skipLicense;
+    let licenseReport: {
+      active: boolean | null;
+      mode: string;
+      detail: string;
+      licenses: string[];
+      floatingServer: string | null;
+    };
+    if (skipLicense) {
+      // `doctor --ci --skip-license` already told the CLI not to look, so the
+      // core must not ask again. `active: null` records "not checked" rather
+      // than the `false` a reader would take for "no licence".
+      licenseReport = {
+        active: null,
+        mode: ctx.config.license.mode,
+        detail: 'skipped by doctor.skipLicense',
+        licenses: [],
+        floatingServer: null,
+      };
+      checks.push({
+        id: 'license',
+        status: 'info',
+        code: 'LICENSE_SKIPPED',
+        blocking: false,
+        message: 'the licence check was skipped by doctor.skipLicense',
+        source: 'core',
+      });
+    } else {
+      const license = await checkLicense(ctx);
+      const licenseFails =
+        !license.active && !license.unsupported && ctx.config.license.mode === 'none';
+      checks.push({
+        id: 'license',
+        status: license.unsupported
+          ? 'fail'
+          : license.active
+            ? 'pass'
+            : licenseFails
+              ? 'fail'
+              : 'info',
+        code: license.unsupported
+          ? 'UNSUPPORTED_COMMAND'
+          : license.active
+            ? 'OK'
+            : licenseFails
+              ? 'LICENSE_NOT_ACTIVE'
+              : 'LICENSE_INACTIVE_REPORTED',
+        blocking: license.unsupported || licenseFails,
+        message: license.unsupported
+          ? 'this Unity CLI does not support `license status`'
+          : license.active
+            ? `active: ${license.detail}`
+            : licenseFails
+              ? `no active Unity license (${license.detail}); a run with license.mode: none requires one`
+              : `no active Unity license yet (${license.detail}); license.mode "${ctx.config.license.mode}" activates it in the lifecycle`,
+        source: 'core',
+      });
+      licenseReport = {
+        active: license.active,
+        mode: ctx.config.license.mode,
+        detail: license.detail,
+        licenses: license.licenses,
+        floatingServer: license.floatingServer,
+      };
+    }
 
     const failed = checks.some(isBlockingFailure);
     const verdict = failed ? 'fail' : 'pass';
@@ -359,13 +397,7 @@ export async function doctorCommand(ctx: CoreContext): Promise<number> {
           blocking: verify.blocking,
           detail: verify.detail,
         },
-        license: {
-          active: license.active,
-          mode: ctx.config.license.mode,
-          detail: license.detail,
-          licenses: license.licenses,
-          floatingServer: license.floatingServer,
-        },
+        license: licenseReport,
       });
     } catch (error) {
       ctx.logger.error(

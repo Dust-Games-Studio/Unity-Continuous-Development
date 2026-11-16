@@ -10,13 +10,15 @@ and writes one machine-readable `summary.json`. A thin adapter per CI system
 supplies secrets, caches, artifacts and an always-run licence teardown. The core
 owns the verdict; the adapter only displays it.
 
-> **The Unity CLI is experimental and in beta.** Unity's own documentation says
-> its features and documentation "might change in an upcoming release". There is
-> no stable channel and no GA date. This toolkit is tested against
-> **1.0.0-beta.9 through 1.0.0-beta.14**; a CLI below that floor fails, a newer
-> one warns and continues, and the exact build is recorded in every
-> `summary.json`. Pinning is an *install-method* policy, not a version string:
-> see [docs/compatibility.md](docs/compatibility.md).
+> **The Unity CLI is stable at 1.0.x.** Unity shipped the stable channel after
+> the beta series this toolkit was designed against. This toolkit is tested
+> against **1.0.0 and 1.0.1**; a CLI below that floor fails, a newer one warns
+> and continues, and the exact build is recorded in every `summary.json`.
+> Pinning is still an *install-method* policy, not a version string: see
+> [docs/compatibility.md](docs/compatibility.md). The upgrade from the beta
+> range — including the listing-envelope change, `build --output`, the new
+> exit codes and the 1.0.x flags the toolkit now sends — is recorded in
+> [docs/decisions/unity-cli-1.0.x-upgrade.md](docs/decisions/unity-cli-1.0.x-upgrade.md).
 >
 > **Unity's support statement covers a narrower set of machines than CI.**
 > Unity supports the Editor on "workstations or laptop form factors running
@@ -32,8 +34,8 @@ Technologies. "Unity" and the Unity logo are trademarks of Unity Technologies.
 ## Local quick start
 
 Prerequisites: Node **22.12+** (the published core needs 22.4+), pnpm 12, git,
-and the Unity CLI. Install the CLI with Unity's installer, then check what you
-got:
+and the Unity CLI. Install the CLI with Unity's installer (macOS/Linux
+`install.sh`, Windows `install.ps1`), then check what you got:
 
 ```bash
 curl -fsSL https://unity.com/install.sh | bash
@@ -68,10 +70,22 @@ routes in `unity-ci.yml`:
 license:
   mode: serial                  # serial | floating | offline-file | none
   serialEnv: UNITY_LICENSE_SERIAL
+unity:
+  editor:
+    headless: false             # 1.0.x: headless Linux Editor (install only, Linux)
+    architecture: null          # x86_64 | arm64
+    path: null                  # 1.0.x: pin a specific Editor binary
+    resume: true                # 1.0.x: resume a cached/interrupted download
 test:
   modes: [EditMode]
+  affected: false               # 1.0.x: only tests the change can reach
+  since: origin/main            # 1.0.x: the revision --affected compares against
 build:
   target: StandaloneLinux64
+  provenance: true              # 1.0.x: --no-provenance when false
+accelerator:
+  endpoint: null                # 1.0.x: host:port, or set disabled: true
+  disabled: false
 ```
 
 An offline `--file` licence cannot be returned; those runners leak a seat and it
@@ -129,6 +143,7 @@ runs only on `main` and release tags for exactly that reason.
 | [docs/local-development.md](docs/local-development.md) | running `unityci` on a developer machine, the fake-`unity` loop, Linux libraries and limits |
 | [docs/generic-ci.md](docs/generic-ci.md) | the minimum for any CI system: `doctor` → `run` → always-run `license return`, plus caching from `cache-info --json` |
 | [docs/compatibility.md](docs/compatibility.md) | tested Unity CLI/Editor versions, the install-method pinning policy, the capability matrix the core probes |
+| [docs/decisions/unity-cli-1.0.x-upgrade.md](docs/decisions/unity-cli-1.0.x-upgrade.md) | the measured beta → stable 1.0.x changes, what the toolkit adopted, and what it left out |
 | [docs/private-packages.md](docs/private-packages.md) | private git UPM packages, the measured git URL-rewrite mechanisms, the local and CI recipes |
 | [adapters/github/README.md](adapters/github/README.md) | the GitHub composite action and every input |
 | [adapters/generic/README.md](adapters/generic/README.md) | the adapter contract in checklist form |
