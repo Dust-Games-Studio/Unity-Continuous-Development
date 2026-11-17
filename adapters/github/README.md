@@ -58,6 +58,12 @@ On a clean runner the Editor is not installed. Either pre-install the version in
 block — a declared acceptance of Unity's and every module's licence agreements,
 which is why the action never assumes it.
 
+`accept-eula: true` is also what lets the doctor preflight get past a clean
+runner: the preflight runs before the install, so it sees a missing Editor, and
+the core treats that as `info` (`EDITOR_WILL_BE_INSTALLED`) only when an install
+is allowed. Leave it empty and a missing Editor is a hard failure — the run has
+no way to proceed.
+
 ## Inputs
 
 | Input | Default | Meaning |

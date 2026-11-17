@@ -80,6 +80,45 @@ function defaultLicense(): unknown {
   return { active: true, licenses: [{ product: 'Unity Personal', type: 'Assigned' }], floatingServer: null };
 }
 
+/**
+ * Unity 1.0.x's report on a clean runner, before `setup` has installed the
+ * Editor or the lifecycle has activated the licence. Measured with
+ * `unity doctor --ci [--skip-license] --format json` on 1.0.1: the licence
+ * check comes back `info` with `blocking: true` when it was skipped, and the
+ * Editor is still a hard `fail`.
+ */
+function cleanRunnerDoctor(): unknown {
+  return {
+    verdict: 'fail',
+    checks: [
+      {
+        id: 'license',
+        status: 'info',
+        code: 'LICENSE_SKIPPED',
+        blocking: true,
+        message: 'License check skipped (--skip-license)',
+      },
+      {
+        id: 'editor',
+        status: 'fail',
+        code: 'EDITOR_NOT_INSTALLED',
+        blocking: true,
+        message: 'This project requires editor 6000.0.47f1, which is not installed',
+      },
+      { id: 'network', status: 'pass', code: 'NETWORK_OK', blocking: true, message: 'reachable' },
+    ],
+  };
+}
+
+/** The status a named check ended up with in the written report. */
+function statusOf(
+  report: ReturnType<typeof readReport>,
+  id: string,
+  code: string,
+): string | undefined {
+  return report.checks.find((check) => check.id === id && check.code === code)?.status;
+}
+
 function responder(args: string[]) {
   if (args[0] === 'version') {
     return envelope({
@@ -491,6 +530,86 @@ describe('doctorCommand', () => {
     expect(code).toBe(0);
   });
 
+  it('passes --skip-license when the lifecycle will activate the licence itself', async () => {
+    // Unity's `doctor --ci` reports a missing licence as a failure. Under an
+    // activation mode the lifecycle activates one immediately after the
+    // preflight, so asking the CLI to fail on it here blocks every clean
+    // runner before `setup` can do its job.
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.license.mode = 'serial';
+    });
+
+    expect(await doctorCommand(ctx)).toBe(0);
+
+    const doctor = calls.find((args) => args[0] === 'doctor' && args.includes('--ci'));
+    expect(doctor).toContain('--skip-license');
+  });
+
+  it('does not pass --skip-license under license.mode: none', async () => {
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.license.mode = 'none';
+    });
+
+    await doctorCommand(ctx);
+
+    const doctor = calls.find((args) => args[0] === 'doctor' && args.includes('--ci'));
+    expect(doctor).not.toContain('--skip-license');
+  });
+
+  it('treats a not-installed Editor as informational when the toolkit may install it', async () => {
+    // The exact clean-runner shape the `example` workflow hit: `doctor` runs
+    // before `setup`, and `setup` is what installs the Editor. Blocking here
+    // made an unattended install impossible.
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.license.mode = 'serial';
+      config.unity.editor.acceptEula = true;
+    });
+    scenario.doctor = cleanRunnerDoctor();
+
+    const code = await doctorCommand(ctx);
+
+    expect(code).toBe(0);
+    const editor = readReport(project).checks.find(
+      (check) => check.id === 'editor' && check.code === 'EDITOR_WILL_BE_INSTALLED',
+    );
+    expect(editor).toMatchObject({ status: 'info', blocking: false });
+    expect(editor?.message).toContain('6000.0.47f1');
+    expect(editor?.message).toContain('setup installs it');
+  });
+
+  it('still fails when the Editor is missing and installation is not allowed', async () => {
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.license.mode = 'serial';
+    }); // acceptEula stays false
+    scenario.doctor = cleanRunnerDoctor();
+
+    const code = await doctorCommand(ctx);
+
+    expect(code).toBe(64);
+    expect(statusOf(readReport(project), 'editor', 'EDITOR_NOT_INSTALLED')).toBe('fail');
+  });
+
+  it('still fails on a different Editor problem even when installation is allowed', async () => {
+    // Only "not installed yet" is a condition `setup` repairs. A corrupt
+    // Editor must not be waved through by the same relaxation.
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.unity.editor.acceptEula = true;
+    });
+    scenario.doctor = {
+      verdict: 'fail',
+      checks: [
+        { id: 'editor', status: 'fail', code: 'EDITOR_CORRUPT', blocking: true, message: 'broken' },
+      ],
+    };
+
+    expect(await doctorCommand(ctx)).toBe(64);
+  });
+
   it('passes --skip-license and skips its own licence check when configured', async () => {
     const project = makeProject();
     const ctx = makeContext(project, (config) => {
@@ -511,6 +630,30 @@ describe('doctorCommand', () => {
       active: null,
       detail: 'skipped by doctor.skipLicense',
     });
+  });
+
+  it("names the CLI's error instead of the JSON envelope when license status fails", async () => {
+    // `--format json` writes the failure envelope to stdout, so the first line
+    // of stdout is "{". Reporting that as the detail hides the actual reason.
+    const message = 'No active Unity license; a build or test run cannot start without one';
+    const envelopeJson = { success: false, errors: [{ code: 'LICENSE_NONE', message }] };
+    mocks.runUnity.mockImplementation(async (options: { args: string[] }) => {
+      calls.push(options.args);
+      if (options.args[0] === 'license') {
+        return { code: 4, stdout: JSON.stringify(envelopeJson), stderr: '', json: envelopeJson };
+      }
+      return responder(options.args);
+    });
+    const project = makeProject();
+    const ctx = makeContext(project, (config) => {
+      config.license.mode = 'serial';
+    });
+
+    expect(await doctorCommand(ctx)).toBe(0);
+
+    const detail = readReport(project).license.detail;
+    expect(detail).toContain('No active Unity license');
+    expect(detail).not.toContain('{');
   });
 
   it('does not run the git preflight: setup owns it', async () => {

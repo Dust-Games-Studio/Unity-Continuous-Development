@@ -10,6 +10,7 @@ import {
   resolveCliIdentity,
   unityBaseOptions,
   type PreflightCheck,
+  type UnityDoctorCheck,
 } from '../lifecycle/setup.js';
 import {
   isUnsupportedCommand,
@@ -241,6 +242,39 @@ function writeReport(ctx: CoreContext, report: unknown): string {
 }
 
 /**
+ * Re-reads a Unity check that reports a precondition `setup` is about to
+ * satisfy.
+ *
+ * `doctor` runs **before** `setup`, so on a clean runner Unity's `--ci` report
+ * necessarily says `EDITOR_NOT_INSTALLED`. When the toolkit is allowed to
+ * install (`unity.editor.acceptEula: true`), that is the plan, not a blocker —
+ * `setup` runs `unity install` next. Only this one condition is relaxed: any
+ * other Editor failure (a corrupt install, a version mismatch this project
+ * cannot install) stays blocking, and a missing Editor stays blocking when
+ * installation is not permitted, because then the run genuinely cannot start.
+ */
+function relaxLifecycleOwnedCheck(
+  check: UnityDoctorCheck,
+  ctx: CoreContext,
+): UnityDoctorCheck {
+  if (
+    check.id === 'editor' &&
+    check.code === 'EDITOR_NOT_INSTALLED' &&
+    ctx.config.unity.editor.acceptEula
+  ) {
+    return {
+      ...check,
+      status: 'info',
+      code: 'EDITOR_WILL_BE_INSTALLED',
+      blocking: false,
+      message:
+        `${check.message}; unity.editor.acceptEula is true, so setup installs it before the run`,
+    };
+  }
+  return check;
+}
+
+/**
  * `unityci doctor`: the preflight gate (R11).
  *
  * It consumes Unity's own report, adds the core's checks (CLI capability matrix,
@@ -259,7 +293,12 @@ export async function doctorCommand(ctx: CoreContext): Promise<number> {
     let unityVerdict: 'pass' | 'fail' | 'unknown' = 'unknown';
 
     const doctorResult = await unityDoctorCi(base, {
-      skipLicense: ctx.config.doctor.skipLicense,
+      // `--skip-license` asks the CLI not to fail the preflight on a missing
+      // licence. Under an activation mode that is exactly right: the lifecycle
+      // activates one immediately after `setup`. `doctor.skipLicense` extends
+      // the same opt-out to `license.mode: none`, for runners licensed another
+      // way entirely.
+      skipLicense: ctx.config.doctor.skipLicense || ctx.config.license.mode !== 'none',
     });
     if (isUnsupportedCommand(doctorResult)) {
       checks.push({
@@ -287,7 +326,7 @@ export async function doctorCommand(ctx: CoreContext): Promise<number> {
         });
       } else {
         for (const check of doctor.checks) {
-          checks.push({ ...check, source: 'unity' });
+          checks.push({ ...relaxLifecycleOwnedCheck(check, ctx), source: 'unity' });
         }
       }
     }

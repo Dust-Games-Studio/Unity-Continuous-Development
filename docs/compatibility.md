@@ -92,7 +92,7 @@ generic crash.
 | Area | What is probed / called | What happens when it is missing |
 |---|---|---|
 | Identity | `unity version --format json` | Recorded in `summary.json`; an incomparable version is `info`, not a failure. |
-| Preflight | `unity doctor --ci [--skip-license] --format json` | The core's own checks (CLI range, glibc, disk space, licence, `projects verify`) still run. `doctor.skipLicense` defers the licence question to the runner. |
+| Preflight | `unity doctor --ci [--skip-license] --format json` | The core's own checks (CLI range, glibc, disk space, licence, `projects verify`) still run. `--skip-license` is passed automatically under an activation mode, and `EDITOR_NOT_INSTALLED` is downgraded to `info` when `acceptEula` allows an install — see above. |
 | Run preflight | `git ls-remote --exit-code <url>` in the setup step of `run` | A broken manifest is exit 64; an unreachable private dependency is exit 64 before an Editor starts. `doctor` does not run this check. |
 | Project integrity | `unity projects verify --strict --format json` | A missing/unparsable report is `info`; a non-zero exit or findings is a blocking failure. |
 | Editor | `unity editors --installed --format json`, `unity install` | An install happens only with `acceptEula: true`; otherwise exit 64 names the exact `unity install` command. Modules required by the invoked command are checked too. `--headless` (Linux), `--resume` and `--architecture` are supported. |
@@ -105,6 +105,38 @@ generic crash.
 The version range is recorded **and** the capabilities are probed. Either alone
 would be fragile: the range cannot predict a release surprise, and a probe
 cannot tell you which build produced a suspicious result.
+
+### The preflight runs before `setup`, so it must not block on what `setup` fixes
+
+`doctor` is the gate, and it runs **first** in the lifecycle — before the Editor
+is installed and before the licence is activated. On a clean runner Unity's own
+`--ci` report therefore always contains two failures:
+
+```
+FAIL license (LICENSE_NONE): No active Unity license
+FAIL editor  (EDITOR_NOT_INSTALLED): This project requires editor …, which is not installed
+```
+
+Both describe the starting point, not a verdict on the run, so the core handles
+them by what the lifecycle can actually do next:
+
+- **Licence** — under an activation mode (`serial`, `floating`, `offline-file`,
+  `personal`) the core passes `unity doctor --ci --skip-license`, which is the
+  CLI's own opt-out for "this runner gets a licence another way". The licence
+  check then comes back `info` and the lifecycle activates a seat after
+  `setup`. Under `license.mode: none` the flag is **not** passed: there is no
+  activation step, so a missing licence genuinely is a blocker. Setting
+  `doctor.skipLicense: true` extends the opt-out to `none`, for a runner
+  licensed outside the toolkit.
+- **Editor** — `EDITOR_NOT_INSTALLED` is rewritten to
+  `info` / `EDITOR_WILL_BE_INSTALLED` **only** when `unity.editor.acceptEula`
+  is `true`, because then `setup` installs it immediately. With `acceptEula`
+  false the check stays a blocking `fail` (the run cannot start and nothing will
+  install anything); any *other* Editor failure — a corrupt install, a version
+  this project may not install — also stays blocking.
+
+The rewritten check keeps its original message and adds why it does not block,
+so `ci-output/logs/doctor.json` still records what Unity found.
 
 ## Reporting a compatibility problem
 

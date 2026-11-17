@@ -19,6 +19,18 @@ unityci license return                          # 3. ALWAYS run, in the teardown
 default; a provider that understands GitHub workflow commands may pass
 `--annotations github`.
 
+### On a clean runner the preflight passes before the Editor exists
+
+`unityci doctor` runs **before** anything is installed or activated, so on a
+fresh runner Unity answers its own preflight with `LICENSE_NONE` and
+`EDITOR_NOT_INSTALLED`. Neither is a blocker when the toolkit is going to fix
+it: under an activation mode the core asks the CLI to `--skip-license` and
+activates a seat after `setup`, and a not-installed Editor becomes `info` when
+`unity.editor.acceptEula: true` lets `setup` run `unity install`. Under
+`license.mode: none`, or with `acceptEula: false`, both stay hard failures —
+nothing downstream would fix them. Details and exact conditions:
+[compatibility.md](compatibility.md#the-preflight-runs-before-setup-so-it-must-not-block-on-what-setup-fixes).
+
 ### Why the teardown is unconditional and tolerates exit 6
 
 `unityci license return` exits **6** when a seat was not returned. That is

@@ -90,7 +90,9 @@ Editor does not clear on its own.
 6. `test.affected`, `test.affectedCompare`, `test.since`, `test.rerunFailed`.
 7. `build.provenance` and `build.buildTargetGroup`.
 8. `accelerator.endpoint` / `accelerator.disabled`, shared by test and build.
-9. `doctor.skipLicense`.
+9. `doctor.skipLicense` (plus an automatic `--skip-license` under every
+   activation mode, since the lifecycle activates a seat immediately after the
+   preflight).
 10. A floating-licence health probe before `license activate --floating`.
 11. Ambient `UNITY_EDITOR_VERSION`/`UNITY_ARCHITECTURE` are removed from every
     child; the resolved Editor version and the configured architecture are

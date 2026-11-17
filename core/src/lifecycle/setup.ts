@@ -142,8 +142,31 @@ function firstLine(value: string): string {
   return line.trim();
 }
 
+/**
+ * The CLI's own message from a JSON failure envelope, when there is one.
+ *
+ * `--format json` writes the failure document to **stdout**, so its first line
+ * is `{`: reading stderr/stdout text reports a brace instead of the reason.
+ */
+function envelopeError(result: UnityResult): string {
+  const sources = [result.json?.errors, asObject(result.json?.data)?.errors];
+  for (const source of sources) {
+    for (const entry of asArray(source)) {
+      const message =
+        typeof entry === 'string' ? entry.trim() : stringField(asObject(entry), 'message');
+      if (message !== null && message !== '') return message;
+    }
+  }
+  return '';
+}
+
 function resultDetail(result: UnityResult): string {
-  const detail = firstLine(result.stderr) || firstLine(result.stdout);
+  const envelope = envelopeError(result);
+  if (envelope !== '') return `: ${envelope}`;
+  const stderrLine = firstLine(result.stderr);
+  const stdoutLine = firstLine(result.stdout);
+  // A JSON document on stdout names nothing; only use it when it is prose.
+  const detail = stderrLine !== '' ? stderrLine : stdoutLine.startsWith('{') ? '' : stdoutLine;
   return detail === '' ? '' : `: ${detail}`;
 }
 
